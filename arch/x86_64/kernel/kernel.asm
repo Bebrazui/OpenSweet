@@ -92,18 +92,27 @@ kmain:
     call apic_init
     call pmm_init
     call ata_init
+    mov al,'D'
+    call putc
+    mov eax, dword [r15 + ata_sectors - kmain]
+    call puthex64
+    mov al, byte [r15 + ata_drv - kmain]
+    call putc
+    mov al, 10
+    call putc
     call ext4_mount
+    call putc
+    call puthex64
+    mov al, 10
+    call putc
     mov al,'F'
     call putc
-    call fb_test_pattern
     mov al,'G'
     call putc
     mov al,'H'
     call putc
-    call ext4_inode_load_auto
     mov al,'I'
     call putc
-    call ext4_ls_print
     mov al,'J'
     call putc
 
@@ -323,7 +332,6 @@ kmain:
     mov eax, 2                    ; root inode
     call ext4_inode_load
     jc .fs_err
-    call ext4_ls_print
     mov al, 10
     call putc
     jmp .prompt
@@ -1101,13 +1109,10 @@ fb_test_pattern:
     cmp byte [r14 + VBS_OK], 1
     jne .ret
     ; load params
-    movzx eax, word [r14 + VBS_PITCH]
     mov [r15 + vbe_pitch - kmain], eax
     movzx eax, word [r14 + VBS_WIDTH]
     mov [r15 + vbe_width - kmain], eax
-    movzx eax, word [r14 + VBS_HEIGHT]
     mov [r15 + vbe_height - kmain], eax
-    mov eax, dword [r14 + VBS_LFB]
     mov [r15 + vbe_lfb - kmain], eax
 
     xor r8d, r8d                     ; y = 0
