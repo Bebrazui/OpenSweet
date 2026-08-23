@@ -1,9 +1,9 @@
 ; Opensweet OS - x86_64 stage 1: MBR bootloader
 ; Loads kernel to 0x10000, A20 on, protected mode -> long mode -> jump to kernel.
 
-KERNEL_LBA     = 33                  ; LBA0=MBR, LBA1..32=stage2(16KB)                  ; os.img: MBR=LBA0, stage2=LBA1..33, kernel=LBA34+
+KERNEL_LBA     = 33                  ; LBA0=MBR, LBA1..32=stage2(16KB)
 KERNEL_ADDR    = 0x10000
-KERNEL_SECTORS = 512                 ; 256KB kernel window
+KERNEL_SECTORS = 512                 ; 256KB window
 
 org 0x0600
 use16
@@ -14,49 +14,10 @@ start:
     mov ds, ax
     mov es, ax
     mov ss, ax
-    mov sp, 0xFF00
+    mov sp, 0x7C00
     sti
-
-    ; --- init COM1 115200 8N1 (minimal) ---
-    mov dx, 0x3F9
-    mov al, 0            ; IER
-    out dx, al
-    mov dx, 0x3FB
-    mov al, 0x80         ; DLAB on
-    out dx, al
-    mov dx, 0x3F8
-    mov al, 3            ; divisor low (38400)
-    out dx, al
-    inc dx               ; 0x3F9
-    mov al, 0
-    out dx, al
-    mov dx, 0x3FB
-    mov al, 0x03         ; 8N1, DLAB off
-    out dx, al
-    mov dx, 0x3FA
-    mov al, 0xC7         ; FIFO
-    out dx, al
-    mov dx, 0x3FC
-    mov al, 0x0B         ; modem control
-    out dx, al
-
-    mov al, 'S'          ; stage2 entered
-    call rs_putc
     mov [boot_drive], dl
 
-rs_putc:
-    push dx
-    push ax
-.wait:
-    mov dx, 0x3FD
-    in al, dx
-    test al, 0x20
-    jz .wait
-    pop ax
-    mov dx, 0x3F8
-    out dx, al
-    pop dx
-    ret
     ; --- load kernel: LBA->CHS per IDE geometry (63 spt, 16 heads) ---
     mov ax, KERNEL_LOAD_SEG
     mov es, ax
@@ -88,17 +49,7 @@ rs_putc:
     mov es, ax
     inc word [cur_lba]
     dec si
-    jz .read_done
-    test si, 127
     jnz .read_loop
-    mov al, '.'
-    call rs_putc
-    jmp .read_loop
-.read_done:
-    mov al, 'k'
-    call rs_putc
-    mov al, 'K'
-    call rs_putc
 
     ; --- e820 memory map -> count dword @0x6000, entries @0x6100 (20 bytes each) ---
     xor ax, ax
@@ -135,69 +86,68 @@ rs_putc:
     int 0x10
     cmp ax, 0x004F
     jne .vbe_none
-    cmp dword [di], 'ASEV'
+    cmp dword [di], 'ASEV'           ; 'VESA'
     jne .vbe_none
 
     mov si, [di + 0x0E]              ; video mode list offset
     mov dx, [di + 0x10]              ; video mode list segment
     mov gs, dx                       ; GS:SI -> mode list
-    mov cx, 256
-.mode_loop:
-    mov bx, [gs:si]
-    cmp bx, 0xFFFF
+    mov cx, 256                      ; safety cap
+.vbe_mode_loop:
+    mov bx, [gs:si]                  ; next mode number
+    cmp bx, 0xFFFF                   ; terminator
     je .vbe_none
     push es
     xor ax, ax
     mov es, ax
-    mov di, 0x5200
+    mov di, 0x5200                   ; ModeInfoBlock buffer
     mov cx, bx                       ; requested mode
     mov ax, 0x4F01
     int 0x10
     pop es
     cmp ax, 0x004F
-    jne .next_mode
-    mov ax, [es:0x5200]
-    and ax, 0x0091                   ; supported|graphics|LFB
+    jne .vbe_next_mode
+    mov ax, [es:0x5200]              ; mode attributes
+    and ax, 0x0091                   ; bit0 supported | bit4 graphics | bit7 LFB
     cmp ax, 0x0091
-    jne .next_mode
-    movzx eax, word [es:0x5212]
+    jne .vbe_next_mode
+    movzx eax, word [es:0x5212]      ; X resolution
     cmp eax, 640
-    jb .next_mode
-    movzx eax, word [es:0x5214]
+    jb .vbe_next_mode
+    movzx eax, word [es:0x5214]      ; Y resolution
     cmp eax, 400
-    jb .next_mode
-    cmp byte [es:0x521A], 32
-    jne .next_mode
+    jb .vbe_next_mode
+    cmp byte [es:0x521A], 32         ; bits per pixel
+    jne .vbe_next_mode
 
-    mov ax, [es:0x5210]
-    mov [0x5010], ax                 ; pitch
+    ; chosen: copy key fields to fixed slots
+    mov ax, [es:0x5210]              ; bytes per scanline
+    mov [0x5010], ax
     mov ax, [es:0x5212]
     mov [0x5012], ax                 ; width
     mov ax, [es:0x5214]
     mov [0x5014], ax                 ; height
     mov al, [es:0x521A]
     mov [0x501A], al                 ; bpp
-    mov eax, [es:0x5228]
-    mov [0x5028], eax                ; LFB phys
+    mov eax, [es:0x5228]             ; LFB physical address
+    mov [0x5028], eax
     mov [0x5030], bx                 ; mode number
-    jmp .mode_found
-.next_mode:
+    jmp .vbe_mode_found
+.vbe_next_mode:
     add si, 2
     dec cx
-    jnz .mode_loop
+    jnz .vbe_mode_loop
     jmp .vbe_none
-.mode_found:
+.vbe_mode_found:
     mov bx, [0x5030]
-    or  bx, 0x4000                   ; LFB flag
-    mov ax, 0x4F02
+    or  bx, 0x4000                   ; linear framebuffer flag
+    mov ax, 0x4F02                   ; Set VBE mode
     int 0x10
     cmp ax, 0x004F
     jne .vbe_none
     mov byte [0x50FE], 1             ; vbe_ok
 .vbe_none:
 .vbe_done:
-    mov al, 'V'
-    call rs_putc
     ; --- enable A20 (fast gate) ---
     in  al, 0x92
     or  al, 2
@@ -209,8 +159,6 @@ rs_putc:
     mov eax, cr0
     or  eax, 1
     mov cr0, eax
-    mov al, 'P'
-    call rs_putc
     jmp CODE32_SEL:pm_entry
 
 disk_error:
@@ -281,9 +229,6 @@ pm_entry:
 
 use64
 lm_entry:
-    mov al, 'L'
-    mov dx, 0xE9
-    out dx, al
     mov ax, DATA_SEL
     mov ds, ax
     mov es, ax
