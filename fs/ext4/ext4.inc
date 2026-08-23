@@ -23,20 +23,15 @@ EH_MAGIC     = 0xF30A
 ext4_mount:                       ; CF=0 ok
     push rdi
     push rcx
-    mov al, '['
-    call e4_putc                     ; DEBUG: entered mount
+    mov dword [r14 + 0x30000], 1            ; stage 1: entered
     lea rdi, [r15 + ext4_sb - kmain]
     mov eax, 2                    ; superblock at byte 1024 -> LBA 2
     mov ecx, 2
     call disk_read_blocks
-    mov al, 'M'
-    call e4_putc
+    mov dword [r14 + 0x30000], 2            ; stage 2: block read done
     jc .fail
-    mov al, 'N'
-    call e4_putc
+    mov dword [r14 + 0x30000], 3            ; stage 3: magic checked
     cmp word [r15 + ext4_sb - kmain + SB_MAGIC], 0xEF53
-    mov al, 'O'
-    call e4_putc
     jne .fail
     mov eax, dword [r15 + ext4_sb - kmain + SB_INCOMPAT]
     and eax, E4_INCOMPAT_MASK                ; unsupported feature bits left?
@@ -61,6 +56,7 @@ ext4_mount:                       ; CF=0 ok
     mov eax, dword [r15 + ext4_sb - kmain + SB_FDB]
     inc eax
     mov [r15 + ext4_gdtb - kmain], eax   ; GDT block (v1: one block)
+    mov dword [r14 + 0x30000], 4         ; stage 4: mount complete
     mov byte [r15 + ext4_ok - kmain], 1
     clc
 .pop:
