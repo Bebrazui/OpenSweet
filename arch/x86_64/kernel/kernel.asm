@@ -30,6 +30,14 @@ RESERVE_PAGES = 0x23               ; low boot structures + kernel + bitmap
 ; --- VMM test target ---
 TEST_VIRT    = 0x6000000000
 
+; --- VBE framebuffer (slots filled by boot @0x5010..) ---
+VBS_PITCH  = 0x5010
+VBS_WIDTH  = 0x5012
+VBS_HEIGHT = 0x5014
+VBS_BPP    = 0x501A
+VBS_LFB    = 0x5028
+VBS_OK     = 0x50FE
+
 org 0xFFFF800000010000
 use64
 
@@ -85,6 +93,7 @@ kmain:
     call pmm_init
     call ata_init
     call ext4_mount
+    call fb_test_pattern
 
     mov rsi, banner
     call puts
@@ -1073,3 +1082,54 @@ rb 0x53-$+keymap_shift
 
 include '..\drivers\ata.asm'
 include 'D:\Opensweet\fs\ext4\ext4.inc'
+
+; ================= framebuffer test pattern (proves VBE LFB works) =================
+; fills screen with per-pixel gradient: R=x, G=y, B=(x+y) & 255
+fb_test_pattern:
+    cmp byte [r14 + VBS_OK], 1
+    jne .ret
+    ; load params
+    movzx eax, word [r14 + VBS_PITCH]
+    mov [r15 + vbe_pitch - kmain], eax
+    movzx eax, word [r14 + VBS_WIDTH]
+    mov [r15 + vbe_width - kmain], eax
+    movzx eax, word [r14 + VBS_HEIGHT]
+    mov [r15 + vbe_height - kmain], eax
+    mov eax, dword [r14 + VBS_LFB]
+    mov [r15 + vbe_lfb - kmain], eax
+
+    xor r8d, r8d                     ; y = 0
+.yloop:
+    mov r9d, 0                       ; x = 0
+.xloop:
+    mov eax, r9d
+    and eax, 0xFF                    ; R = x
+    shl eax, 16
+    mov ecx, r8d
+    and ecx, 0xFF
+    mov edx, ecx
+    shl edx, 8                       ; G = y
+    or eax, edx
+    add ecx, r9d                     ; B = (x+y)
+    and ecx, 0xFF
+    or eax, ecx
+    mov edi, [r15 + vbe_lfb - kmain]
+    mov ecx, [r15 + vbe_pitch - kmain]
+    imul ecx, r8d
+    add edi, ecx
+    lea rdi, [rdi + r9*4]
+    mov [rdi], eax
+    inc r9d
+    cmp r9d, [r15 + vbe_width - kmain]
+    jb .xloop
+    inc r8d
+    cmp r8d, [r15 + vbe_height - kmain]
+    jb .yloop
+.ret:
+    ret
+
+align 16
+vbe_lfb    dd 0
+vbe_pitch  dd 0
+vbe_width  dd 0
+vbe_height dd 0
