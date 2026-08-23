@@ -3,3 +3,6 @@ build/
 
 # editor
 *.bak
+
+# KolibriOS GPL reference - local study copy only, NEVER commit
+build/_kolibri_ext.inc
