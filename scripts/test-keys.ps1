@@ -14,7 +14,7 @@ Start-Sleep 1
 
 $qemu = "C:\Program Files\qemu\qemu-system-x86_64.exe"
 $q = Start-Process -FilePath $qemu -ArgumentList `
-    "-drive","format=raw,file=build\os.img", `
+    "-drive","format=raw,file=build\os.img", "-drive","format=raw,file=build\disk.img,if=ide,index=1", `
     "-display","none", `
     "-serial","file:build\serial.log", `
     "-monitor","telnet:127.0.0.1:$MonitorPort`,server,nowait" -PassThru

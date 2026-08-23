@@ -83,6 +83,7 @@ kmain:
     sti
     call apic_init
     call pmm_init
+    call ata_init
 
     mov rsi, banner
     call puts
@@ -165,6 +166,11 @@ kmain:
     call streq
     test al, al
     jnz .do_map
+    mov rsi, cmd_buf
+    mov rdi, cmd_ata
+    call streq
+    test al, al
+    jnz .do_ata
     jmp .prompt
 .do_exc:
     db 0xCC                   ; int3 -> #BP (vector 3)
@@ -239,6 +245,46 @@ kmain:
     mov rsi, msg_oom
     call puts
     jmp .prompt
+.do_ata:
+    ; sectors count of data drive
+    mov rsi, msg_atasec
+    call puts
+    mov eax, dword [r15 + ata_sectors - kmain]
+    call puthex64
+    mov al, 10
+    call putc
+    ; read sector 0 into ata_buf and dump first 16 bytes
+    lea rdi, [r15 + ata_buf - kmain]
+    xor eax, eax             ; LBA 0
+    mov ecx, 1
+    call disk_read_blocks
+    jc .ata_err
+    mov rsi, msg_atadump
+    call puts
+    lea rbx, [r15 + ata_buf - kmain]
+    xor ecx, ecx             ; byte index
+.ata_byte:
+    movzx eax, byte [rbx + rcx]
+    shr al, 4                ; high nibble
+    call hexdigit
+    call putc
+    movzx eax, byte [rbx + rcx]
+    and al, 0xF              ; low nibble
+    call hexdigit
+    call putc
+    mov al, ' '
+    call putc
+    inc ecx
+    cmp ecx, 16
+    jb .ata_byte
+    mov al, 10
+    call putc
+    jmp .prompt
+.ata_err:
+    mov rsi, msg_ataerr
+    call puts
+    jmp .prompt
+
 .prompt:
     mov rsi, prompt
     call puts
@@ -920,6 +966,7 @@ cmd_div  db "div", 0
 cmd_ticks db "ticks", 0
 cmd_mem   db "mem", 0
 cmd_map   db "map", 0
+cmd_ata   db "ata", 0
 msg_freepages db "free_pages=", 0
 msg_a     db " a=", 0
 msg_b     db " b=", 0
@@ -927,6 +974,9 @@ msg_eq    db "EQ", 10, 0
 msg_ne    db "NE", 10, 0
 msg_mapval db "mapped_value=", 0
 msg_oom   db "OOM", 10, 0
+msg_atasec db "ata_sectors=", 0
+msg_atadump db "sec0: ", 0
+msg_ataerr db "ATA ERR", 10, 0
 kb_buf   rb 32
 kb_head  db 0
 kb_tail  db 0
@@ -953,3 +1003,5 @@ db "QWERTYUIOP{}",10,0
 db 'ASDFGHJKL:"',126,0,"|"
 db "ZXCVBNM<>?",0,0,0," "
 rb 0x53-$+keymap_shift
+
+include '..\drivers\ata.asm'

@@ -17,7 +17,8 @@
 - Многозадачность: context switch, кольца 0/3
 
 ## Фаза 2 — подсистемы
-- ext4: read-only сначала (superblock, GDT, extents, inode cache); запись потом
+- [x] Блочный слой: ATA PIO драйвер (LBA28, primary master+slave, polling, таймауты), команда `ata` (identify + дамп сектора), make-disk.cmd тестовый образ
+- ext4: read-only сначала (superblock, GDT, extents, inode cache); запись потом — дизайн в docs/EXT4.md
 - littlefs: портирование эталонного кода (чистый C99) — нужен компилятор в ядре или ручной транслят; вариант: собрать через GCC и слинковать
 - LVGL: framebuffer-драйвер (VBE/VESA или UEFI GOP), lv_port_disp
 - Ввод: USB HID (xHCI) для мыши; BT — BLE HOG через контроллер (ESP32 как сопроцессор по UART/SPI — самый быстрый путь)

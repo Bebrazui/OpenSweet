@@ -11,6 +11,7 @@
 
 Автотест клавиатуры headless (QEMU monitor sendkey):
 
+    make-disk.cmd             (тестовый диск build\disk.img)
     test.cmd                  (набирает div ret)
     test.cmd t,i,c,k,s,ret    (свои клавиши через запятые)
 
