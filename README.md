@@ -1,0 +1,27 @@
+# Opensweet OS
+
+Мультиархитектурная ОС: x86_64, ARM64, RISC-V, Tensilica Xtensa.
+Ядро на ассемблере (FASM для x86_64), файловые системы ext4 + littlefs, GUI на LVGL, ввод по WiFi/BT (мышь/клавиатура).
+
+## Сборка и запуск (x86_64, уже работает)
+
+    build.cmd
+    "C:\Program Files\qemu\qemu-system-x86_64.exe" -drive format=raw,file=build\os.img -display gtk
+
+Serial-лог ядра пишется на COM1 (`-serial file:log` для headless-теста).
+
+Что умеет ядро 0.0.1: MBR -> protected mode -> long mode, identity-map 1GB
+(2MB pages), вывод на VGA+COM1, polled PS/2 клавиатура с echo-shell.
+
+## Структура
+
+    arch/x86_64   загрузчик + ядро (FASM)
+    arch/arm64    план: QEMU virt, PL011 UART, Linux-style Image header
+    arch/riscv64  план: QEMU virt + SBI, NS16550 UART
+    arch/xtensa   план: ESP32, crosstool-NG toolchain, esptool
+    fs/ext4       read-only драйвер ext4 (extents, CRC32C)
+    fs/littlefs   портирование littlefs (MIT)
+    gui/lvgl      портирование LVGL, framebuffer-драйвер
+    drivers/input BT HID (BLE HOG) + WiFi стек
+
+Подробный план: docs/ROADMAP.md
