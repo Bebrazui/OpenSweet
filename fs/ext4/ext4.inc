@@ -23,14 +23,17 @@ EH_MAGIC     = 0xF30A
 ext4_mount:                       ; CF=0 ok
     push rdi
     push rcx
-    mov dword [r14 + 0x30000], 1            ; stage 1: entered
+    mov al, '1'
+    call e4_putc
     lea rdi, [r15 + ext4_sb - kmain]
     mov eax, 2                    ; superblock at byte 1024 -> LBA 2
     mov ecx, 2
     call disk_read_blocks
-    mov dword [r14 + 0x30000], 2            ; stage 2: block read done
+    mov al, '2'
+    call e4_putc
     jc .fail
-    mov dword [r14 + 0x30000], 3            ; stage 3: magic checked
+    mov al, '3'
+    call e4_putc
     cmp word [r15 + ext4_sb - kmain + SB_MAGIC], 0xEF53
     jne .fail
     mov eax, dword [r15 + ext4_sb - kmain + SB_INCOMPAT]
@@ -56,7 +59,8 @@ ext4_mount:                       ; CF=0 ok
     mov eax, dword [r15 + ext4_sb - kmain + SB_FDB]
     inc eax
     mov [r15 + ext4_gdtb - kmain], eax   ; GDT block (v1: one block)
-    mov dword [r14 + 0x30000], 4         ; stage 4: mount complete
+    mov al, '4'
+    call e4_putc
     mov byte [r15 + ext4_ok - kmain], 1
     clc
 .pop:

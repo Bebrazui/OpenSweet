@@ -84,9 +84,7 @@ kmain:
     call apic_init
     call pmm_init
     call ata_init
-    ; TODO(bug): call ext4_mount -> #UD @ org+0x10001 even with empty body;
-    ; investigate FASM include/call resolution under high org
-    ; call ext4_mount
+    call ext4_mount
 
     mov rsi, banner
     call puts
