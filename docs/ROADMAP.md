@@ -8,8 +8,9 @@
 
 ## Фаза 1 — ядро x86_64
 - [x] IDT + обработчики исключений 0-31 (halt-loop + печать вектора/RIP), тест-команды `exc`/`div`
-- [x] Прерывания вместо polling: remap 8259 PIC (IRQ0-7 -> 0x20), PIT ~1kHz тики (`ticks`), IRQ1 клавиатура -> ring buffer, hlt-idle
-- APIC таймер
+- [x] Прерывания вместо polling: remap 8259 PIC, PIT ~1kHz тики (`ticks`), IRQ1 клавиатура -> ring buffer, hlt-idle
+- [x] Local APIC: включение, маскировка LVT, таймер periodic 1кГц (ICR=6250 @ QEMU 100МГц, /16); PIC идёт через LVT LINT0=ExtINT; dual EOI (PIC+LAPIC)
+- Калибровка LAPIC-таймера на реальном железе (PIT one-shot + опрос порта)
 - PMM (bitmap), VMM (higher-half, 4KB+2MB pages)
 - Загрузка через UEFI (PE32+ образ) — FASM умеет PE64
 - Многозадачность: context switch, кольца 0/3

@@ -16,8 +16,10 @@
 
 Serial-лог ядра пишется на COM1 (`-serial file:log` для headless-теста).
 
-Что умеет ядро 0.0.1: MBR -> protected mode -> long mode, identity-map 1GB
-(2MB pages), вывод на VGA+COM1, polled PS/2 клавиатура с echo-shell.
+Что умеет ядро 0.0.1: MBR -> protected mode -> long mode, identity-map 1GB +
+[3GB,4GB) для MMIO (LAPIC), вывод на VGA+COM1, IDT с обработкой исключений,
+Local APIC timer 1кГц, прерывистая PS/2 клавиатура с echo-shell
+(команды: `exc`, `div`, `ticks`).
 
 ## Структура
 

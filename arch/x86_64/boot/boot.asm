@@ -2,7 +2,7 @@
 ; Loads kernel to 0x10000, A20 on, protected mode -> long mode -> jump to kernel.
 
 KERNEL_ADDR    = 0x10000
-KERNEL_SECTORS = 16
+KERNEL_SECTORS = 16              ; TODO: multi-track CHS load when kernel > 8KB
 
 org 0x7C00
 use16
@@ -66,7 +66,8 @@ pm_entry:
     mov ss, ax
     mov esp, 0x7C00
 
-    ; --- page tables: PML4@0x1000, PDPT@0x2000, PD@0x3000 (identity 1GB, 2MB pages) ---
+    ; --- page tables: PML4@0x1000, PDPT@0x2000, PD@0x3000 (identity 1GB, 2MB pages),
+    ;     PDPT[3] -> 1GB page for [3GB,4GB) so LAPIC MMIO @0xFEE00000 is mapped ---
     mov edi, 0x1000
     xor eax, eax
     mov ecx, 0xC00          ; clear 12KB
@@ -74,6 +75,7 @@ pm_entry:
 
     mov dword [0x1000], 0x2001   ; PML4[0] -> PDPT
     mov dword [0x2000], 0x3001   ; PDPT[0] -> PD
+    mov dword [0x2018], 0xC0000087  ; PDPT[3]: 1GB page @ 3GB, P|RW|PS
 
     mov edi, 0x3000
     mov eax, 0x83                ; P|RW|PS, phys 0

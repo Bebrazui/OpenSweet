@@ -6,6 +6,16 @@ COLS     = 80
 ROWS     = 25
 COM1     = 0x3F8
 
+; --- Local APIC ---
+LAPIC_BASE = 0xFEE00000
+LAPIC_EOI   = LAPIC_BASE + 0x0B0
+LAPIC_SPUR  = LAPIC_BASE + 0x0F0
+LAPIC_LVTTR = LAPIC_BASE + 0x320
+LAPIC_TICR  = LAPIC_BASE + 0x380
+LAPIC_TCCR  = LAPIC_BASE + 0x390
+LAPIC_TDCR  = LAPIC_BASE + 0x3E0
+TIMER_VEC   = 0x30                ; outside PIC range 0x20-0x2F
+
 org 0x10000
 use64
 
@@ -49,6 +59,8 @@ kmain:
     call pit_init
 
     sti
+
+    call apic_init
 
     mov rsi, banner
     call puts
@@ -338,6 +350,24 @@ init_idt:
     cmp rbx, 16
     jb .irq_next
 
+    ; vectors 48..255 <- generic ignore stub (spurious-safe)
+    mov ebx, 48
+.fill_rest:
+    lea rax, [irq_spur]
+    mov rdi, rbx
+    shl rdi, 4
+    add rdi, idt
+    mov [rdi], ax
+    shr rax, 16
+    mov word [rdi+6], ax
+    shr rax, 16
+    mov [rdi+8], eax
+    mov word [rdi+2], 0x18
+    mov byte [rdi+5], 0x8E
+    inc ebx
+    cmp ebx, 256
+    jb .fill_rest
+
     lidt tword [idtr]
     ret
 
@@ -373,22 +403,21 @@ pit_init:
     out 0x40, al
     ret
 
-; --- hardware IRQ common: EOI + dispatch vector 32..47 ---
+; --- hardware IRQ common: EOI by source + dispatch ---
 common_irq:
     push rax
-    mov rax, [rsp+8]          ; vector number pushed by stub
-    cmp rax, 40
-    jb .master_eoi
+    ; always ack BOTH controllers - covers PIC, LAPIC-EXTINT and LAPIC paths
     mov al, 0x20
-    out 0xA0, al              ; EOI slave
-.master_eoi:
-    mov al, 0x20
-    out 0x20, al              ; EOI master
+    out 0x20, al
+    mov ecx, LAPIC_EOI
+    xor eax, eax
+    mov dword [ecx], eax
     mov rax, [rsp+8]
-    sub rax, 32               ; irq index
-    cmp rax, 0
-    je .timer
-    cmp rax, 1
+    cmp rax, TIMER_VEC
+    je .timer                 ; LAPIC timer
+    cmp rax, 32
+    je .timer                 ; legacy PIT IRQ0 (pre-calibration)
+    cmp rax, 33               ; vector 32+1 = IRQ1 keyboard
     je .kbd
     jmp .ret
 .timer:
@@ -401,6 +430,10 @@ common_irq:
     add rsp, 8                ; drop pushed vector -> rsp points at RIP
     iretq
 
+irq_spur:
+    push 47                   ; dummy vector -> unknown path, just EOI
+    jmp common_irq
+
 rept 16 n
 {
     irq#n:
@@ -411,6 +444,44 @@ rept 16 n
 align 8
 irq_table:
 rept 16 n { dq irq#n }
+
+; --- Local APIC timer: periodic ~1kHz (ICR=6250, bus 100MHz, /16). ---
+; NOTE: after LAPIC enable + LINT0 masked, the PIC cannot deliver anymore,
+; so there is NO PIT-based calibration possible here. Fixed QEMU assumption;
+; recalibrate via PIT one-shot + port polling on real HW later.
+apic_init:
+    mov eax, 1
+    cpuid
+    test edx, 1 shl 9         ; APIC present?
+    jz .no_apic
+
+    ; spurious register: vector 0xFF + enable bit8
+    mov ecx, LAPIC_SPUR
+    mov dword [ecx], 0x1FF
+
+    ; mask ALL LVTs: silence EXTINT/LINT/error paths
+    mov ecx, LAPIC_BASE + 0x330     ; thermal
+    mov dword [ecx], 0x10000
+    mov ecx, LAPIC_BASE + 0x340     ; performance
+    mov dword [ecx], 0x10000
+    mov ecx, LAPIC_BASE + 0x350     ; LINT0 = ExtINT mode: PIC passes through LAPIC
+    mov dword [ecx], 0x00700
+    mov ecx, LAPIC_BASE + 0x360     ; LINT1
+    mov dword [ecx], 0x10000
+    mov ecx, LAPIC_BASE + 0x370     ; error
+    mov dword [ecx], 0x10000
+
+    ; timer: /16, periodic, 6250 counts = 1ms @ 100MHz
+    mov ecx, LAPIC_TDCR
+    mov dword [ecx], 3                        ; divide by 16
+    mov ecx, LAPIC_LVTTR
+    mov dword [ecx], TIMER_VEC or 0x20000     ; vector | periodic(bit17)
+    mov ecx, LAPIC_TICR
+    mov dword [ecx], 6250
+
+.skip:
+.no_apic:
+    ret
 
 common_ex:
     mov rsi, exc_msg
