@@ -219,16 +219,18 @@ disk_read_blocks:
     push rcx
     call ata_read_one
     pop rcx
-    jc .fail
+    jnc .dr_ok
+    mov al, 'X'              ; DEBUG: sector read failed
+    call putc
+    stc
+    ret
+.dr_ok:
     add rdi, 512
     inc rax
     dec rcx
     jnz .dr_loop
 .ok:
     clc
-    ret
-.fail:
-    stc
     ret
 
 align 16

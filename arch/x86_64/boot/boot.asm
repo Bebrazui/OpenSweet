@@ -17,38 +17,36 @@ start:
     sti
     mov [boot_drive], dl
 
-    ; --- load kernel: multi-track CHS read (1 sector per int13 call) ---
+    ; --- load kernel: LBA->CHS per IDE geometry (63 spt, 16 heads) ---
     mov ax, KERNEL_LOAD_SEG
     mov es, ax
-    xor bx, bx               ; es:bx = 0x1000:0000
-    mov si, KERNEL_SECTORS   ; remaining sectors
-    mov byte [cur_cyl], 0
-    mov byte [cur_head], 0
-    mov byte [cur_sec], 2
+    mov word [cur_lba], 1    ; first sector after MBR
+    mov si, KERNEL_SECTORS
 .read_loop:
-    mov ah, 0x02
-    mov al, 1
-    mov ch, [cur_cyl]
-    mov cl, [cur_sec]
+    mov ax, [cur_lba]
+    xor dx, dx
+    mov cx, 63
+    div cx                   ; ax = t, dx = sector-1
+    inc dx
+    push dx
+    xor dx, dx
+    mov cx, 16
+    div cx                   ; ax = cylinder, dx = head
+    mov [cur_head], dl
+    pop dx
+    mov [cur_cyl], ax
+    mov cl, dl               ; sector
+    mov ch, al               ; cylinder low
     mov dh, [cur_head]
     mov dl, [boot_drive]
+    mov ah, 0x02             ; BIOS: read sectors
+    mov al, 1
     int 0x13
     jc  disk_error
     mov ax, es
-    add ax, 0x20             ; next 512-byte paragraph
+    add ax, 0x20
     mov es, ax
-
-    ; advance CHS: 18 sectors/head, 2 heads
-    inc byte [cur_sec]
-    cmp byte [cur_sec], 18
-    jbe .no_track
-    mov byte [cur_sec], 1
-    inc byte [cur_head]
-    cmp byte [cur_head], 2
-    jb .no_track
-    mov byte [cur_head], 0
-    inc byte [cur_cyl]
-.no_track:
+    inc word [cur_lba]
     dec si
     jnz .read_loop
 
@@ -186,7 +184,8 @@ gdt_descriptor:
     dd gdt_start
 
 boot_drive db 0
-cur_cyl    db 0
+cur_lba    dw 0
+cur_cyl    dw 0
 cur_head   db 0
 cur_sec    db 0
 KERNEL_LOAD_SEG = 0x1000

@@ -29,13 +29,21 @@ ext4_mount:                       ; CF=0 ok
     mov eax, 2                    ; superblock at byte 1024 -> LBA 2
     mov ecx, 2
     call disk_read_blocks
-    mov al, '2'
-    call e4_putc
     jc .fail
-    mov al, '3'
+    ; DEBUG: magic word -> COM1 as 2 hex digits + raw bytes
+    mov al, 'B'
+    call e4_putc
+    mov bl, byte [r15 + ext4_sb - kmain + SB_MAGIC]
+    mov cl, byte [r15 + ext4_sb - kmain + SB_MAGIC + 1]
+    mov al, bl
+    call e4_putc
+    mov al, cl
+    call e4_putc
+    mov al, ' '
     call e4_putc
     cmp word [r15 + ext4_sb - kmain + SB_MAGIC], 0xEF53
     jne .fail
+
     mov eax, dword [r15 + ext4_sb - kmain + SB_INCOMPAT]
     and eax, E4_INCOMPAT_MASK                ; unsupported feature bits left?
     jnz .fail
