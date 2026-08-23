@@ -84,6 +84,8 @@ kmain:
     call apic_init
     call pmm_init
     call ata_init
+    ; TODO: debug #UD on entry - see WIP notes
+    ; call ext4_mount
 
     mov rsi, banner
     call puts
@@ -171,6 +173,17 @@ kmain:
     call streq
     test al, al
     jnz .do_ata
+    mov rdi, cmd_ls
+    call streq
+    test al, al
+    jnz .do_ls
+    ; prefix command "cat <path>"
+    mov rsi, cmd_buf
+    lea rdi, [r15 + str_catsp - kmain]
+    mov ecx, 4
+    call strpref
+    test al, al
+    jnz .do_cat
     jmp .prompt
 .do_exc:
     db 0xCC                   ; int3 -> #BP (vector 3)
@@ -282,6 +295,44 @@ kmain:
     jmp .prompt
 .ata_err:
     mov rsi, msg_ataerr
+    call puts
+    jmp .prompt
+.do_ls:
+    cmp byte [r15 + ext4_ok - kmain], 0
+    je .fs_err
+    mov eax, 2                    ; root inode
+    call ext4_inode_load
+    jc .fs_err
+    call ext4_ls_print
+    mov al, 10
+    call putc
+    jmp .prompt
+.do_cat:
+    lea rsi, [r15 + cmd_buf - kmain]
+    add rsi, 4                    ; skip "cat "
+    lea rdi, [r15 + e4t_path - kmain]
+    mov byte [rdi], '/'
+    inc rdi
+.cat_cp:
+    lodsb
+    test al, al
+    jz .cat_cpd
+    stosb
+    jmp .cat_cp
+.cat_cpd:
+    mov byte [rdi], 0
+    lea rsi, [r15 + e4t_path - kmain]
+    call ext4_lookup
+    test eax, eax
+    jz .fs_err
+    call ext4_inode_load
+    jc .fs_err
+    call ext4_cat_print
+    mov al, 10
+    call putc
+    jmp .prompt
+.fs_err:
+    mov rsi, msg_fserr
     call puts
     jmp .prompt
 
@@ -967,6 +1018,8 @@ cmd_ticks db "ticks", 0
 cmd_mem   db "mem", 0
 cmd_map   db "map", 0
 cmd_ata   db "ata", 0
+cmd_ls    db "ls", 0
+str_catsp db "cat ", 0
 msg_freepages db "free_pages=", 0
 msg_a     db " a=", 0
 msg_b     db " b=", 0
@@ -977,6 +1030,19 @@ msg_oom   db "OOM", 10, 0
 msg_atasec db "ata_sectors=", 0
 msg_atadump db "sec0: ", 0
 msg_ataerr db "ATA ERR", 10, 0
+msg_fserr db "FS ERR", 10, 0
+
+; --- prefix compare: RSI vs RDI, RCX bytes -> AL=1 equal ---
+strpref:
+    push rsi
+    push rdi
+    push rcx
+    repe cmpsb
+    setz al
+    pop rcx
+    pop rdi
+    pop rsi
+    ret
 kb_buf   rb 32
 kb_head  db 0
 kb_tail  db 0
@@ -1005,3 +1071,4 @@ db "ZXCVBNM<>?",0,0,0," "
 rb 0x53-$+keymap_shift
 
 include '..\drivers\ata.asm'
+include 'D:\Opensweet\fs\ext4\ext4.inc'

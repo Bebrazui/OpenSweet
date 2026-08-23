@@ -152,7 +152,15 @@ ata_read_one:
     or al, [r15 + ata_drv - kmain]
     mov dx, ATA_DRV
     out dx, al
+    mov al, 'z'
+    push rdx
+    mov dx, 0xE9
+    out dx, al
+    pop rdx
     call ata_wait_ready
+    mov al, 'a'
+    mov dx, 0xE9
+    out dx, al
     jnc .sel_ok
     stc
     jmp .pop
@@ -181,6 +189,9 @@ ata_read_one:
     out dx, al
 
     call ata_wait_drq
+    mov al, 'b'
+    mov dx, 0xE9
+    out dx, al
     jnc .got_data
     stc
     jmp .pop

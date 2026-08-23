@@ -11,6 +11,7 @@ $Keys = $KeysCsv -split '[\s,]+' | Where-Object { $_ }
 
 Get-Process qemu-system-* -ErrorAction SilentlyContinue | Stop-Process -Force
 Start-Sleep 1
+Remove-Item build\serial.log -ErrorAction SilentlyContinue
 
 $qemu = "C:\Program Files\qemu\qemu-system-x86_64.exe"
 $q = Start-Process -FilePath $qemu -ArgumentList `
@@ -29,11 +30,13 @@ try {
         $s.Write($b, 0, $b.Length)
         Start-Sleep -Milliseconds $SettleMS
     }
+    Start-Sleep -Seconds 2
+    $b = [Text.Encoding]::ASCII.GetBytes("quit`n")
+    $s.Write($b, 0, $b.Length)
+    Start-Sleep -Seconds 1
     $c.Close()
 } finally {
-    Start-Sleep -Seconds 2
-    Stop-Process -Id $q.Id -Force
+    Get-Process qemu-system-* -ErrorAction SilentlyContinue | Stop-Process -Force
 }
 
-"--- SERIAL LOG ---"
-Get-Content build\serial.log
+if (Test-Path build\serial.log) { Get-Content build\serial.log } else { "NO SERIAL LOG - qemu failed to start?" }
