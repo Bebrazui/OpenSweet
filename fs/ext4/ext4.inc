@@ -23,8 +23,6 @@ EH_MAGIC     = 0xF30A
 ext4_mount:                       ; CF=0 ok
     push rdi
     push rcx
-    mov al, '1'
-    call e4_putc
     lea rdi, [r15 + ext4_sb - kmain]
     mov eax, 2                    ; superblock at byte 1024 -> LBA 2
     mov ecx, 2
@@ -45,7 +43,9 @@ ext4_mount:                       ; CF=0 ok
     jne .fail
 
     mov eax, dword [r15 + ext4_sb - kmain + SB_INCOMPAT]
-    and eax, E4_INCOMPAT_MASK                ; unsupported feature bits left?
+    mov ecx, E4_INCOMPAT_MASK
+    not ecx                       ; ecx = unsupported bits mask
+    and eax, ecx
     jnz .fail
 
     mov eax, dword [r15 + ext4_sb - kmain + SB_LOG_BS]
@@ -253,10 +253,11 @@ ext4_dir_find:
     push r10
     push r11
     mov ebx, ecx                            ; name length
+    mov r11, rsi                            ; keep name pointer safe
     mov dword [r15 + e4t_lb - kmain], 0
 .dfb:
     mov eax, dword [r15 + e4t_lb - kmain]
-    mov ecx, dword [r15 + ext4_lbs - kmain]
+    mov ecx, [r15 + ext4_lbs - kmain]
     add ecx, 10
     shl rax, cl                             ; logical byte offset
     cmp rax, qword [r15 + ext4_inode - kmain + IN_OFF_SIZE]
@@ -266,15 +267,14 @@ ext4_dir_find:
     cmp rax, -1
     je .notfound
     lea rsi, [r15 + ext4_bbuf - kmain]
-    call ext4_blk_read                      ; rsi restored by callee
+    call ext4_blk_read
     lea r8, [r15 + ext4_bbuf - kmain]
-    mov ecx, dword [r15 + ext4_lbs - kmain]
+    mov ecx, [r15 + ext4_lbs - kmain]
     inc ecx
     mov edx, 1
     shl edx, cl
-    lea r9, [r8 + rdx]                      ; block end... r9 needs full reg below
     mov r9, r8
-    add r9, rdx
+    add r9, rdx                             ; block end
 .ent:
     cmp r8, r9
     jae .next_blk
@@ -285,21 +285,23 @@ ext4_dir_find:
     cmp eax, ebx
     jne .skip
     lea r10, [r8 + 8]                       ; entry name
-    mov r11, rsi                            ; wanted name
-    push rcx
-    mov ecx, ebx
+    mov rcx, rbx                            ; compare length
+    xor edx, edx                            ; match flag
 .cmp_loop:
+    test ecx, ecx
+    jz .matched
     mov al, [r10]
     cmp al, [r11]
     jne .cmp_diff
     inc r10
     inc r11
     dec ecx
-    jnz .cmp_loop
-    pop rcx
-    jmp .found
+    jmp .cmp_loop
+.matched:
+    mov edx, 1
 .cmp_diff:
-    pop rcx
+    test edx, edx
+    jnz .found
 .skip:
     movzx eax, word [r8 + 4]                ; rec_len
     test ax, ax

@@ -307,6 +307,8 @@ kmain:
     call putc
     jmp .prompt
 .do_cat:
+    cmp byte [r15 + ext4_ok - kmain], 0
+    je .fs_err
     lea rsi, [r15 + cmd_buf - kmain]
     add rsi, 4                    ; skip "cat "
     lea rdi, [r15 + e4t_path - kmain]
