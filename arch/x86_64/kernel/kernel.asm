@@ -16,6 +16,20 @@ LAPIC_TCCR  = LAPIC_BASE + 0x390
 LAPIC_TDCR  = LAPIC_BASE + 0x3E0
 TIMER_VEC   = 0x30                ; outside PIC range 0x20-0x2F
 
+; --- memory map (from boot) ---
+MEMMAP_COUNT = 0x5FFC
+MEMMAP_BASE  = 0x6000
+
+; --- physical memory manager: bitmap of 4KB pages, covers first 256MB ---
+PMM_BITMAP   = 0x20000            ; 8KB bitmap, identity-mapped low RAM
+BITMAP_BITS  = 65536              ; 256MB / 4KB
+BITMAP_DWORDS = BITMAP_BITS / 32
+BITMAP_BYTES = BITMAP_BITS / 8
+RESERVE_PAGES = 0x23               ; low boot structures + kernel + bitmap
+
+; --- VMM test target ---
+TEST_VIRT    = 0x6000000000
+
 org 0x10000
 use64
 
@@ -61,6 +75,7 @@ kmain:
     sti
 
     call apic_init
+    call pmm_init
 
     mov rsi, banner
     call puts
@@ -133,6 +148,16 @@ kmain:
     call streq
     test al, al
     jnz .do_ticks
+    mov rsi, cmd_buf
+    mov rdi, cmd_mem
+    call streq
+    test al, al
+    jnz .do_mem
+    mov rsi, cmd_buf
+    mov rdi, cmd_map
+    call streq
+    test al, al
+    jnz .do_map
     jmp .prompt
 .do_exc:
     db 0xCC                   ; int3 -> #BP (vector 3)
@@ -147,6 +172,65 @@ kmain:
     call puthex64
     mov al, 10
     call putc
+    jmp .prompt
+.do_mem:
+    call count_free           ; r8d = free pages
+    mov rsi, msg_freepages
+    call puts
+    mov eax, r8d
+    call puthex64
+    mov al, 10
+    call putc
+    ; alloc -> free -> alloc must return same page
+    call pmm_alloc
+    mov r8, rax
+    mov rdi, rax
+    call pmm_free
+    call pmm_alloc
+    mov r9, rax
+    mov rsi, msg_a
+    call puts
+    mov rax, r8
+    call puthex64
+    mov rsi, msg_b
+    call puts
+    mov rax, r9
+    call puthex64
+    cmp r8, r9
+    je .mem_eq
+    mov rsi, msg_ne
+    jmp .mem_prn
+.mem_eq:
+    mov rsi, msg_eq
+.mem_prn:
+    call puts
+    jmp .prompt
+.do_map:
+    call pmm_alloc_zero       ; phys page (zeroed)
+    test rax, rax
+    jz .map_oom
+    push rax
+    mov rdi, TEST_VIRT
+    mov r11d, 3               ; P|RW
+    call vmm_map
+    mov rcx, 0x1122334455667788
+    mov rax, TEST_VIRT
+    mov [rax], rcx            ; write via new mapping
+    mov rdx, [rax]            ; read back
+    mov rsi, msg_mapval
+    call puts
+    mov rax, rdx
+    call puthex64
+    mov al, 10
+    call putc
+    mov rdi, TEST_VIRT
+    call vmm_unmap
+    pop rax
+    call pmm_free
+    jmp .prompt
+.map_oom:
+    mov rsi, msg_oom
+    call puts
     jmp .prompt
 .prompt:
     mov rsi, prompt
@@ -368,6 +452,18 @@ init_idt:
     cmp ebx, 256
     jb .fill_rest
 
+    ; entry TIMER_VEC(48) = real LAPIC timer handler (overrides generic stub)
+    lea rax, [irq_timer]
+    mov rdi, (TIMER_VEC)*16
+    add rdi, idt
+    mov [rdi], ax
+    shr rax, 16
+    mov word [rdi+6], ax
+    shr rax, 16
+    mov [rdi+8], eax
+    mov word [rdi+2], 0x18
+    mov byte [rdi+5], 0x8E
+
     lidt tword [idtr]
     ret
 
@@ -405,19 +501,31 @@ pit_init:
 
 ; --- hardware IRQ common: EOI by source + dispatch ---
 common_irq:
+    ; full context save: we run on an arbitrary interrupted thread
     push rax
+    push rcx
+    push rdx
+    push rbx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11                  ; vector now at [rsp + 10*8]
+
     ; always ack BOTH controllers - covers PIC, LAPIC-EXTINT and LAPIC paths
     mov al, 0x20
     out 0x20, al
     mov ecx, LAPIC_EOI
     xor eax, eax
     mov dword [ecx], eax
-    mov rax, [rsp+8]
+
+    mov rax, [rsp+80]
     cmp rax, TIMER_VEC
-    je .timer                 ; LAPIC timer
-    cmp rax, 32
-    je .timer                 ; legacy PIT IRQ0 (pre-calibration)
-    cmp rax, 33               ; vector 32+1 = IRQ1 keyboard
+    je .timer
+    cmp rax, 32               ; legacy PIT IRQ0 (pre-switch)
+    je .timer
+    cmp rax, 33               ; IRQ1 keyboard
     je .kbd
     jmp .ret
 .timer:
@@ -426,12 +534,25 @@ common_irq:
 .kbd:
     call kb_irq
 .ret:
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rbx
+    pop rdx
+    pop rcx
     pop rax
     add rsp, 8                ; drop pushed vector -> rsp points at RIP
     iretq
 
 irq_spur:
     push 47                   ; dummy vector -> unknown path, just EOI
+    jmp common_irq
+
+irq_timer:
+    push TIMER_VEC            ; LAPIC timer vector
     jmp common_irq
 
 rept 16 n
@@ -479,8 +600,221 @@ apic_init:
     mov ecx, LAPIC_TICR
     mov dword [ecx], 6250
 
+    ; mask PIT IRQ0: otherwise ExtINT reflood-storms on every EOI
+    ; (LAPIC timer is the only tick source now)
+    in  al, 0x21
+    or  al, 1
+    out 0x21, al
+
 .skip:
 .no_apic:
+    ret
+
+; --- physical memory manager ---
+; bitmap: 1 bit per 4KB page, first 256MB; 1 = used, 0 = free
+pmm_init:
+    mov edi, PMM_BITMAP
+    mov ecx, BITMAP_BYTES/4
+    mov eax, -1
+    rep stosd                 ; everything used by default
+
+    ; walk e820: clear bits for usable (type=1) ranges
+    mov ebx, [MEMMAP_COUNT]
+    test ebx, ebx
+    jz .head
+    mov rsi, MEMMAP_BASE
+.range:
+    cmp dword [rsi+16], 1
+    jne .next_e
+    mov rax, [rsi]            ; base
+    mov rcx, [rsi+8]          ; length
+    add rcx, rax              ; end
+    mov rdx, 0x10000000       ; clamp to 256MB
+    cmp rcx, rdx
+    jbe .clamped
+    mov rcx, rdx
+.clamped:
+    add rax, 0xFFF            ; round base up to page
+    and rax, -4096
+    cmp rax, rcx
+    jae .next_e
+.page_loop:
+    mov r8, rax
+    shr r8, 12                ; page number
+    cmp r8, BITMAP_BITS
+    jae .next_e
+    mov r9, r8
+    shr r9, 5                 ; dword index
+    and r8d, 31               ; bit index
+    btr dword [PMM_BITMAP + r9*4], r8d
+    add rax, 4096
+    cmp rax, rcx
+    jb .page_loop
+.next_e:
+    add rsi, 20
+    dec ebx
+    jnz .range
+
+.head:
+    ; re-reserve low pages [0, RESERVE_PAGES)
+    mov ecx, RESERVE_PAGES
+.setr:
+    lea eax, [ecx-1]
+    mov r8, rax
+    shr r8, 5
+    and eax, 31
+    bts dword [PMM_BITMAP + r8*4], eax
+    loop .setr
+    ret
+
+; RAX = phys addr of free page (0 = OOM)
+pmm_alloc:
+    xor ebx, ebx
+.dw:
+    mov eax, [PMM_BITMAP + rbx*4]
+    not eax                   ; free bits set
+    test eax, eax
+    jz .next
+    bsf ecx, eax              ; first free bit
+    bts dword [PMM_BITMAP + rbx*4], ecx
+    shl ebx, 5
+    add ebx, ecx
+    shl rbx, 12
+    mov rax, rbx
+    ret
+.next:
+    inc ebx
+    cmp ebx, BITMAP_DWORDS
+    jb .dw
+    xor eax, eax
+    ret
+
+; RAX = zeroed free page phys (0 = OOM)
+pmm_alloc_zero:
+    call pmm_alloc
+    test rax, rax
+    jz .bad
+    mov rdi, rax
+    push rdi
+    mov ecx, 4096/8
+    xor eax, eax
+    rep stosq
+    pop rax
+.bad:
+    ret
+
+; RDI = phys addr to release
+pmm_free:
+    shr rdi, 12
+    mov ecx, edi
+    shr ecx, 5
+    and edi, 31
+    btr dword [PMM_BITMAP + rcx*4], edi
+    ret
+
+; count free pages -> R8D
+count_free:
+    xor ebx, ebx
+    xor r8d, r8d
+.dw:
+    mov eax, [PMM_BITMAP + rbx*4]
+    not eax
+    mov ecx, 32
+.bits:
+    shr eax, 1
+    adc r8d, 0
+    dec ecx
+    jnz .bits
+    inc ebx
+    cmp ebx, BITMAP_DWORDS
+    jb .dw
+    ret
+
+; --- VMM: map/unmap single 4KB pages, tables allocated on demand ---
+; vmm_map: RDI=virt, RAX=phys, R11B=pte flags; preserves params
+vmm_map:
+    push rdi
+    push rax
+    push r11
+    mov rdx, rdi
+    shr rdx, 39
+    and edx, 511              ; PML4 idx
+    mov r8, rdi
+    shr r8, 30
+    and r8d, 511              ; PDPT idx
+    mov r9, rdi
+    shr r9, 21
+    and r9d, 511              ; PD idx
+    mov r10, rdi
+    shr r10, 12
+    and r10d, 511             ; PT idx
+    mov rsi, 0x1000           ; PML4 (linear == phys)
+
+.lvl_pdpt:
+    mov rbx, [rsi + rdx*8]
+    test rbx, rbx
+    jnz .have_pdpt
+    call pmm_alloc_zero
+    or al, 3                  ; P|RW
+    mov [rsi + rdx*8], rax
+.have_pdpt:
+    mov rsi, [rsi + rdx*8]
+    and esi, 0xFFFFF000
+
+.lvl_pd:
+    mov rbx, [rsi + r8*8]
+    test rbx, rbx
+    jnz .have_pd
+    call pmm_alloc_zero
+    or al, 3
+    mov [rsi + r8*8], rax
+.have_pd:
+    mov rsi, [rsi + r8*8]
+    and esi, 0xFFFFF000
+
+.lvl_pt:
+    mov rbx, [rsi + r9*8]
+    test rbx, rbx
+    jnz .have_pt
+    call pmm_alloc_zero
+    or al, 3
+    mov [rsi + r9*8], rax
+.have_pt:
+    mov rsi, [rsi + r9*8]
+    and esi, 0xFFFFF000
+
+    pop r11
+    pop rax
+    pop rdi
+    and rax, -4096
+    or rax, r11               ; final PTE
+    mov [rsi + r10*8], rax
+    ret
+
+; vmm_unmap: RDI=virt (assumes fully populated path)
+vmm_unmap:
+    mov rdx, rdi
+    shr rdx, 39
+    and edx, 511
+    mov r8, rdi
+    shr r8, 30
+    and r8d, 511
+    mov r9, rdi
+    shr r9, 21
+    and r9d, 511
+    mov r10, rdi
+    shr r10, 12
+    and r10d, 511
+    mov rsi, 0x1000
+    mov rsi, [rsi + rdx*8]
+    and esi, 0xFFFFF000
+    mov rsi, [rsi + r8*8]
+    and esi, 0xFFFFF000
+    mov rsi, [rsi + r9*8]
+    and esi, 0xFFFFF000
+    and qword [rsi + r10*8], 0
+    mov rax, cr3
+    mov cr3, rax              ; TLB flush
     ret
 
 common_ex:
@@ -575,6 +909,15 @@ at_msg   db " @ ", 0
 cmd_exc  db "exc", 0
 cmd_div  db "div", 0
 cmd_ticks db "ticks", 0
+cmd_mem   db "mem", 0
+cmd_map   db "map", 0
+msg_freepages db "free_pages=", 0
+msg_a     db " a=", 0
+msg_b     db " b=", 0
+msg_eq    db "EQ", 10, 0
+msg_ne    db "NE", 10, 0
+msg_mapval db "mapped_value=", 0
+msg_oom   db "OOM", 10, 0
 kb_buf   rb 32
 kb_head  db 0
 kb_tail  db 0

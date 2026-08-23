@@ -2,7 +2,7 @@
 ; Loads kernel to 0x10000, A20 on, protected mode -> long mode -> jump to kernel.
 
 KERNEL_ADDR    = 0x10000
-KERNEL_SECTORS = 16              ; TODO: multi-track CHS load when kernel > 8KB
+KERNEL_SECTORS = 32
 
 org 0x7C00
 use16
@@ -17,18 +17,65 @@ start:
     sti
     mov [boot_drive], dl
 
-    ; --- load kernel: CHS read sectors 2..N of track 0 to 0x1000:0000 ---
+    ; --- load kernel: multi-track CHS read (1 sector per int13 call) ---
+    mov ax, KERNEL_LOAD_SEG
+    mov es, ax
+    xor bx, bx               ; es:bx = 0x1000:0000
+    mov si, KERNEL_SECTORS   ; remaining sectors
+    mov byte [cur_cyl], 0
+    mov byte [cur_head], 0
+    mov byte [cur_sec], 2
+.read_loop:
     mov ah, 0x02
-    mov al, KERNEL_SECTORS
-    mov ch, 0
-    mov cl, 2
-    mov dh, 0
+    mov al, 1
+    mov ch, [cur_cyl]
+    mov cl, [cur_sec]
+    mov dh, [cur_head]
     mov dl, [boot_drive]
-    mov bx, KERNEL_LOAD_SEG
-    mov es, bx
-    xor bx, bx
     int 0x13
     jc  disk_error
+    mov ax, es
+    add ax, 0x20             ; next 512-byte paragraph
+    mov es, ax
+
+    ; advance CHS: 18 sectors/head, 2 heads
+    inc byte [cur_sec]
+    cmp byte [cur_sec], 18
+    jbe .no_track
+    mov byte [cur_sec], 1
+    inc byte [cur_head]
+    cmp byte [cur_head], 2
+    jb .no_track
+    mov byte [cur_head], 0
+    inc byte [cur_cyl]
+.no_track:
+    dec si
+    jnz .read_loop
+
+    ; --- e820 memory map -> entries at 0x6000 (20 bytes each), count dword @0x5FFC ---
+    xor ax, ax
+    mov es, ax                ; ES got advanced by the disk reads!
+    mov word [0x5FFC], 0
+    mov di, 0x6000
+    xor ebx, ebx
+    xor bp, bp
+    mov edx, 0x534D4150      ; 'PAMS'
+.e820:
+    mov eax, 0xE820
+    mov ecx, 20
+    int 0x15
+    jc .e820_done
+    cmp eax, 0x534D4150
+    jne .e820_done
+    inc bp
+    add di, 20
+    cmp di, 0x6E00
+    jae .e820_done
+    test bx, bx
+    jnz .e820
+.e820_done:
+    mov [0x5FFC], bp
+    mov word [0x5FFE], 0      ; full dword count
 
     ; --- enable A20 (fast gate) ---
     in  al, 0x92
@@ -135,6 +182,9 @@ gdt_descriptor:
     dd gdt_start
 
 boot_drive db 0
+cur_cyl    db 0
+cur_head   db 0
+cur_sec    db 0
 KERNEL_LOAD_SEG = 0x1000
 err_msg db "DISK ERR", 0
 loading_msg db "OK", 0
