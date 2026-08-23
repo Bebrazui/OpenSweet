@@ -93,9 +93,19 @@ kmain:
     call pmm_init
     call ata_init
     call ext4_mount
+    mov al,'F'
+    call putc
     call fb_test_pattern
+    mov al,'G'
+    call putc
+    mov al,'H'
+    call putc
     call ext4_inode_load_auto
+    mov al,'I'
+    call putc
     call ext4_ls_print
+    mov al,'J'
+    call putc
 
     mov rsi, banner
     call puts
