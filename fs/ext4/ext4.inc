@@ -127,6 +127,8 @@ ext4_inode_load:
     mov eax, [rsi + rcx + 8]                ; bg_inode_table_lo
     mov dword [r15 + e4t_itable - kmain], eax
 
+    mov al, 'g'
+    call e4_putc
     mov eax, dword [r15 + e4t_index - kmain]
     mul dword [r15 + ext4_isize - kmain]    ; edx:eax = byteoff in table
     test edx, edx
@@ -152,6 +154,8 @@ ext4_inode_load:
     lea rdi, [r15 + ext4_inode - kmain]
     mov ecx, dword [r15 + ext4_isize - kmain]
     rep movsb
+    mov al, 'L'
+    call e4_putc
     clc
 .eil_pop:
     pop rdi
@@ -178,6 +182,8 @@ ext4_map:
     mov edx, dword [r15 + ext4_inode - kmain + IN_OFF_FLAGS]
     test edx, EXT_FLAG
     jz .none                                ; legacy indirect: not in v1
+    mov al, 'M'
+    call e4_putc
     lea rsi, [r15 + ext4_inode - kmain + IN_OFF_BLOCK]
 .tree:
     cmp word [rsi], EH_MAGIC
@@ -233,6 +239,8 @@ ext4_map:
     dec r8d
     jnz .map_scan_leaf
 .none:
+    mov al, 'X'
+    call e4_putc
     mov rax, -1
     xor edx, edx
 .done:
