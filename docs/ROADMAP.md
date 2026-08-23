@@ -12,7 +12,7 @@
 - [x] Local APIC: включение, маскировка LVT, таймер periodic 1кГц; PIC через LINT0=ExtINT; dual EOI; полное сохранение контекста в IRQ
 - [x] E820 memory map (boot) -> PMM bitmap 256MB (`mem`: free/alloc/free/alloc-EQ)
 - [x] VMM: vmm_map/vmm_unmap 4KB с аллокацией таблиц по требованию (`map`: запись/чтение через новую трансляцию)
-- Higher-half kernel (линковка на 0xFFFF8000...), 2MB pages для user space
+- [x] Higher-half kernel: org 0xFFFF800000010000, PML4[256] -> 2MB @ phys 0, трамплин из identity; R15=база образа, R14=0 для low-refs
 - Загрузка через UEFI (PE32+ образ) — FASM умеет PE64
 - Многозадачность: context switch, кольца 0/3
 

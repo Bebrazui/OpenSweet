@@ -52,11 +52,11 @@ start:
     dec si
     jnz .read_loop
 
-    ; --- e820 memory map -> entries at 0x6000 (20 bytes each), count dword @0x5FFC ---
+    ; --- e820 memory map -> count dword @0x6000, entries @0x6100 (20 bytes each) ---
     xor ax, ax
     mov es, ax                ; ES got advanced by the disk reads!
-    mov word [0x5FFC], 0
-    mov di, 0x6000
+    mov dword [0x6000], 0
+    mov di, 0x6100
     xor ebx, ebx
     xor bp, bp
     mov edx, 0x534D4150      ; 'PAMS'
@@ -69,13 +69,12 @@ start:
     jne .e820_done
     inc bp
     add di, 20
-    cmp di, 0x6E00
+    cmp di, 0x6F00
     jae .e820_done
     test bx, bx
     jnz .e820
 .e820_done:
-    mov [0x5FFC], bp
-    mov word [0x5FFE], 0      ; full dword count
+    mov [0x6000], bp
 
     ; --- enable A20 (fast gate) ---
     in  al, 0x92
@@ -114,15 +113,20 @@ pm_entry:
     mov esp, 0x7C00
 
     ; --- page tables: PML4@0x1000, PDPT@0x2000, PD@0x3000 (identity 1GB, 2MB pages),
-    ;     PDPT[3] -> 1GB page for [3GB,4GB) so LAPIC MMIO @0xFEE00000 is mapped ---
+    ;     PDPT[3] -> 1GB page for [3GB,4GB) so LAPIC MMIO @0xFEE00000 is mapped,
+    ;     PML4[256] -> kernel at 0xFFFF800000000000+ (higher half, 2MB page @ phys 0) ---
     mov edi, 0x1000
     xor eax, eax
-    mov ecx, 0xC00          ; clear 12KB
+    mov ecx, 0x1400          ; clear 20KB: 0x1000..0x5FFF (memmap @0x6000 untouched!)
     rep stosd
 
     mov dword [0x1000], 0x2001   ; PML4[0] -> PDPT
     mov dword [0x2000], 0x3001   ; PDPT[0] -> PD
     mov dword [0x2018], 0xC0000087  ; PDPT[3]: 1GB page @ 3GB, P|RW|PS
+
+    mov dword [0x1000+256*8], 0x4001   ; PML4[256] -> PDPT_K @0x4000
+    mov dword [0x4000], 0x5001         ; PDPT_K[0] -> PD_K @0x5000
+    mov dword [0x5000], 0x83           ; PD_K[0]: 2MB @ phys 0
 
     mov edi, 0x3000
     mov eax, 0x83                ; P|RW|PS, phys 0

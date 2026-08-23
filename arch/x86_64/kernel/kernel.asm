@@ -17,8 +17,8 @@ LAPIC_TDCR  = LAPIC_BASE + 0x3E0
 TIMER_VEC   = 0x30                ; outside PIC range 0x20-0x2F
 
 ; --- memory map (from boot) ---
-MEMMAP_COUNT = 0x5FFC
-MEMMAP_BASE  = 0x6000
+MEMMAP_COUNT = 0x6000
+MEMMAP_BASE  = 0x6100
 
 ; --- physical memory manager: bitmap of 4KB pages, covers first 256MB ---
 PMM_BITMAP   = 0x20000            ; 8KB bitmap, identity-mapped low RAM
@@ -30,13 +30,21 @@ RESERVE_PAGES = 0x23               ; low boot structures + kernel + bitmap
 ; --- VMM test target ---
 TEST_VIRT    = 0x6000000000
 
-org 0x10000
+org 0xFFFF800000010000
 use64
 
 kmain:
+    ; entered at PHYS 0x10000 via identity map (boot jumped low);
+    ; all absolute addresses below resolve to HIGHER-HALF via PML4[256].
+    mov rsp, 0x90000
+    mov r15, 0xFFFF800000010000   ; image base: all data refs go via [r15 + ...]
+    mov rax, .high            ; jump to same code via higher-half VA
+    jmp rax
+.high:
     cli
     cld
-    mov rsp, 0x90000
+    mov rsp, 0x90000          ; low stack for now (identity-mapped)
+    xor r14d, r14d            ; r14 = 0: base for low-memory absolute refs
 
     ; --- init COM1: 38400 8N1 ---
     mov dx, COM1+1
@@ -66,14 +74,13 @@ kmain:
     mov ecx, COLS*ROWS
     mov ax, 0x0720
     rep stosw
-    mov word [cur], 0
+    mov word [r15 + cur - kmain], 0
 
     call init_idt
     call pic_init
     call pit_init
 
     sti
-
     call apic_init
     call pmm_init
 
@@ -83,10 +90,10 @@ kmain:
     ; --- CPU vendor via CPUID ---
     xor eax, eax
     cpuid
-    mov dword [vendor], ebx
-    mov dword [vendor+4], edx
-    mov dword [vendor+8], ecx
-    mov byte [vendor+12], 0
+    mov dword [r15 + vendor - kmain], ebx
+    mov dword [r15 + vendor - kmain+4], edx
+    mov dword [r15 + vendor - kmain+8], ecx
+    mov byte [r15 + vendor - kmain+12], 0
     mov rsi, cpu_msg
     call puts
     mov rsi, vendor
@@ -108,18 +115,18 @@ kmain:
     je .enter
     cmp al, 8
     je .bs
-    movzx ecx, byte [cmd_len]
+    movzx ecx, byte [r15 + cmd_len - kmain]
     cmp ecx, 63
     jae .echo
-    mov byte [cmd_buf + rcx], al
-    inc byte [cmd_len]
+    mov byte [r15 + cmd_buf - kmain + rcx], al
+    inc byte [r15 + cmd_len - kmain]
 .echo:
     call putc
     jmp .shell
 .bs:
-    cmp byte [cmd_len], 0
+    cmp byte [r15 + cmd_len - kmain], 0
     je .shell
-    dec byte [cmd_len]
+    dec byte [r15 + cmd_len - kmain]
     mov al, 8
     call putc
     jmp .shell
@@ -128,9 +135,9 @@ kmain:
     call putc
     mov al, 10
     call putc
-    movzx ecx, byte [cmd_len]
-    mov byte [cmd_buf + rcx], 0
-    mov byte [cmd_len], 0
+    movzx ecx, byte [r15 + cmd_len - kmain]
+    mov byte [r15 + cmd_buf - kmain + rcx], 0
+    mov byte [r15 + cmd_len - kmain], 0
 
     ; --- dispatch command ---
     mov rsi, cmd_buf
@@ -168,7 +175,7 @@ kmain:
 .do_ticks:
     mov rsi, ticks_msg
     call puts
-    mov eax, [timer_ticks]
+    mov eax, [r15 + timer_ticks - kmain]
     call puthex64
     mov al, 10
     call putc
@@ -239,14 +246,14 @@ kmain:
 
 ; --- read next ASCII from keyboard ring buffer; AL=0 if empty ---
 getc:
-    movzx ecx, byte [kb_tail]
-    movzx edx, byte [kb_head]
+    movzx ecx, byte [r15 + kb_tail - kmain]
+    movzx edx, byte [r15 + kb_head - kmain]
     cmp ecx, edx
     je .empty
-    mov al, [kb_buf + rcx]
+    mov al, [r15 + kb_buf - kmain + rcx]
     inc ecx
     and ecx, 31
-    mov [kb_tail], cl
+    mov [r15 + kb_tail - kmain], cl
     ret
 .empty:
     xor eax, eax
@@ -267,30 +274,30 @@ kb_irq:
     jnz .skip
     cmp al, KEYMAP_SIZE
     jae .skip
-    lea rbx, [keymap_norm]
-    cmp byte [shift], 0
+    lea rbx, [r15 + keymap_norm - kmain]
+    cmp byte [r15 + shift - kmain], 0
     je .sel
-    lea rbx, [keymap_shift]
+    lea rbx, [r15 + keymap_shift - kmain]
 .sel:
     movzx r8d, al
     mov al, [rbx + r8]
     test al, al
     jz .skip
-    movzx ecx, byte [kb_head]
+    movzx ecx, byte [r15 + kb_head - kmain]
     lea edx, [ecx+1]
     and edx, 31
-    movzx r8d, byte [kb_tail]
+    movzx r8d, byte [r15 + kb_tail - kmain]
     cmp edx, r8d
     je .skip                  ; full - drop char
-    mov [kb_buf + rcx], al
-    mov [kb_head], dl
+    mov [r15 + kb_buf - kmain + rcx], al
+    mov [r15 + kb_head - kmain], dl
 .skip:
     ret
 .sh_on:
-    mov byte [shift], 1
+    mov byte [r15 + shift - kmain], 1
     ret
 .sh_off:
-    mov byte [shift], 0
+    mov byte [r15 + shift - kmain], 0
     ret
 
 ; --- print ASCIIZ string at RSI ---
@@ -330,18 +337,18 @@ putc:
     je  .out
     cmp al, 8
     je  .bs
-    movzx edx, word [cur]
+    movzx edx, word [r15 + cur - kmain]
     mov rdi, VGA_BASE
     lea rdi, [rdi + rdx*2]
     mov [rdi], al
     mov byte [rdi+1], 0x07
-    inc word [cur]
-    cmp word [cur], COLS*ROWS
+    inc word [r15 + cur - kmain]
+    cmp word [r15 + cur - kmain], COLS*ROWS
     jb  .out
     call scroll
     jmp .out
 .nl:
-    movzx eax, word [cur]
+    movzx eax, word [r15 + cur - kmain]
     xor edx, edx
     mov ecx, COLS
     div rcx                   ; rax=row, rdx=col
@@ -352,13 +359,13 @@ putc:
     call scroll
     mov rax, COLS*(ROWS-1)
 .set_cur:
-    mov [cur], ax
+    mov [r15 + cur - kmain], ax
     jmp .out
 .bs:
-    cmp word [cur], 0
+    cmp word [r15 + cur - kmain], 0
     je  .out
-    dec word [cur]
-    movzx edx, word [cur]
+    dec word [r15 + cur - kmain]
+    movzx edx, word [r15 + cur - kmain]
     mov rdi, VGA_BASE
     lea rdi, [rdi + rdx*2]
     mov word [rdi], 0x0720
@@ -390,10 +397,11 @@ scroll:
 
 ; --- IDT: vectors 0..31 -> exception stubs, halt-loop on fault ---
 init_idt:
-    mov edi, idt
+    lea rdi, [r15 + idt - kmain]
     mov ecx, 256*16/4
     xor eax, eax
     rep stosd
+    lea r11, [r15 + idt - kmain]   ; r11 = idt base (rdi is now END of table!)
 
     mov rsi, ex_table
     xor ebx, ebx
@@ -401,7 +409,7 @@ init_idt:
     mov rax, [rsi]
     mov rdi, rbx
     shl rdi, 4                ; entry size = 16 bytes
-    add rdi, idt
+    add rdi, r11
     mov [rdi], ax             ; offset 15:0
     shr rax, 16
     mov word [rdi+6], ax      ; offset 31:16
@@ -421,7 +429,8 @@ init_idt:
     mov rax, [rsi]
     mov rdi, rbx
     shl rdi, 4
-    add rdi, idt + 32*16
+    add rdi, r11
+    add rdi, 32*16
     mov [rdi], ax
     shr rax, 16
     mov word [rdi+6], ax
@@ -437,10 +446,10 @@ init_idt:
     ; vectors 48..255 <- generic ignore stub (spurious-safe)
     mov ebx, 48
 .fill_rest:
-    lea rax, [irq_spur]
+    lea rax, [r15 + irq_spur - kmain]
     mov rdi, rbx
     shl rdi, 4
-    add rdi, idt
+    add rdi, r11
     mov [rdi], ax
     shr rax, 16
     mov word [rdi+6], ax
@@ -453,9 +462,9 @@ init_idt:
     jb .fill_rest
 
     ; entry TIMER_VEC(48) = real LAPIC timer handler (overrides generic stub)
-    lea rax, [irq_timer]
+    lea rax, [r15 + irq_timer - kmain]
     mov rdi, (TIMER_VEC)*16
-    add rdi, idt
+    add rdi, r11
     mov [rdi], ax
     shr rax, 16
     mov word [rdi+6], ax
@@ -464,7 +473,7 @@ init_idt:
     mov word [rdi+2], 0x18
     mov byte [rdi+5], 0x8E
 
-    lidt tword [idtr]
+    lidt tword [r15 + idtr - kmain]
     ret
 
 ; --- remap 8259 PIC: IRQ0-7 -> 0x20, IRQ8-15 -> 0x28; unmask IRQ0+IRQ1 ---
@@ -529,7 +538,7 @@ common_irq:
     je .kbd
     jmp .ret
 .timer:
-    inc dword [timer_ticks]
+    inc dword [r15 + timer_ticks - kmain]
     jmp .ret
 .kbd:
     call kb_irq
@@ -619,7 +628,7 @@ pmm_init:
     rep stosd                 ; everything used by default
 
     ; walk e820: clear bits for usable (type=1) ranges
-    mov ebx, [MEMMAP_COUNT]
+    mov ebx, [r14 + MEMMAP_COUNT]
     test ebx, ebx
     jz .head
     mov rsi, MEMMAP_BASE
@@ -646,7 +655,7 @@ pmm_init:
     mov r9, r8
     shr r9, 5                 ; dword index
     and r8d, 31               ; bit index
-    btr dword [PMM_BITMAP + r9*4], r8d
+    btr dword [r14 + PMM_BITMAP + r9*4], r8d
     add rax, 4096
     cmp rax, rcx
     jb .page_loop
@@ -663,7 +672,7 @@ pmm_init:
     mov r8, rax
     shr r8, 5
     and eax, 31
-    bts dword [PMM_BITMAP + r8*4], eax
+    bts dword [r14 + PMM_BITMAP + r8*4], eax
     loop .setr
     ret
 
@@ -671,12 +680,12 @@ pmm_init:
 pmm_alloc:
     xor ebx, ebx
 .dw:
-    mov eax, [PMM_BITMAP + rbx*4]
+    mov eax, [r14 + PMM_BITMAP + rbx*4]
     not eax                   ; free bits set
     test eax, eax
     jz .next
     bsf ecx, eax              ; first free bit
-    bts dword [PMM_BITMAP + rbx*4], ecx
+    bts dword [r14 + PMM_BITMAP + rbx*4], ecx
     shl ebx, 5
     add ebx, ecx
     shl rbx, 12
@@ -709,7 +718,7 @@ pmm_free:
     mov ecx, edi
     shr ecx, 5
     and edi, 31
-    btr dword [PMM_BITMAP + rcx*4], edi
+    btr dword [r14 + PMM_BITMAP + rcx*4], edi
     ret
 
 ; count free pages -> R8D
@@ -717,7 +726,7 @@ count_free:
     xor ebx, ebx
     xor r8d, r8d
 .dw:
-    mov eax, [PMM_BITMAP + rbx*4]
+    mov eax, [r14 + PMM_BITMAP + rbx*4]
     not eax
     mov ecx, 32
 .bits:
@@ -898,7 +907,7 @@ puthex64:
     ret
 
 align 16
-banner   db "Opensweet OS 0.0.1 [x86_64] - built with FASM", 10, 0
+banner   db "Opensweet OS 0.0.2 [x86_64] higher-half - built with FASM", 10, 0
 cpu_msg  db "CPU: ", 0
 prompt   db "opensweet> ", 0
 vendor   rb 16
