@@ -94,6 +94,8 @@ kmain:
     call ata_init
     call ext4_mount
     call fb_test_pattern
+    call ext4_inode_load_auto
+    call ext4_ls_print
 
     mov rsi, banner
     call puts

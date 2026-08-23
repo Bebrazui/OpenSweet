@@ -21,6 +21,7 @@ start:
     ; --- load kernel: LBA->CHS per IDE geometry (63 spt, 16 heads) ---
     mov ax, KERNEL_LOAD_SEG
     mov es, ax
+    xor bx, bx                 ; ES:BX = 0x1000:0000 (BX was garbage!)
     mov word [cur_lba], KERNEL_LBA
     mov si, KERNEL_SECTORS
 .read_loop:

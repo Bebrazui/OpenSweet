@@ -378,6 +378,9 @@ ext4_lookup:
     jmp .pop3
 
 ; ================= print names of loaded directory =================
+ext4_inode_load_auto:
+    mov eax, 2
+    jmp ext4_inode_load
 ext4_ls_print:                    ; loaded dir inode
     push rbx
     push rsi
