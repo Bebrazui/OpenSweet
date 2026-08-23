@@ -1,12 +1,13 @@
 # Opensweet OS - headless test: boot, inject PS/2 keys via QEMU monitor, dump serial log
 param(
-    [string[]]$Keys = @('d','i','v','ret'),
+    [string]$KeysCsv = 'd i v ret',
     [int]$BootWaitSec = 3,
     [int]$SettleMS = 300,
     [string]$MonitorPort = '4444'
 )
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot\..
+$Keys = $KeysCsv -split '[\s,]+' | Where-Object { $_ }
 
 Get-Process qemu-system-* -ErrorAction SilentlyContinue | Stop-Process -Force
 Start-Sleep 1

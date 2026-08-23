@@ -6,7 +6,13 @@
 ## Сборка и запуск (x86_64, уже работает)
 
     build.cmd
-    "C:\Program Files\qemu\qemu-system-x86_64.exe" -drive format=raw,file=build\os.img -display gtk
+    run.cmd        (QEMU + лог COM1 в build\serial.log)
+    log.cmd        (показать последний serial-лог)
+
+Автотест клавиатуры headless (QEMU monitor sendkey):
+
+    test.cmd                  (набирает div ret)
+    test.cmd t,i,c,k,s,ret    (свои клавиши через запятые)
 
 Serial-лог ядра пишется на COM1 (`-serial file:log` для headless-теста).
 

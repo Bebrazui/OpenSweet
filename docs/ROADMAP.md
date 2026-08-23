@@ -7,8 +7,9 @@
 - [x] PS/2 клавиатура (polled), echo-shell
 
 ## Фаза 1 — ядро x86_64
-- [x] IDT + обработчики исключений 0-31 (halt-loop), тест-команды `exc`/`div` в shell
-- APIC таймер, прерывания вместо polling
+- [x] IDT + обработчики исключений 0-31 (halt-loop + печать вектора/RIP), тест-команды `exc`/`div`
+- [x] Прерывания вместо polling: remap 8259 PIC (IRQ0-7 -> 0x20), PIT ~1kHz тики (`ticks`), IRQ1 клавиатура -> ring buffer, hlt-idle
+- APIC таймер
 - PMM (bitmap), VMM (higher-half, 4KB+2MB pages)
 - Загрузка через UEFI (PE32+ образ) — FASM умеет PE64
 - Многозадачность: context switch, кольца 0/3
