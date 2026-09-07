@@ -5,9 +5,9 @@
 ; Supports RFC 1950 (Zlib), RFC 1951 (Deflate), and RFC 2083 (PNG filters 0..4).
 ; ==============================================================================
 
-PNG_FILE_BUF    = 0x03000000       ; 7 MB temporary disk read buffer
-PNG_IDAT_BUF    = 0x03700000       ; 7 MB concatenated IDAT zlib payload
-PNG_RAW_BUF     = 0x03E00000       ; 7 MB decompressed scanlines (1080 * 5761 = 6,221,880 bytes)
+PNG_FILE_BUF    = 0x03800000       ; 7 MB temporary disk read buffer (no collision with 8MB R2D_WIN_CACHE @ 0x03000000)
+PNG_IDAT_BUF    = 0x03F00000       ; 7 MB concatenated IDAT zlib payload
+PNG_RAW_BUF     = 0x04600000       ; 7 MB decompressed scanlines (1080 * 5761 = 6,221,880 bytes)
 PNG_MAX_READ    = 0x00700000       ; 7 MB max read from ext4
 
 PNG_IMG_W       = 1920

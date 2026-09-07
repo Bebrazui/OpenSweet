@@ -13,7 +13,7 @@ TASK_RUNNING    = 2
 TASK_SLEEPING   = 3
 TASK_DEAD       = 4
 
-; TCB offsets (64 bytes per TCB)
+; TCB offsets (576 bytes per TCB)
 TCB_RSP         = 0x00                ; uint64: Saved stack pointer
 TCB_STATE       = 0x08                ; uint32: TASK_* state
 TCB_ID          = 0x0C                ; uint32: Task ID
@@ -23,7 +23,8 @@ TCB_TICKS       = 0x18                ; uint64: Total CPU ticks accumulated
 TCB_STACK_BASE  = 0x20                ; uint64: Bottom of stack memory
 TCB_STACK_TOP   = 0x28                ; uint64: Top of stack memory
 TCB_NAME        = 0x30                ; 16 bytes: ASCIIZ task name
-TCB_SIZE        = 64
+TCB_FXSAVE      = 0x40                ; 512 bytes: 16-byte aligned FXSAVE/FXRSTOR area (FPU/MMX/SSE XMM0..15)
+TCB_SIZE        = 576                 ; 0x40 + 512 = 576 bytes (multiple of 16, aligns each task)
 
 TASK_STACK_SIZE = 8192                ; 8 KB stack per task
 
@@ -80,6 +81,9 @@ sched_init:
     ; Stack 0 uses initial boot stack 0x90000
     mov qword [rbx + TCB_STACK_BASE], 0x80000
     mov qword [rbx + TCB_STACK_TOP],  0x90000
+
+    ; Initialize FPU/SSE state for Task 0
+    fxsave [rbx + TCB_FXSAVE]
 
     ; Copy name "shell"
     lea rsi, [r15 + str_name_shell - kmain]
@@ -205,6 +209,18 @@ task_create:
     ; Saved RSP in TCB points to the top of the GPR frame
     mov [rdi + TCB_RSP], r9
 
+    ; Initialize task FPU/SSE state from clean Task 0 state
+    push rsi
+    push rdi
+    push rcx
+    lea rsi, [r15 + task_table - kmain + TCB_FXSAVE]
+    lea rdi, [rdi + TCB_FXSAVE]
+    mov ecx, 512 / 8
+    rep movsq
+    pop rcx
+    pop rdi
+    pop rsi
+
     ; Mark task ready
     mov dword [rdi + TCB_STATE], TASK_READY
     inc dword [r15 + sched_task_cnt - kmain]
@@ -328,8 +344,9 @@ sched_tick:
     mov dword [rsi + TCB_STATE], TASK_READY
 
 .find_next:
-    ; Save current task RSP
+    ; Save current task RSP and FPU/SSE state
     mov [rsi + TCB_RSP], rsp
+    fxsave [rsi + TCB_FXSAVE]
 
     ; Pick next task in circular order
     mov edx, [r15 + sched_curr_task - kmain]
@@ -359,6 +376,13 @@ sched_tick:
     mov dword [rdi + TCB_STATE], TASK_RUNNING
     mov dword [rdi + TCB_SLICE], SCHED_QUANTUM
 
+    ; Update TSS RSP0 to incoming task's kernel stack top
+    mov rax, [rdi + TCB_STACK_TOP]
+    mov [r15 + tss64 + 4 - kmain], rax
+
+    ; Restore incoming task's FPU/SSE context
+    fxrstor [rdi + TCB_FXSAVE]
+
     ; Load new RSP!
     mov rsp, [rdi + TCB_RSP]
 
@@ -386,11 +410,12 @@ isr_yield:
     push r14
     push r15
 
-    ; Save current task RSP
+    ; Save current task RSP and FPU/SSE state
     mov eax, [r15 + sched_curr_task - kmain]
     imul eax, TCB_SIZE
     lea rsi, [r15 + task_table - kmain + rax]
     mov [rsi + TCB_RSP], rsp
+    fxsave [rsi + TCB_FXSAVE]
 
     ; If current task was RUNNING, set to READY (if SLEEPING, leave as SLEEPING)
     cmp dword [rsi + TCB_STATE], TASK_RUNNING
@@ -424,6 +449,13 @@ isr_yield:
     mov [r15 + sched_curr_task - kmain], edx
     mov dword [rdi + TCB_STATE], TASK_RUNNING
     mov dword [rdi + TCB_SLICE], SCHED_QUANTUM
+
+    ; Update TSS RSP0 to incoming task's kernel stack top
+    mov rax, [rdi + TCB_STACK_TOP]
+    mov [r15 + tss64 + 4 - kmain], rax
+
+    ; Restore incoming task's FPU/SSE context
+    fxrstor [rdi + TCB_FXSAVE]
 
     ; Switch to next task's stack!
     mov rsp, [rdi + TCB_RSP]

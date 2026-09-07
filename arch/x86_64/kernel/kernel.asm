@@ -86,6 +86,17 @@ kmain:
     rep stosw
     mov word [r15 + cur - kmain], 0
 
+    ; --- Enable SSE & FPU (CR4.OSFXSR and CR4.OSXMMEXCPT, clear CR0.EM, set CR0.MP) ---
+    mov rax, cr4
+    or rax, (1 shl 9) or (1 shl 10)     ; bit 9 = OSFXSR, bit 10 = OSXMMEXCPT
+    mov cr4, rax
+    mov rax, cr0
+    and rax, not (1 shl 2)              ; clear CR0.EM (Emulation)
+    or rax, (1 shl 1)                   ; set CR0.MP (Monitor Coprocessor)
+    mov cr0, rax
+    fninit
+
+    call init_gdt_tss
     call init_idt
     call pic_init
     call pit_init
@@ -1242,6 +1253,75 @@ init_idt:
     lidt tword [r15 + idtr - kmain]
     ret
 
+; ==============================================================================
+; init_gdt_tss: Install 64-bit Kernel GDT with TSS descriptor and execute LTR
+; ==============================================================================
+init_gdt_tss:
+    push rax
+    push rbx
+    push rcx
+    push rdi
+
+    ; 1. Clear TSS
+    lea rdi, [r15 + tss64 - kmain]
+    mov ecx, TSS64_SIZE / 4
+    xor eax, eax
+    rep stosd
+
+    ; Set initial Ring 0 RSP0 = 0x90000 (kernel boot/shell stack)
+    mov qword [r15 + tss64 + 4 - kmain], 0x90000
+
+    ; Set IOPB offset >= 104 (no I/O bitmap)
+    mov word [r15 + tss64 + 102 - kmain], 104
+
+    ; 2. Populate 16-byte TSS descriptor in GDT
+    lea rax, [r15 + tss64 - kmain]
+    lea rbx, [r15 + gdt64_tss_desc - kmain]
+
+    ; Limit[15:0] = TSS64_SIZE - 1 (103 = 0x67)
+    mov word [rbx], TSS64_SIZE - 1
+    ; Base[15:0]
+    mov [rbx + 2], ax
+    shr rax, 16
+    ; Base[23:16]
+    mov [rbx + 4], al
+    ; Type = 0x89 (Present, DPL=0, Type 9 = 64-bit TSS Available)
+    mov byte [rbx + 5], 0x89
+    ; Limit[19:16] = 0, Flags = 0
+    mov byte [rbx + 6], 0x00
+    ; Base[31:24]
+    mov [rbx + 7], ah
+    shr rax, 16
+    ; Base[63:32]
+    mov [rbx + 8], eax
+    ; Reserved = 0
+    mov dword [rbx + 12], 0
+
+    ; 3. Populate base in gdtr64
+    lea rax, [r15 + gdt64_start - kmain]
+    mov [r15 + gdtr64 + 2 - kmain], rax
+
+    ; 4. Load 64-bit GDT: LGDT
+    lgdt tword [r15 + gdtr64 - kmain]
+
+    ; Reload data segment registers with DATA64_SEL (0x10)
+    mov ax, DATA64_SEL
+    mov ds, ax
+    mov es, ax
+    mov ss, ax
+    mov fs, ax
+    mov gs, ax
+
+    ; 5. Load Task Register with TSS: LTR
+    mov ax, TSS_SEL              ; 0x30
+    ltr ax
+
+    pop rdi
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
 ; --- remap 8259 PIC: IRQ0-7 -> 0x20, IRQ8-15 -> 0x28; unmask IRQ0+IRQ1 ---
 pic_init:
     mov al, 0x11              ; ICW1: init + cascade
@@ -1443,8 +1523,8 @@ pmm_init:
     bts dword [r14 + PMM_BITMAP + r8*4], eax
     loop .setr
 
-    ; re-reserve GUI/wallpaper pages [0x2000, 0x4600) (38MB @ 0x02000000)
-    mov ecx, 9728
+    ; re-reserve GUI/wallpaper/PNG pages [0x2000, 0x5000) (48MB @ 0x02000000)
+    mov ecx, 12288
 .set_bb:
     lea eax, [ecx + 0x1FFF]
     mov r8, rax
@@ -2241,6 +2321,41 @@ align 16
 idt      rb 256*16
 idtr     dw 4095
          dq idt
+
+align 16
+gdt64_start:
+    dq 0                         ; 0x00: Null descriptor
+CODE32_SEL    = 0x08             ; 0x08: 32-bit Compatibility Code
+    dw 0xFFFF, 0x0000
+    db 0x00, 0x9A, 0xCF, 0x00
+DATA64_SEL    = 0x10             ; 0x10: 64-bit Kernel Data (Ring 0, read/write)
+    dw 0xFFFF, 0x0000
+    db 0x00, 0x92, 0xCF, 0x00
+CODE64_SEL    = 0x18             ; 0x18: 64-bit Kernel Code (Ring 0, 64-bit long mode)
+    dw 0xFFFF, 0x0000
+    db 0x00, 0x9A, 0xAF, 0x00
+USER_DATA_SEL = 0x20             ; 0x20: 64-bit User Data (Ring 3, read/write)
+    dw 0xFFFF, 0x0000
+    db 0x00, 0xF2, 0xCF, 0x00    ; Present=1, DPL=3, S=1, Type=2 (Data RW)
+USER_CODE_SEL = 0x28             ; 0x28: 64-bit User Code (Ring 3, 64-bit long mode)
+    dw 0xFFFF, 0x0000
+    db 0x00, 0xFA, 0xAF, 0x00    ; Present=1, DPL=3, S=1, Type=10 (Code RX, L=1)
+TSS_SEL       = 0x30             ; 0x30: 64-bit TSS Descriptor (16 bytes = 2 slots: 0x30 and 0x38)
+gdt64_tss_desc:
+    dw 0, 0
+    db 0, 0, 0, 0
+    dd 0, 0
+gdt64_end:
+
+align 16
+gdtr64:
+    dw gdt64_end - gdt64_start - 1
+    dq gdt64_start
+
+align 16
+tss64:
+    rb 104
+TSS64_SIZE = 104
 
 KEYMAP_SIZE = 0x54
 keymap_norm:

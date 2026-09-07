@@ -3,7 +3,7 @@
 
 KERNEL_LBA     = 33                  ; LBA0=MBR, LBA1..32=stage2(16KB)
 KERNEL_ADDR    = 0x10000
-KERNEL_SECTORS = 512                 ; 256KB kernel window
+KERNEL_SECTORS = 800                 ; 400KB kernel window (supports up to 800 sectors via LBA)
 
 org 0x0600
 use16
@@ -47,13 +47,56 @@ start:
     mov al, '2'
     call tty_putc
 
-    ; --- load kernel: LBA->CHS per IDE geometry ---
-    mov ax, KERNEL_LOAD_SEG
-    mov es, ax
-    xor bx, bx
+    ; --- load kernel: INT 13h AH=42h (LBA DAP) with CHS fallback ---
+    mov word [kernel_left], KERNEL_SECTORS
     mov word [cur_lba], KERNEL_LBA
-    mov si, KERNEL_SECTORS
-.read_loop:
+    mov word [cur_seg], KERNEL_LOAD_SEG
+
+    ; Check if LBA extensions are supported (INT 13h AH=41h)
+    mov ah, 0x41
+    mov bx, 0x55AA
+    mov dl, [boot_drive]
+    int 0x13
+    jc .fallback_chs
+    cmp bx, 0xAA55
+    jne .fallback_chs
+    test cl, 1                   ; Packet calls supported?
+    jz .fallback_chs
+
+    ; LBA DAP mode: read kernel in 64-sector (32 KB) chunks
+.lba_loop:
+    mov ax, [kernel_left]
+    test ax, ax
+    jz .load_done
+
+    cmp ax, 64                   ; max 64 sectors (32 KB) per BIOS call
+    jbe .last_chunk
+    mov ax, 64
+.last_chunk:
+    mov [dap_count], ax
+    mov bx, [cur_seg]
+    mov [dap_buf_seg], bx
+    mov word [dap_buf_off], 0
+    movzx eax, word [cur_lba]
+    mov [dap_lba_lo], eax
+    mov dword [dap_lba_hi], 0
+
+    mov dl, [boot_drive]
+    mov si, dap_packet
+    mov ah, 0x42
+    int 0x13
+    jc disk_error
+
+    mov ax, [dap_count]
+    sub [kernel_left], ax
+    add [cur_lba], ax
+    shl ax, 5                    ; count * 32 paragraphs
+    add [cur_seg], ax
+    jmp .lba_loop
+
+.fallback_chs:
+    mov si, [kernel_left]
+.chs_loop:
     mov ax, [cur_lba]
     xor dx, dx
     mov cx, 63
@@ -70,16 +113,19 @@ start:
     mov ch, al               ; cylinder low
     mov dh, [cur_head]
     mov dl, [boot_drive]
+    mov ax, [cur_seg]
+    mov es, ax
+    xor bx, bx
     mov ah, 0x02             ; BIOS: read sectors
     mov al, 1
     int 0x13
     jc  disk_error
-    mov ax, es
-    add ax, 0x20
-    mov es, ax
+    add word [cur_seg], 0x20
     inc word [cur_lba]
     dec si
-    jnz .read_loop
+    jnz .chs_loop
+
+.load_done:
     mov al, 'K'
     call rs_putc
     mov al, '3'
@@ -329,7 +375,7 @@ pm_entry:
     mov cr3, eax
     mov eax, cr4
     or eax, 1 shl 5                     ; PAE
-    or eax, 1 shl 10                    ; OSFXSR (SSE for C code)
+    or eax, (1 shl 9) or (1 shl 10)     ; OSFXSR (bit 9) + OSXMMEXCPT (bit 10)
     mov cr4, eax
 
     mov ecx, 0xC0000080                 ; EFER
@@ -373,10 +419,27 @@ gdt_descriptor:
     dw gdt_end - gdt_start - 1
     dd gdt_start
 
-boot_drive db 0
-cur_lba    dw 0
-cur_cyl    dw 0
-cur_head   db 0
-cur_sec    db 0
+align 4
+dap_packet:
+    db 0x10         ; size of packet (16 bytes)
+    db 0            ; reserved (0)
+dap_count:
+    dw 0            ; number of sectors
+dap_buf_off:
+    dw 0            ; buffer offset (0)
+dap_buf_seg:
+    dw 0            ; buffer segment
+dap_lba_lo:
+    dd 0            ; 32-bit lower LBA
+dap_lba_hi:
+    dd 0            ; 32-bit upper LBA (0)
+
+boot_drive  db 0
+cur_lba     dw 0
+cur_cyl     dw 0
+cur_head    db 0
+cur_sec     db 0
+kernel_left dw 0
+cur_seg     dw 0
 KERNEL_LOAD_SEG = 0x1000
 err_msg db "DISK ERR", 0
