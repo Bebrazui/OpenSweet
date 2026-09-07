@@ -6,6 +6,7 @@
 
 R2D_BACKBUFFER       = 0x02000000       ; 8 MB backbuffer (identity-mapped, reserved in PMM)
 R2D_WALLPAPER_CACHE  = 0x02800000       ; 8 MB cached TrueColor wallpaper
+R2D_WIN_CACHE        = 0x03000000       ; 8 MB cached active window drag surface
 R2D_SCREEN_W         = 1920
 R2D_SCREEN_H         = 1080
 R2D_PITCH            = 7680             ; 1920 dwords per scanline
@@ -1594,30 +1595,145 @@ gui_frame_count     dd 0
 gui_fps             dd 60
 gui_fps_sec_frames  dd 0
 gui_last_sec_tick   dd 0
+gui_last_frame_tick dd 0
 
 ; ==============================================================================
-; r2d_record_frame: Update frame counter and calculate real-time FPS
+; r2d_redraw_fps_lfb: Refresh FPS badge directly to menubar in VRAM LFB
+; ==============================================================================
+r2d_redraw_fps_lfb:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+
+    ; 1. Format current FPS string
+    call md_format_fps
+
+    ; 2. Restore 80x28 menubar background from R2D_WALLPAPER_CACHE to R2D_BACKBUFFER
+    ; at x = R2D_SCREEN_W - 170
+    xor ebx, ebx                      ; row 0..27
+.fps_restore_bg:
+    cmp ebx, 28
+    jae .fps_bg_restored
+
+    imul eax, ebx, R2D_PITCH
+    lea rsi, [rax + R2D_WALLPAPER_CACHE + (R2D_SCREEN_W - 170)*4]
+    lea rdi, [rax + R2D_BACKBUFFER + (R2D_SCREEN_W - 170)*4]
+    cld
+    mov ecx, 40                       ; 80 dwords = 40 qwords
+    rep movsq
+
+    inc ebx
+    jmp .fps_restore_bg
+
+.fps_bg_restored:
+    ; 3. Apply translucent menubar tint
+    mov ecx, R2D_SCREEN_W - 170
+    xor edx, edx                      ; y = 0
+    mov esi, 80
+    mov edi, 28
+    mov eax, 0xC00F172A               ; Translucent Slate 900
+    call r2d_fill_rect_alpha
+
+    ; 4. Render FPS text string at x = R2D_SCREEN_W - 165, y = 6
+    mov ecx, R2D_SCREEN_W - 165
+    mov edx, 6
+    mov eax, 0xFF10B981               ; Vibrant Emerald Green
+    lea rsi, [r15 + str_md_fps - kmain]
+    call r2d_draw_text_ui_aa
+
+    ; 5. Blit 80x28 rectangle from R2D_BACKBUFFER directly to VRAM LFB
+    mov eax, [r15 + vbe_lfb - kmain]
+    test eax, eax
+    jz .fps_done
+
+    xor ebx, ebx                      ; row 0..27
+.fps_row:
+    cmp ebx, 28
+    jae .fps_done
+
+    imul eax, ebx, R2D_PITCH
+    lea rsi, [rax + R2D_BACKBUFFER + (R2D_SCREEN_W - 170)*4]
+    add eax, [r15 + vbe_lfb - kmain]
+    lea rdi, [rax + (R2D_SCREEN_W - 170)*4]
+
+    cld
+    mov ecx, 40                       ; 80 dwords = 40 qwords
+    rep movsq
+
+    inc ebx
+    jmp .fps_row
+
+.fps_done:
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; ==============================================================================
+; r2d_record_frame: Update frame counter and calculate live instantaneous FPS
 ; ==============================================================================
 r2d_record_frame:
     push rax
     push rbx
+    push rcx
+    push rdx
+
     inc dword [r15 + gui_frame_count - kmain]
     inc dword [r15 + gui_fps_sec_frames - kmain]
 
+    ; Measure delta time since last frame
     mov eax, [r15 + timer_ticks - kmain]
-    mov ebx, [r15 + gui_last_sec_tick - kmain]
-    sub eax, ebx
-    cmp eax, 1000
+    mov ebx, eax
+    sub ebx, [r15 + gui_last_frame_tick - kmain]
+    mov [r15 + gui_last_frame_tick - kmain], eax
+
+    ; If delta_t in valid range [1..250 ms], compute instant FPS = 1000 / delta_t
+    test ebx, ebx
+    jle .check_badge
+    cmp ebx, 250
+    ja .check_badge
+
+    mov ecx, 1000
+    xor edx, edx
+    mov eax, ecx
+    div ebx                           ; eax = instantaneous FPS
+    cmp eax, 999
+    jbe @f
+    mov eax, 999
+@@:
+    ; Exponential moving average: fps = (fps * 3 + instant) / 4
+    mov ecx, [r15 + gui_fps - kmain]
+    imul ecx, 3
+    add eax, ecx
+    shr eax, 2
+    test eax, eax
+    jnz @f
+    mov eax, 1
+@@:
+    mov [r15 + gui_fps - kmain], eax
+
+.check_badge:
+    ; Refresh menubar FPS badge directly to VRAM LFB every 250 ms (4x / sec)
+    mov eax, [r15 + timer_ticks - kmain]
+    sub eax, [r15 + gui_last_sec_tick - kmain]
+    cmp eax, 250
     jb .rf_done
 
-    ; 1000 ms elapsed: store current FPS
-    mov eax, [r15 + gui_fps_sec_frames - kmain]
-    mov [r15 + gui_fps - kmain], eax
-    mov dword [r15 + gui_fps_sec_frames - kmain], 0
     mov eax, [r15 + timer_ticks - kmain]
     mov [r15 + gui_last_sec_tick - kmain], eax
 
+    ; Only redraw badge if not actively inside another menubar render
+    call r2d_redraw_fps_lfb
+
 .rf_done:
+    pop rdx
+    pop rcx
     pop rbx
     pop rax
     ret

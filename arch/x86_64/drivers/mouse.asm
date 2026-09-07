@@ -75,9 +75,9 @@ mouse_init:
     out MOUSE_CMD_PORT, al
     call mouse_read            ; AL = current command byte
 
-    ; Enable IRQ12 (bit 1) and enable mouse clock (clear bit 5)
-    or al, 0x02
-    and al, not 0x20
+    ; Enable IRQ1 (bit 0), IRQ12 (bit 1) and enable both clocks (clear bits 4 and 5)
+    or al, 0x03
+    and al, not 0x30
     mov bl, al
 
     ; Write back modified command byte
@@ -90,6 +90,27 @@ mouse_init:
 
     ; 3. Set mouse defaults (command 0xF6)
     mov al, 0xF6
+    call mouse_write
+    call mouse_read            ; ACK (0xFA)
+
+    ; 3b. Set sample rate to 200 Hz (command 0xF3, arg 200)
+    mov al, 0xF3
+    call mouse_write
+    call mouse_read            ; ACK (0xFA)
+    mov al, 200
+    call mouse_write
+    call mouse_read            ; ACK (0xFA)
+
+    ; 3c. Set resolution to maximum 8 counts/mm (command 0xE8, arg 3)
+    mov al, 0xE8
+    call mouse_write
+    call mouse_read            ; ACK (0xFA)
+    mov al, 3
+    call mouse_write
+    call mouse_read            ; ACK (0xFA)
+
+    ; 3d. Set scaling 1:1 (command 0xE6)
+    mov al, 0xE6
     call mouse_write
     call mouse_read            ; ACK (0xFA)
 
