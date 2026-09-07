@@ -21,7 +21,7 @@ MEMMAP_COUNT = 0x6000
 MEMMAP_BASE  = 0x6100
 
 ; --- physical memory manager: bitmap of 4KB pages, covers first 256MB ---
-PMM_BITMAP   = 0x60000            ; 8KB bitmap, identity-mapped low RAM
+PMM_BITMAP   = 0x98000            ; 8KB bitmap @ 0x98000..0x99FFF (safe from kernel @ 0x10000..0x7EFFF)
 BITMAP_BITS  = 65536              ; 256MB / 4KB
 BITMAP_DWORDS = BITMAP_BITS / 32
 BITMAP_BYTES = BITMAP_BITS / 8
@@ -1182,6 +1182,12 @@ init_idt:
     mov [rdi+8], eax          ; offset 63:32
     mov word [rdi+2], 0x18    ; CODE64_SEL
     mov byte [rdi+5], 0x8E    ; present | ring0 | interrupt gate
+
+    ; If vector 8 (#DF - Double Fault), assign IST1 (1)
+    cmp rbx, 8
+    jne @f
+    mov byte [rdi+4], 1       ; IST=1 (switch to tss64.ist1 on #DF)
+@@:
     add rsi, 8
     inc rbx
     cmp rbx, 32
@@ -1270,6 +1276,9 @@ init_gdt_tss:
 
     ; Set initial Ring 0 RSP0 = 0x90000 (kernel boot/shell stack)
     mov qword [r15 + tss64 + 4 - kmain], 0x90000
+
+    ; Set IST1 = 0x7F000 (Dedicated Double Fault #DF stack)
+    mov qword [r15 + tss64 + 0x24 - kmain], 0x7F000
 
     ; Set IOPB offset >= 104 (no I/O bitmap)
     mov word [r15 + tss64 + 102 - kmain], 104

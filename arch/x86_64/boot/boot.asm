@@ -16,6 +16,25 @@ start:
     sti
     mov [boot_drive], dl            ; BIOS passes boot drive in DL
 
+    ; Check if LBA extensions are supported (INT 13h AH=41h)
+    mov ah, 0x41
+    mov bx, 0x55AA
+    mov dl, [boot_drive]
+    int 0x13
+    jc .chs_fallback
+    cmp bx, 0xAA55
+    jne .chs_fallback
+    test cl, 1                   ; Packet calls supported?
+    jz .chs_fallback
+
+    ; Fast LBA DAP read (loads all 32 sectors of stage2 in 1 call!)
+    mov dl, [boot_drive]
+    mov si, dap
+    mov ah, 0x42
+    int 0x13
+    jnc .stage2_loaded
+
+.chs_fallback:
     mov ax, 0                       ; buffer segment
     mov es, ax
     mov bx, 0x0600                  ; buffer offset -> stage2 home
@@ -48,6 +67,7 @@ start:
     dec si
     jnz .read_loop
 
+.stage2_loaded:
     mov al, '1'                     ; DEBUG: stage2 loaded
     mov ah, 0x0E
     mov bx, 0x0007
@@ -65,9 +85,17 @@ die:
     jmp die
 
 align 4
-cur_lba   dw 0
-cur_cyl   dw 0
-cur_head  db 0
+dap:
+    db 0x10, 0
+    dw STAGE_SECTORS
+    dw 0x0600
+    dw 0x0000
+    dd 1
+    dd 0
+
+cur_lba    dw 0
+cur_cyl    dw 0
+cur_head   db 0
 boot_drive db 0
 
 rb 510-($-$$)
