@@ -63,6 +63,8 @@ mouse_init:
     push rax
     push rbx
     push rcx
+    pushfq
+    cli                                 ; Disable interrupts during device handshake!
 
     ; 1. Enable auxiliary device (mouse port)
     call mouse_wait_write
@@ -75,9 +77,9 @@ mouse_init:
     out MOUSE_CMD_PORT, al
     call mouse_read            ; AL = current command byte
 
-    ; Enable IRQ1 (bit 0), IRQ12 (bit 1) and enable both clocks (clear bits 4 and 5)
-    or al, 0x03
-    and al, not 0x30
+    ; Keep IRQ1 (bit 0), disable IRQ12 (bit 1) temporarily, enable clocks (clear bits 4, 5)
+    and al, not 0x32
+    or al, 0x01
     mov bl, al
 
     ; Write back modified command byte
@@ -88,12 +90,21 @@ mouse_init:
     mov al, bl
     out MOUSE_DATA_PORT, al
 
-    ; 3. Set mouse defaults (command 0xF6)
+    ; 3. Drain any pending data before sending commands
+.pre_drain:
+    in al, MOUSE_CMD_PORT
+    test al, 0x01
+    jz .pre_drained
+    in al, MOUSE_DATA_PORT
+    jmp .pre_drain
+.pre_drained:
+
+    ; 4. Set mouse defaults (command 0xF6)
     mov al, 0xF6
     call mouse_write
     call mouse_read            ; ACK (0xFA)
 
-    ; 3b. Set sample rate to 200 Hz (command 0xF3, arg 200)
+    ; 4b. Set sample rate to 200 Hz (command 0xF3, arg 200)
     mov al, 0xF3
     call mouse_write
     call mouse_read            ; ACK (0xFA)
@@ -101,7 +112,7 @@ mouse_init:
     call mouse_write
     call mouse_read            ; ACK (0xFA)
 
-    ; 3c. Set resolution to maximum 8 counts/mm (command 0xE8, arg 3)
+    ; 4c. Set resolution to maximum 8 counts/mm (command 0xE8, arg 3)
     mov al, 0xE8
     call mouse_write
     call mouse_read            ; ACK (0xFA)
@@ -109,35 +120,55 @@ mouse_init:
     call mouse_write
     call mouse_read            ; ACK (0xFA)
 
-    ; 3d. Set scaling 1:1 (command 0xE6)
+    ; 4d. Set scaling 1:1 (command 0xE6)
     mov al, 0xE6
     call mouse_write
     call mouse_read            ; ACK (0xFA)
 
-    ; 4. Enable data reporting / streaming (command 0xF4)
+    ; 4e. Enable data reporting / streaming (command 0xF4)
     mov al, 0xF4
     call mouse_write
     call mouse_read            ; ACK (0xFA)
 
-    ; 5. Drain any residual bytes in output buffer
+    ; 5. Cleanly drain all buffers
+.drain_all:
     in al, MOUSE_CMD_PORT
     test al, 0x01
-    jz .drained
+    jz .all_drained
     in al, MOUSE_DATA_PORT
-.drained:
+    jmp .drain_all
+.all_drained:
 
-    ; 6. Set initial state: center of screen (512, 384)
+    ; 6. Now that mouse is fully configured and silent, enable IRQ12 in controller!
+    call mouse_wait_write
+    mov al, 0x20
+    out MOUSE_CMD_PORT, al
+    call mouse_read
+    or al, 0x03                ; enable both IRQ1 and IRQ12
+    and al, not 0x30           ; ensure clocks enabled
+    mov bl, al
+    call mouse_wait_write
+    mov al, 0x60
+    out MOUSE_CMD_PORT, al
+    call mouse_wait_write
+    mov al, bl
+    out MOUSE_DATA_PORT, al
+
+    ; 7. Reset packet state machine
+    mov byte [r15 + mouse_cycle - kmain], 0
+    mov byte [r15 + mouse_buttons - kmain], 0
+
+    ; 8. Set initial coordinates: center of screen (512, 384)
     mov dword [r15 + mouse_x - kmain], 512
     mov dword [r15 + mouse_y - kmain], 384
     mov dword [r15 + mouse_prev_x - kmain], 512
     mov dword [r15 + mouse_prev_y - kmain], 384
-    mov byte [r15 + mouse_buttons - kmain], 0
-    mov byte [r15 + mouse_cycle - kmain], 0
     mov byte [r15 + mouse_bg_valid - kmain], 0
 
-    ; 7. Initial cursor draw
+    ; 9. Initial cursor draw
     call mouse_update_cursor
 
+    popfq
     pop rcx
     pop rbx
     pop rax
@@ -178,9 +209,11 @@ mouse_irq:
 
 .byte0:
     ; Bit 3 of byte 0 in standard PS/2 mouse packet is ALWAYS 1.
-    ; If not, packets are out of sync -> discard byte and stay at cycle 0.
+    ; Bits 6 and 7 are overflow flags (must be 0 for valid packet).
     test al, 0x08
     jz .done
+    test al, 0xC0
+    jnz .done
     mov [r15 + mouse_packet - kmain], al
     mov byte [r15 + mouse_cycle - kmain], 1
     jmp .done

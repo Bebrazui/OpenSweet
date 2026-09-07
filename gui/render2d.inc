@@ -1728,7 +1728,15 @@ r2d_record_frame:
     mov eax, [r15 + timer_ticks - kmain]
     mov [r15 + gui_last_sec_tick - kmain], eax
 
-    ; Only redraw badge if not actively inside another menubar render
+    ; If a window is currently being dragged near the top bar, skip badge redraw
+    ; to avoid stamping menubar over the moving window
+    movzx ebx, byte [r15 + wm_drag_app - kmain]
+    cmp ebx, APP_COUNT
+    jae .do_badge_redraw
+    cmp dword [r15 + wm_y - kmain + rbx*4], 35
+    jle .rf_done
+
+.do_badge_redraw:
     call r2d_redraw_fps_lfb
 
 .rf_done:

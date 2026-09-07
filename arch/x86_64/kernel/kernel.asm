@@ -1068,6 +1068,11 @@ getc:
 
 ; --- IRQ1: translate scancode -> ASCII, push into ring buffer ---
 kb_irq:
+    in  al, 0x64
+    test al, 0x20             ; bit 5: 1 = mouse / aux, 0 = keyboard
+    jnz .skip                 ; ignore mouse packet bytes!
+    test al, 0x01             ; bit 0: 1 = output buffer has data
+    jz .skip
     in  al, 0x60
     cmp al, 0x2A              ; LShift make
     je .sh_on
@@ -1721,7 +1726,8 @@ vmm_unmap:
 common_ex:
     mov rsi, exc_msg
     call puts
-    mov al, [rsp]             ; vector number pushed by stub
+    movzx r12d, byte [rsp]             ; vector number pushed by stub
+    mov al, r12b
     push rax
     shr al, 4
     call hexdigit
@@ -1730,10 +1736,76 @@ common_ex:
     and al, 0xF
     call hexdigit
     call putc                 ; low digit
+
+    ; Check if this vector has an error code pushed by CPU
+    cmp r12d, 14
+    je .has_err
+    cmp r12d, 13
+    je .has_err
+    cmp r12d, 12
+    je .has_err
+    cmp r12d, 11
+    je .has_err
+    cmp r12d, 10
+    je .has_err
+    cmp r12d, 8
+    je .has_err
+    cmp r12d, 17
+    je .has_err
+
+    ; No error code: [rsp+8] = RIP, [rsp+32] = RSP
     mov rsi, at_msg
     call puts
-    mov rax, [rsp+8]          ; RIP from trap frame (was [rsp+16])
+    mov rax, [rsp+8]          ; RIP
     call puthex64
+    mov al, ' '
+    call putc
+    mov al, 'R'
+    call putc
+    mov al, 'S'
+    call putc
+    mov al, 'P'
+    call putc
+    mov al, '='
+    call putc
+    mov rax, [rsp+32]         ; RSP
+    call puthex64
+    jmp .print_cr2
+
+.has_err:
+    ; Has error code: [rsp+8] = ERR, [rsp+16] = RIP, [rsp+40] = RSP
+    mov al, ' '
+    call putc
+    mov al, 'E'
+    call putc
+    mov al, 'R'
+    call putc
+    mov al, 'R'
+    call putc
+    mov al, '='
+    call putc
+    mov rax, [rsp+8]          ; ERR
+    call puthex64
+
+    mov rsi, at_msg
+    call puts
+    mov rax, [rsp+16]         ; RIP
+    call puthex64
+
+    mov al, ' '
+    call putc
+    mov al, 'R'
+    call putc
+    mov al, 'S'
+    call putc
+    mov al, 'P'
+    call putc
+    mov al, '='
+    call putc
+    mov rax, [rsp+40]         ; RSP
+    call puthex64
+
+.print_cr2:
     mov al, ' '
     call putc
     mov al, 'C'

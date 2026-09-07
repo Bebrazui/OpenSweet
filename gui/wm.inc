@@ -702,6 +702,7 @@ wm_handle_mouse:
 
     ; Pre-render active window into R2D_WIN_CACHE for zero-lag blitting
     call wm_capture_drag_surface
+    mov byte [r15 + md_term_dirty - kmain], 0   ; Avoid full-screen render stall on drag start!
     jmp .mouse_ret
 
 .body_click:
@@ -883,6 +884,16 @@ wm_drag_step:
     mov [r15 + wm_drag_prev_x - kmain], r12d
     mov [r15 + wm_drag_prev_y - kmain], r13d
 
+    ; Sanity check: dirty box must be strictly within screen bounds
+    test esi, esi
+    jle .step_skip_blit
+    test edi, edi
+    jle .step_skip_blit
+    cmp ecx, R2D_SCREEN_W
+    jae .step_skip_blit
+    cmp edx, R2D_SCREEN_H
+    jae .step_skip_blit
+
     ; Acquire GUI lock
     mov dword [r15 + gui_lock - kmain], 1
 
@@ -953,6 +964,7 @@ wm_drag_step:
     ; Release GUI lock
     mov dword [r15 + gui_lock - kmain], 0
 
+.step_skip_blit:
     pop r13
     pop r12
     pop r11
@@ -1202,6 +1214,11 @@ wm_capture_drag_surface:
     add edi, 36
 
     ; Clamp to screen
+    cmp ecx, R2D_SCREEN_W
+    jae .cap_done
+    cmp edx, R2D_SCREEN_H
+    jae .cap_done
+
     mov eax, ecx
     add eax, esi
     cmp eax, R2D_SCREEN_W
@@ -1216,6 +1233,11 @@ wm_capture_drag_surface:
     mov edi, R2D_SCREEN_H
     sub edi, edx
 @@:
+
+    test esi, esi
+    jle .cap_done
+    test edi, edi
+    jle .cap_done
 
     ; Store surface geometry
     mov [r15 + wm_drag_surf_w - kmain], esi
@@ -1324,6 +1346,11 @@ wm_paste_drag_surface:
     mov r11d, [r15 + wm_drag_surf_h - kmain]
 
     ; Check bounds
+    cmp r8d, R2D_SCREEN_W
+    jae .paste_done
+    cmp r9d, R2D_SCREEN_H
+    jae .paste_done
+
     mov eax, r8d
     add eax, r10d
     cmp eax, R2D_SCREEN_W
@@ -1338,6 +1365,11 @@ wm_paste_drag_surface:
     mov r11d, R2D_SCREEN_H
     sub r11d, r9d
 @@:
+
+    test r10d, r10d
+    jle .paste_done
+    test r11d, r11d
+    jle .paste_done
 
     mov r12d, r10d
     shr r12d, 1                                 ; qwords per row
