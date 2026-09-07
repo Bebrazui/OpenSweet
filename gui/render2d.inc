@@ -1520,6 +1520,11 @@ r2d_redraw_clock_lfb:
     push rdx
     push rsi
     push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
 
     ; Concurrency guard: if desktop compositor is actively rendering, skip
     cmp dword [r15 + gui_lock - kmain], 0
@@ -1581,6 +1586,11 @@ r2d_redraw_clock_lfb:
     jmp .clk_row
 
 .clk_done:
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
     pop rdi
     pop rsi
     pop rdx
@@ -1607,6 +1617,11 @@ r2d_redraw_fps_lfb:
     push rdx
     push rsi
     push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
 
     ; 1. Format current FPS string
     call md_format_fps
@@ -1667,6 +1682,11 @@ r2d_redraw_fps_lfb:
     jmp .fps_row
 
 .fps_done:
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
     pop rdi
     pop rsi
     pop rdx

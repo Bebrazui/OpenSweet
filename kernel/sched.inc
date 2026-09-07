@@ -707,6 +707,10 @@ task_sysmon_daemon:
     cmp byte [r15 + wm_state - kmain + APP_SYS], WM_STATE_OPEN
     jne .sys_loop
 
+    ; Skip triggering full render if a window is being dragged
+    cmp byte [r15 + wm_drag_app - kmain], 0xFF
+    jne .sys_loop
+
     ; Trigger desktop render if sysmon is visible
     mov byte [r15 + md_term_dirty - kmain], 1
 

@@ -305,6 +305,11 @@ md_render_menubar:
     push rdx
     push rsi
     push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
 
     xor ecx, ecx
     xor edx, edx
@@ -356,6 +361,11 @@ md_render_menubar:
     lea rsi, [r15 + str_md_clock - kmain]
     call r2d_draw_text_ui_aa
 
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
     pop rdi
     pop rsi
     pop rdx
@@ -374,6 +384,11 @@ md_render_dock:
     push rdx
     push rsi
     push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
 
     mov ecx, 800
     mov edx, 996
@@ -460,6 +475,11 @@ md_render_dock:
     mov eax, 0xFFF8FAFC
     call r2d_draw_rounded_rect_aa
 @@:
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
     pop rdi
     pop rsi
     pop rdx

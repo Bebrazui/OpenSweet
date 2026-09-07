@@ -155,6 +155,8 @@ kmain:
 
 .shell:
     call md_handle_mouse
+    cmp byte [r15 + wm_drag_app - kmain], 0xFF
+    jne .no_render              ; Drag in progress: NEVER trigger full-screen render!
     cmp byte [r15 + md_term_dirty - kmain], 0
     je .no_render
     mov byte [r15 + md_term_dirty - kmain], 0

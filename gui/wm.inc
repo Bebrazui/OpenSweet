@@ -40,6 +40,11 @@ wm_drag_surf_off_x dd 0
 wm_drag_surf_off_y dd 0
 wm_drag_surf_valid db 0
 wm_prev_lmb        db 0
+wm_last_drag_tick  dd 0
+wm_drag_dirty_x    dd 0
+wm_drag_dirty_y    dd 0
+wm_drag_dirty_w    dd 0
+wm_drag_dirty_h    dd 0
 
 ; Window Titles
 str_title_term db "Terminal - Opensweet Shell (x86_64)", 0
@@ -539,9 +544,28 @@ wm_handle_mouse:
     jz .just_hover
 
     ; Transition: Click Released
+    movzx ebx, byte [r15 + wm_drag_app - kmain]
+    cmp ebx, APP_COUNT
+    jae .release_no_drag
+
+    ; Flush any throttled final movement if window ended at different position
+    mov eax, [r15 + wm_x - kmain + rbx*4]
+    cmp eax, [r15 + wm_drag_prev_x - kmain]
+    jne .flush_final_drag
+    mov edx, [r15 + wm_y - kmain + rbx*4]
+    cmp edx, [r15 + wm_drag_prev_y - kmain]
+    je .release_done
+.flush_final_drag:
+    call wm_drag_step
+
+.release_done:
     mov byte [r15 + wm_drag_app - kmain], 0xFF
     mov byte [r15 + wm_drag_surf_valid - kmain], 0
-    mov byte [r15 + md_term_dirty - kmain], 1
+    jmp .mouse_ret
+
+.release_no_drag:
+    mov byte [r15 + wm_drag_app - kmain], 0xFF
+    mov byte [r15 + wm_drag_surf_valid - kmain], 0
     jmp .mouse_ret
 
 .just_hover:
@@ -758,15 +782,44 @@ wm_handle_mouse:
     mov edx, ecx
 @@:
 
-    ; Check if window position actually changed!
+    ; Always store latest target window coordinates
+    mov [r15 + wm_x - kmain + rbx*4], eax
+    mov [r15 + wm_y - kmain + rbx*4], edx
+
+    ; Check if window position actually changed compared to last blitted position!
     cmp eax, [r15 + wm_drag_prev_x - kmain]
-    jne .do_drag_move
+    jne .check_throttle
     cmp edx, [r15 + wm_drag_prev_y - kmain]
     je .mouse_ret                     ; Position unchanged, return!
 
-.do_drag_move:
-    ; Perform high-performance sub-region dirty blit (60+ FPS!)
+.check_throttle:
+    ; Throttle dirty blits to 60+ FPS (10 ms interval)
+    mov eax, [r15 + timer_ticks - kmain]
+    sub eax, [r15 + wm_last_drag_tick - kmain]
+    cmp eax, 10
+    jb .throttle_cursor
+
+    mov eax, [r15 + timer_ticks - kmain]
+    mov [r15 + wm_last_drag_tick - kmain], eax
+
+    mov eax, [r15 + wm_x - kmain + rbx*4]
+    mov edx, [r15 + wm_y - kmain + rbx*4]
     call wm_drag_step
+    jmp .mouse_ret
+
+.throttle_cursor:
+    ; Fast 1-microsecond cursor update without heavy VRAM window blit
+    mov ecx, [r15 + md_mouse_prev_x - kmain]
+    mov edx, [r15 + md_mouse_prev_y - kmain]
+    call r2d_restore_cursor_lfb
+
+    mov eax, [r15 + md_mouse_x - kmain]
+    mov [r15 + md_mouse_prev_x - kmain], eax
+    mov edx, [r15 + md_mouse_y - kmain]
+    mov [r15 + md_mouse_prev_y - kmain], edx
+
+    mov ecx, eax
+    call r2d_draw_cursor_lfb
     jmp .mouse_ret
 
 .mouse_ret:
@@ -899,40 +952,45 @@ wm_drag_step:
     ; Acquire GUI lock
     mov dword [r15 + gui_lock - kmain], 1
 
-    ; r8d = X_min, r9d = Y_min, r10d = W_dirty, r11d = H_dirty
-    mov r8d, ecx
-    mov r9d, edx
-    mov r10d, esi
-    mov r11d, edi
+    ; Save dirty rectangle to memory
+    mov [r15 + wm_drag_dirty_x - kmain], ecx
+    mov [r15 + wm_drag_dirty_y - kmain], edx
+    mov [r15 + wm_drag_dirty_w - kmain], esi
+    mov [r15 + wm_drag_dirty_h - kmain], edi
 
     ; Step 1: Restore wallpaper in dirty rect (<0.05 ms)
+    mov ecx, [r15 + wm_drag_dirty_x - kmain]
+    mov edx, [r15 + wm_drag_dirty_y - kmain]
+    mov esi, [r15 + wm_drag_dirty_w - kmain]
+    mov edi, [r15 + wm_drag_dirty_h - kmain]
     call r2d_restore_wallpaper_rect
 
     ; Step 2: Redraw Top Menu Bar if dirty rect touches it (Y_min < 28)
-    cmp r9d, 28
+    mov edx, [r15 + wm_drag_dirty_y - kmain]
+    cmp edx, 28
     jae .skip_mb
     call md_render_menubar
 .skip_mb:
 
     ; Step 3: Redraw Dock if dirty rect touches it
-    mov eax, r9d
-    add eax, r11d                     ; Y_max
+    mov eax, [r15 + wm_drag_dirty_y - kmain]
+    add eax, [r15 + wm_drag_dirty_h - kmain]     ; Y_max
     cmp eax, 990
     jb .skip_dk
-    mov eax, r8d
-    add eax, r10d                     ; X_max
+    mov eax, [r15 + wm_drag_dirty_x - kmain]
+    add eax, [r15 + wm_drag_dirty_w - kmain]     ; X_max
     cmp eax, 800
     jb .skip_dk
-    cmp r8d, 1120
+    cmp dword [r15 + wm_drag_dirty_x - kmain], 1120
     ja .skip_dk
     call md_render_dock
 .skip_dk:
 
     ; Step 4: Render all intersecting windows in Z-order
-    push r8
-    push r9
-    push r10
-    push r11
+    mov r8d, [r15 + wm_drag_dirty_x - kmain]
+    mov r9d, [r15 + wm_drag_dirty_y - kmain]
+    mov r10d, [r15 + wm_drag_dirty_w - kmain]
+    mov r11d, [r15 + wm_drag_dirty_h - kmain]
     cmp byte [r15 + wm_drag_surf_valid - kmain], 1
     je .paste_surface_mode
     call wm_render_intersecting
@@ -941,16 +999,12 @@ wm_drag_step:
     call wm_render_intersecting_under
     call wm_paste_drag_surface
 .render_done:
-    pop r11
-    pop r10
-    pop r9
-    pop r8
 
     ; Step 5: Flip only dirty rect to VRAM LFB (~3-5 ms)
-    mov ecx, r8d
-    mov edx, r9d
-    mov esi, r10d
-    mov edi, r11d
+    mov ecx, [r15 + wm_drag_dirty_x - kmain]
+    mov edx, [r15 + wm_drag_dirty_y - kmain]
+    mov esi, [r15 + wm_drag_dirty_w - kmain]
+    mov edi, [r15 + wm_drag_dirty_h - kmain]
     call r2d_flip_rect
 
     ; Step 6: Draw cursor directly to VRAM LFB at new position
