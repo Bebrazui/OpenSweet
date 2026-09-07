@@ -305,7 +305,9 @@ pm_entry:
     rep stosd
 
     mov dword [0x1000], 0x2001          ; PML4[0] -> PDPT
-    mov dword [0x2000], 0x3001          ; PDPT[0] -> PD
+    mov dword [0x2000], 0x3001          ; PDPT[0] -> PD (0..1GB)
+    mov dword [0x2008], 0x40000087      ; PDPT[1]: 1GB @1GB (1..2GB)
+    mov dword [0x2010], 0x80000087      ; PDPT[2]: 1GB @2GB (2..3GB)
     mov dword [0x2018], 0xC0000087      ; PDPT[3]: 1GB @3GB (LAPIC/VBE LFB)
 
     ; higher-half: PML4[256] -> PDPT_B@0x4000 -> PD_B@0x7000 -> 2MB @ phys 0

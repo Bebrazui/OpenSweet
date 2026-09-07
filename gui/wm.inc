@@ -32,6 +32,8 @@ wm_drag_off_x      dd 0
 wm_drag_off_y      dd 0
 wm_drag_prev_x     dd 0
 wm_drag_prev_y     dd 0
+wm_drag_surf_x0    dd 0
+wm_drag_surf_y0    dd 0
 wm_drag_surf_w     dd 0
 wm_drag_surf_h     dd 0
 wm_drag_surf_off_x dd 0
@@ -1239,7 +1241,9 @@ wm_capture_drag_surface:
     test edi, edi
     jle .cap_done
 
-    ; Store surface geometry
+    ; Store surface geometry and origins cleanly in memory
+    mov [r15 + wm_drag_surf_x0 - kmain], ecx
+    mov [r15 + wm_drag_surf_y0 - kmain], edx
     mov [r15 + wm_drag_surf_w - kmain], esi
     mov [r15 + wm_drag_surf_h - kmain], edi
 
@@ -1255,19 +1259,32 @@ wm_capture_drag_surface:
     mov eax, 1                                  ; is_focused = 1
     call wm_render_window
 
-    ; Copy (ecx, edx, esi, edi) from R2D_BACKBUFFER into R2D_WIN_CACHE (0x03000000)
+    ; Reload surface geometry explicitly from memory
+    mov ecx, [r15 + wm_drag_surf_x0 - kmain]
+    mov edx, [r15 + wm_drag_surf_y0 - kmain]
+    mov esi, [r15 + wm_drag_surf_w - kmain]
+    mov edi, [r15 + wm_drag_surf_h - kmain]
+
+    test esi, esi
+    jle .cap_done
+    test edi, edi
+    jle .cap_done
+
     mov r12d, esi
     shr r12d, 1                                 ; qwords per row
+    test r12d, r12d
+    jz .cap_done
 
     xor ebx, ebx                                ; row = 0..edi-1
 .cap_row:
     cmp ebx, edi
-    jae .cap_finish
+    jge .cap_finish
 
     mov eax, edx
     add eax, ebx
     imul eax, R2D_PITCH
     lea rsi, [rax + R2D_BACKBUFFER]
+    mov ecx, [r15 + wm_drag_surf_x0 - kmain]
     lea rsi, [rsi + rcx*4]                      ; src backbuffer ptr
 
     mov eax, [r15 + wm_drag_surf_w - kmain]
@@ -1275,11 +1292,9 @@ wm_capture_drag_surface:
     shl rax, 2
     lea rdi, [rax + R2D_WIN_CACHE]              ; dst win_cache ptr
 
-    push rcx
     mov ecx, r12d
     cld
     rep movsq
-    pop rcx
 
     inc ebx
     jmp .cap_row

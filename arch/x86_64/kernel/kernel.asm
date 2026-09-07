@@ -1724,9 +1724,25 @@ vmm_unmap:
     ret
 
 common_ex:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push rbp
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+
     mov rsi, exc_msg
     call puts
-    movzx r12d, byte [rsp]             ; vector number pushed by stub
+    movzx r12d, byte [rsp + 15*8]      ; vector number pushed by stub
     mov al, r12b
     push rax
     shr al, 4
@@ -1753,10 +1769,10 @@ common_ex:
     cmp r12d, 17
     je .has_err
 
-    ; No error code: [rsp+8] = RIP, [rsp+32] = RSP
+    ; No error code: [rsp + 16*8] = RIP, [rsp + 19*8] = RSP
     mov rsi, at_msg
     call puts
-    mov rax, [rsp+8]          ; RIP
+    mov rax, [rsp + 16*8]     ; RIP
     call puthex64
     mov al, ' '
     call putc
@@ -1768,12 +1784,12 @@ common_ex:
     call putc
     mov al, '='
     call putc
-    mov rax, [rsp+32]         ; RSP
+    mov rax, [rsp + 19*8]     ; RSP
     call puthex64
     jmp .print_cr2
 
 .has_err:
-    ; Has error code: [rsp+8] = ERR, [rsp+16] = RIP, [rsp+40] = RSP
+    ; Has error code: [rsp + 16*8] = ERR, [rsp + 17*8] = RIP, [rsp + 20*8] = RSP
     mov al, ' '
     call putc
     mov al, 'E'
@@ -1784,12 +1800,12 @@ common_ex:
     call putc
     mov al, '='
     call putc
-    mov rax, [rsp+8]          ; ERR
+    mov rax, [rsp + 16*8]     ; ERR
     call puthex64
 
     mov rsi, at_msg
     call puts
-    mov rax, [rsp+16]         ; RIP
+    mov rax, [rsp + 17*8]     ; RIP
     call puthex64
 
     mov al, ' '
@@ -1802,7 +1818,7 @@ common_ex:
     call putc
     mov al, '='
     call putc
-    mov rax, [rsp+40]         ; RSP
+    mov rax, [rsp + 20*8]     ; RSP
     call puthex64
 
 .print_cr2:
@@ -1818,6 +1834,82 @@ common_ex:
     call putc
     mov rax, cr2
     call puthex64
+
+    ; Line 1: RAX, RBX, RCX, RDX
+    lea rsi, [r15 + str_dump_r1 - kmain]
+    call puts
+    mov rax, [rsp + 14*8]     ; RAX
+    call puthex64
+    lea rsi, [r15 + str_dump_rb - kmain]
+    call puts
+    mov rax, [rsp + 13*8]     ; RBX
+    call puthex64
+    lea rsi, [r15 + str_dump_rc - kmain]
+    call puts
+    mov rax, [rsp + 12*8]     ; RCX
+    call puthex64
+    lea rsi, [r15 + str_dump_rd - kmain]
+    call puts
+    mov rax, [rsp + 11*8]     ; RDX
+    call puthex64
+
+    ; Line 2: RSI, RDI, R8, R9
+    lea rsi, [r15 + str_dump_r2 - kmain]
+    call puts
+    mov rax, [rsp + 10*8]     ; RSI
+    call puthex64
+    lea rsi, [r15 + str_dump_di - kmain]
+    call puts
+    mov rax, [rsp + 9*8]      ; RDI
+    call puthex64
+    lea rsi, [r15 + str_dump_r8 - kmain]
+    call puts
+    mov rax, [rsp + 7*8]      ; R8
+    call puthex64
+    lea rsi, [r15 + str_dump_r9 - kmain]
+    call puts
+    mov rax, [rsp + 6*8]      ; R9
+    call puthex64
+
+    ; Line 3: R10, R11, R12, R13
+    lea rsi, [r15 + str_dump_ra - kmain]
+    call puts
+    mov rax, [rsp + 5*8]      ; R10
+    call puthex64
+    lea rsi, [r15 + str_dump_rb1 - kmain]
+    call puts
+    mov rax, [rsp + 4*8]      ; R11
+    call puthex64
+    lea rsi, [r15 + str_dump_rc1 - kmain]
+    call puts
+    mov rax, [rsp + 3*8]      ; R12
+    call puthex64
+    lea rsi, [r15 + str_dump_rd1 - kmain]
+    call puts
+    mov rax, [rsp + 2*8]      ; R13
+    call puthex64
+
+    ; Stack contents at fault RSP
+    lea rsi, [r15 + str_dump_stk - kmain]
+    call puts
+    mov rbx, [rsp + 20*8]     ; fault RSP
+    test rbx, rbx
+    jz @f
+    mov rax, [rbx + 0]
+    call puthex64
+    mov al, ' '
+    call putc
+    mov rax, [rbx + 8]
+    call puthex64
+    mov al, ' '
+    call putc
+    mov rax, [rbx + 16]
+    call puthex64
+    mov al, ' '
+    call putc
+    mov rax, [rbx + 24]
+    call puthex64
+@@:
     mov al, 10
     call putc
 .halt:
@@ -1976,6 +2068,19 @@ cur      dw 0
 shift    db 0
 exc_msg  db "EXCEPTION ", 0
 at_msg   db " @ ", 0
+str_dump_r1 db 10, "  RAX=", 0
+str_dump_rb db " RBX=", 0
+str_dump_rc db " RCX=", 0
+str_dump_rd db " RDX=", 0
+str_dump_r2 db 10, "  RSI=", 0
+str_dump_di db " RDI=", 0
+str_dump_r8 db " R8 =", 0
+str_dump_r9 db " R9 =", 0
+str_dump_ra db 10, "  R10=", 0
+str_dump_rb1 db " R11=", 0
+str_dump_rc1 db " R12=", 0
+str_dump_rd1 db " R13=", 0
+str_dump_stk db 10, "  STK@RSP: ", 0
 cmd_exc  db "exc", 0
 cmd_div  db "div", 0
 cmd_map  db "map", 0
