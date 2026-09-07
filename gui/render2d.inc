@@ -54,14 +54,125 @@ r2d_flip:
     jz .flip_done
 
     mov rsi, R2D_BACKBUFFER
-    mov ecx, (R2D_SCREEN_W * R2D_SCREEN_H * 4) / 8    ; 393,216 qwords
+    mov ecx, (R2D_SCREEN_W * R2D_SCREEN_H * 4) / 8    ; 1,036,800 qwords
     rep movsq
+
+    call r2d_record_frame
 
 .flip_done:
     pop rax
     pop rcx
     pop rdi
     pop rsi
+    ret
+
+; ==============================================================================
+; r2d_flip_rect: Fast hardware blit of sub-rectangle from Backbuffer to VRAM LFB
+; ECX = x, EDX = y, ESI = w, EDI = h
+; ==============================================================================
+r2d_flip_rect:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+
+    mov r8d, [r15 + vbe_lfb - kmain]
+    test r8d, r8d
+    jz .fr_done
+
+    ; Check bounds: ECX=x, EDX=y, ESI=w, EDI=h
+    cmp ecx, R2D_SCREEN_W
+    jae .fr_done
+    cmp edx, R2D_SCREEN_H
+    jae .fr_done
+    test esi, esi
+    jle .fr_done
+    test edi, edi
+    jle .fr_done
+
+    ; Clamp x + w <= R2D_SCREEN_W
+    mov eax, ecx
+    add eax, esi
+    cmp eax, R2D_SCREEN_W
+    jbe @f
+    mov esi, R2D_SCREEN_W
+    sub esi, ecx
+@@:
+    ; Clamp y + h <= R2D_SCREEN_H
+    mov eax, edx
+    add eax, edi
+    cmp eax, R2D_SCREEN_H
+    jbe @f
+    mov edi, R2D_SCREEN_H
+    sub edi, edx
+@@:
+    ; Align x down to even (8-byte aligned row starts)
+    test ecx, 1
+    jz @f
+    dec ecx
+    inc esi
+@@:
+    ; Align w up to even
+    test esi, 1
+    jz @f
+    inc esi
+@@:
+    ; Re-check w clamp
+    mov eax, ecx
+    add eax, esi
+    cmp eax, R2D_SCREEN_W
+    jbe @f
+    mov esi, R2D_SCREEN_W
+    sub esi, ecx
+@@:
+    ; Qwords count per row = w / 2
+    mov r10d, esi
+    shr r10d, 1                       ; r10d = qwords per row
+    test r10d, r10d
+    jz .fr_done
+
+    ; Starting byte offset = (y * R2D_SCREEN_W + x) * 4
+    imul eax, edx, R2D_SCREEN_W
+    add eax, ecx
+    shl rax, 2                        ; byte offset in rax
+
+    lea rsi, [rax + R2D_BACKBUFFER]
+    mov r8d, r8d                      ; zero-extend r8d to r8
+    add r8, rax                       ; r8 = starting vbe_lfb address
+
+    mov r9d, edi                      ; r9d = rows remaining
+    cld
+
+.fr_row_loop:
+    mov rcx, r10                      ; qword count
+    mov rdi, r8                       ; dest vbe_lfb ptr
+    mov r11, rsi                      ; preserve row start rsi
+    rep movsq
+
+    add r8, R2D_PITCH
+    lea rsi, [r11 + R2D_PITCH]
+    dec r9d
+    jnz .fr_row_loop
+
+.fr_done:
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
     ret
 
 ; ==============================================================================
@@ -149,11 +260,114 @@ r2d_draw_ambient_wallpaper:
     cld
     mov rdi, R2D_BACKBUFFER
     mov rsi, R2D_WALLPAPER_CACHE
-    mov ecx, (R2D_SCREEN_W * R2D_SCREEN_H * 4) / 8    ; 393,216 qwords
+    mov ecx, (R2D_SCREEN_W * R2D_SCREEN_H * 4) / 8    ; 1,036,800 qwords
     rep movsq
     pop rcx
     pop rdi
     pop rsi
+    ret
+
+; ==============================================================================
+; r2d_restore_wallpaper_rect: Fast sub-rectangle restore from Wallpaper Cache to Backbuffer
+; ECX = x, EDX = y, ESI = w, EDI = h
+; ==============================================================================
+r2d_restore_wallpaper_rect:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+
+    ; Check bounds: ECX=x, EDX=y, ESI=w, EDI=h
+    cmp ecx, R2D_SCREEN_W
+    jae .rw_done
+    cmp edx, R2D_SCREEN_H
+    jae .rw_done
+    test esi, esi
+    jle .rw_done
+    test edi, edi
+    jle .rw_done
+
+    ; Clamp x + w <= R2D_SCREEN_W
+    mov eax, ecx
+    add eax, esi
+    cmp eax, R2D_SCREEN_W
+    jbe @f
+    mov esi, R2D_SCREEN_W
+    sub esi, ecx
+@@:
+    ; Clamp y + h <= R2D_SCREEN_H
+    mov eax, edx
+    add eax, edi
+    cmp eax, R2D_SCREEN_H
+    jbe @f
+    mov edi, R2D_SCREEN_H
+    sub edi, edx
+@@:
+    ; Align x down to even
+    test ecx, 1
+    jz @f
+    dec ecx
+    inc esi
+@@:
+    ; Align w up to even
+    test esi, 1
+    jz @f
+    inc esi
+@@:
+    ; Re-check w clamp
+    mov eax, ecx
+    add eax, esi
+    cmp eax, R2D_SCREEN_W
+    jbe @f
+    mov esi, R2D_SCREEN_W
+    sub esi, ecx
+@@:
+    mov r10d, esi
+    shr r10d, 1                       ; r10d = qwords per row
+    test r10d, r10d
+    jz .rw_done
+
+    ; Starting byte offset = (y * R2D_SCREEN_W + x) * 4
+    imul eax, edx, R2D_SCREEN_W
+    add eax, ecx
+    shl rax, 2                        ; byte offset in rax
+
+    lea rsi, [rax + R2D_WALLPAPER_CACHE]
+    lea r8, [rax + R2D_BACKBUFFER]
+
+    mov r9d, edi                      ; r9d = rows remaining
+    cld
+
+.rw_row_loop:
+    mov rcx, r10                      ; qword count
+    mov rdi, r8
+    mov r11, rsi
+    rep movsq
+
+    add r8, R2D_PITCH
+    lea rsi, [r11 + R2D_PITCH]
+    dec r9d
+    jnz .rw_row_loop
+
+.rw_done:
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
     ret
 
 ; ==============================================================================
@@ -1375,6 +1589,38 @@ r2d_redraw_clock_lfb:
     ret
 
 align 16
-gui_lock dd 0
+gui_lock            dd 0
+gui_frame_count     dd 0
+gui_fps             dd 60
+gui_fps_sec_frames  dd 0
+gui_last_sec_tick   dd 0
+
+; ==============================================================================
+; r2d_record_frame: Update frame counter and calculate real-time FPS
+; ==============================================================================
+r2d_record_frame:
+    push rax
+    push rbx
+    inc dword [r15 + gui_frame_count - kmain]
+    inc dword [r15 + gui_fps_sec_frames - kmain]
+
+    mov eax, [r15 + timer_ticks - kmain]
+    mov ebx, [r15 + gui_last_sec_tick - kmain]
+    sub eax, ebx
+    cmp eax, 1000
+    jb .rf_done
+
+    ; 1000 ms elapsed: store current FPS
+    mov eax, [r15 + gui_fps_sec_frames - kmain]
+    mov [r15 + gui_fps - kmain], eax
+    mov dword [r15 + gui_fps_sec_frames - kmain], 0
+    mov eax, [r15 + timer_ticks - kmain]
+    mov [r15 + gui_last_sec_tick - kmain], eax
+
+.rf_done:
+    pop rbx
+    pop rax
+    ret
+
 
 

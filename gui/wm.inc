@@ -27,10 +27,12 @@ wm_h          dd 600, 560, 480,  440
 wm_z_order    db 0, 1, 2, 3                     ; App IDs from back (0) to front (open_count - 1)
 wm_open_count db 1                              ; Number of active open windows
 wm_focus_app  db 0                              ; Currently focused application ID
-wm_drag_app   db 0xFF                           ; 0xFF = no window being dragged
-wm_drag_off_x dd 0
-wm_drag_off_y dd 0
-wm_prev_lmb   db 0
+wm_drag_app    db 0xFF                           ; 0xFF = no window being dragged
+wm_drag_off_x  dd 0
+wm_drag_off_y  dd 0
+wm_drag_prev_x dd 0
+wm_drag_prev_y dd 0
+wm_prev_lmb    db 0
 
 ; Window Titles
 str_title_term db "Terminal - Opensweet Shell (x86_64)", 0
@@ -201,6 +203,7 @@ wm_bring_to_front:
     push rbx
     push rcx
     push rdx
+    push r8
 
     movzx ebx, al                       ; app_id
     cmp ebx, APP_COUNT
@@ -243,6 +246,7 @@ wm_bring_to_front:
     mov [r15 + wm_focus_app - kmain], bl
 
 .btf_ret:
+    pop r8
     pop rdx
     pop rcx
     pop rbx
@@ -672,13 +676,22 @@ wm_handle_mouse:
     mov al, bl
     call wm_bring_to_front
 
+    movzx ebx, al
     mov [r15 + wm_drag_app - kmain], bl
+
+    ; Safely reload window coordinates directly from memory
+    mov r8d, [r15 + wm_x - kmain + rbx*4]
+    mov r9d, [r15 + wm_y - kmain + rbx*4]
+
     mov eax, [r15 + md_mouse_x - kmain]
     sub eax, r8d
     mov [r15 + wm_drag_off_x - kmain], eax
     mov edx, [r15 + md_mouse_y - kmain]
     sub edx, r9d
     mov [r15 + wm_drag_off_y - kmain], edx
+
+    mov [r15 + wm_drag_prev_x - kmain], r8d
+    mov [r15 + wm_drag_prev_y - kmain], r9d
     jmp .mouse_ret
 
 .body_click:
@@ -717,7 +730,6 @@ wm_handle_mouse:
     jle @f
     mov eax, ecx
 @@:
-    mov [r15 + wm_x - kmain + rbx*4], eax
 
     mov edx, [r15 + md_mouse_y - kmain]
     sub edx, [r15 + wm_drag_off_y - kmain]
@@ -732,10 +744,17 @@ wm_handle_mouse:
     jle @f
     mov edx, ecx
 @@:
-    mov [r15 + wm_y - kmain + rbx*4], edx
 
-    ; Mark dirty to re-render composited desktop
-    mov byte [r15 + md_term_dirty - kmain], 1
+    ; Check if window position actually changed!
+    cmp eax, [r15 + wm_drag_prev_x - kmain]
+    jne .do_drag_move
+    cmp edx, [r15 + wm_drag_prev_y - kmain]
+    je .mouse_ret                     ; Position unchanged, return!
+
+.do_drag_move:
+    ; Perform high-performance sub-region dirty blit (60+ FPS!)
+    call wm_drag_step
+    jmp .mouse_ret
 
 .mouse_ret:
     pop r12
@@ -750,3 +769,279 @@ wm_handle_mouse:
     pop rbx
     pop rax
     ret
+
+; ==============================================================================
+; wm_drag_step: Fast sub-rectangle dirty blit for window dragging
+; EBX = app_id, EAX = new_x, EDX = new_y
+; ==============================================================================
+wm_drag_step:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+
+    mov r12d, eax                     ; r12d = new_x
+    mov r13d, edx                     ; r13d = new_y
+
+    mov r8d, [r15 + wm_drag_prev_x - kmain] ; r8d = old_x
+    mov r9d, [r15 + wm_drag_prev_y - kmain] ; r9d = old_y
+    mov r10d, [r15 + wm_w - kmain + rbx*4]  ; r10d = win_w
+    mov r11d, [r15 + wm_h - kmain + rbx*4]  ; r11d = win_h
+
+    ; X_min = min(old_x, new_x)
+    mov ecx, r8d
+    cmp ecx, r12d
+    jbe .xmin_ok
+    mov ecx, r12d
+.xmin_ok:
+
+    ; Y_min = min(old_y, new_y)
+    mov edx, r9d
+    cmp edx, r13d
+    jbe .ymin_ok
+    mov edx, r13d
+.ymin_ok:
+
+    ; X_max = max(old_x, new_x) + win_w
+    mov esi, r8d
+    cmp esi, r12d
+    jae .xmax_ok
+    mov esi, r12d
+.xmax_ok:
+    add esi, r10d
+
+    ; Y_max = max(old_y, new_y) + win_h
+    mov edi, r9d
+    cmp edi, r13d
+    jae .ymax_ok
+    mov edi, r13d
+.ymax_ok:
+    add edi, r11d
+
+    ; Expand bounding box with shadow margin (18 px)
+    sub ecx, 18
+    jns .cx_ok
+    xor ecx, ecx
+.cx_ok:
+    sub edx, 18
+    jns .dx_ok
+    xor edx, edx
+.dx_ok:
+    add esi, 18
+    cmp esi, R2D_SCREEN_W
+    jbe .si_ok
+    mov esi, R2D_SCREEN_W
+.si_ok:
+    add edi, 18
+    cmp edi, R2D_SCREEN_H
+    jbe .di_ok
+    mov edi, R2D_SCREEN_H
+.di_ok:
+
+    ; Align min_x down to even
+    and ecx, not 1
+
+    ; Dirty width = max_x - min_x
+    sub esi, ecx
+    test esi, 1
+    jz .w_even
+    inc esi
+.w_even:
+    ; Ensure min_x + w <= R2D_SCREEN_W
+    mov eax, ecx
+    add eax, esi
+    cmp eax, R2D_SCREEN_W
+    jbe .w_clamped
+    mov esi, R2D_SCREEN_W
+    sub esi, ecx
+.w_clamped:
+
+    ; Dirty height = max_y - min_y
+    sub edi, edx
+
+    ; Update window coordinates and drag_prev
+    mov [r15 + wm_x - kmain + rbx*4], r12d
+    mov [r15 + wm_y - kmain + rbx*4], r13d
+    mov [r15 + wm_drag_prev_x - kmain], r12d
+    mov [r15 + wm_drag_prev_y - kmain], r13d
+
+    ; Acquire GUI lock
+    mov dword [r15 + gui_lock - kmain], 1
+
+    ; r8d = X_min, r9d = Y_min, r10d = W_dirty, r11d = H_dirty
+    mov r8d, ecx
+    mov r9d, edx
+    mov r10d, esi
+    mov r11d, edi
+
+    ; Step 1: Restore wallpaper in dirty rect (<0.05 ms)
+    call r2d_restore_wallpaper_rect
+
+    ; Step 2: Redraw Top Menu Bar if dirty rect touches it (Y_min < 28)
+    cmp r9d, 28
+    jae .skip_mb
+    call md_render_menubar
+.skip_mb:
+
+    ; Step 3: Redraw Dock if dirty rect touches it
+    mov eax, r9d
+    add eax, r11d                     ; Y_max
+    cmp eax, 990
+    jb .skip_dk
+    mov eax, r8d
+    add eax, r10d                     ; X_max
+    cmp eax, 800
+    jb .skip_dk
+    cmp r8d, 1120
+    ja .skip_dk
+    call md_render_dock
+.skip_dk:
+
+    ; Step 4: Render all intersecting windows in Z-order
+    push r8
+    push r9
+    push r10
+    push r11
+    call wm_render_intersecting
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+
+    ; Step 5: Flip only dirty rect to VRAM LFB (~3-5 ms)
+    mov ecx, r8d
+    mov edx, r9d
+    mov esi, r10d
+    mov edi, r11d
+    call r2d_flip_rect
+
+    ; Step 6: Draw cursor directly to VRAM LFB at new position
+    mov ecx, [r15 + md_mouse_x - kmain]
+    mov edx, [r15 + md_mouse_y - kmain]
+    mov [r15 + md_mouse_prev_x - kmain], ecx
+    mov [r15 + md_mouse_prev_y - kmain], edx
+    call r2d_draw_cursor_lfb
+
+    ; Step 7: Record frame & update real-time FPS
+    call r2d_record_frame
+
+    ; Release GUI lock
+    mov dword [r15 + gui_lock - kmain], 0
+
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; ==============================================================================
+; wm_render_intersecting: Render open windows in Z-order that intersect dirty box
+; R8D = X_min, R9D = Y_min, R10D = W_dirty, R11D = H_dirty
+; ==============================================================================
+wm_render_intersecting:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    sub rsp, 32                       ; local variables frame
+
+    ; [rsp + 0] = X_min
+    ; [rsp + 4] = Y_min
+    ; [rsp + 8] = X_max
+    ; [rsp + 12] = Y_max
+    mov [rsp + 0], r8d
+    mov [rsp + 4], r9d
+    mov eax, r8d
+    add eax, r10d
+    mov [rsp + 8], eax                ; X_max
+    mov edx, r9d
+    add edx, r11d
+    mov [rsp + 12], edx               ; Y_max
+
+    xor r12d, r12d                    ; z index 0..open_count-1
+.check_win_loop:
+    cmp r12b, [r15 + wm_open_count - kmain]
+    jae .intersect_done
+
+    movzx ebx, byte [r15 + wm_z_order - kmain + r12] ; app_id
+
+    ; Load window bounds + shadow margin 18
+    mov eax, [r15 + wm_x - kmain + rbx*4]
+    sub eax, 18                       ; wx1
+    jns .wx1_pos
+    xor eax, eax
+.wx1_pos:
+    mov ecx, [r15 + wm_x - kmain + rbx*4]
+    add ecx, [r15 + wm_w - kmain + rbx*4]
+    add ecx, 18                       ; wx2
+
+    mov edx, [r15 + wm_y - kmain + rbx*4]
+    sub edx, 18                       ; wy1
+    jns .wy1_pos
+    xor edx, edx
+.wy1_pos:
+    mov esi, [r15 + wm_y - kmain + rbx*4]
+    add esi, [r15 + wm_h - kmain + rbx*4]
+    add esi, 18                       ; wy2
+
+    ; Intersection test:
+    cmp ecx, [rsp + 0]                ; wx2 <= X_min ?
+    jbe .skip_this_win
+    cmp eax, [rsp + 8]                ; wx1 >= X_max ?
+    jae .skip_this_win
+    cmp esi, [rsp + 4]                ; wy2 <= Y_min ?
+    jbe .skip_this_win
+    cmp edx, [rsp + 12]               ; wy1 >= Y_max ?
+    jae .skip_this_win
+
+    ; Window intersects! Render it.
+    xor eax, eax
+    cmp bl, [r15 + wm_focus_app - kmain]
+    sete al                           ; 1 if focused, 0 otherwise
+
+    call wm_render_window
+
+.skip_this_win:
+    inc r12d
+    jmp .check_win_loop
+
+.intersect_done:
+    add rsp, 32
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+

@@ -35,6 +35,7 @@ str_md_menu_f   db "Files", 0
 str_md_menu_s   db "System", 0
 str_md_menu_set db "Settings", 0
 str_md_clock    db "14:38:00", 0
+str_md_fps      db " 60 FPS", 0
 
 str_md_banner1  db "Opensweet OS v0.0.3 [x86_64 Long Mode] - 1920x1080 @ 32bpp", 0
 str_md_banner2  db "Type 'help' for list of available hardware and ext4 commands.", 0
@@ -217,7 +218,94 @@ modern_desktop_render:
     ; 1. Ambient Wallpaper (fast 64-bit copy from pre-rendered cache in 0.3ms)
     call r2d_draw_ambient_wallpaper
 
-    ; 2. Top Menu Bar (height 28)
+    ; 2. Top Menu Bar
+    call md_render_menubar
+
+    ; 3. Render all active open windows in Z-order
+    call wm_render_all
+
+    ; 4. Floating Bottom Dock
+    call md_render_dock
+
+    ; 5. Flip clean backbuffer to VRAM LFB
+    call r2d_flip
+
+    ; 6. Draw mouse cursor directly to VRAM LFB
+    mov ecx, [r15 + md_mouse_x - kmain]
+    mov edx, [r15 + md_mouse_y - kmain]
+    mov [r15 + md_mouse_prev_x - kmain], ecx
+    mov [r15 + md_mouse_prev_y - kmain], edx
+    call r2d_draw_cursor_lfb
+
+    ; Release GUI compositor lock
+    mov dword [r15 + gui_lock - kmain], 0
+
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+; ==============================================================================
+; md_format_fps: Convert gui_fps (0..999) to string " XX FPS"
+; ==============================================================================
+md_format_fps:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+
+    mov eax, [r15 + gui_fps - kmain]
+    cmp eax, 999
+    jbe @f
+    mov eax, 999
+@@:
+    xor edx, edx
+    mov ecx, 100
+    div ecx                           ; eax = hundreds, edx = remainder
+    test al, al
+    jz .fps_no_h
+    add al, '0'
+    mov [r15 + str_md_fps - kmain + 0], al
+    jmp .fps_tens
+.fps_no_h:
+    mov byte [r15 + str_md_fps - kmain + 0], ' '
+.fps_tens:
+    mov eax, edx
+    xor edx, edx
+    mov ecx, 10
+    div ecx                           ; al = tens, dl = units
+    add al, '0'
+    add dl, '0'
+    mov [r15 + str_md_fps - kmain + 1], al
+    mov [r15 + str_md_fps - kmain + 2], dl
+    mov byte [r15 + str_md_fps - kmain + 3], ' '
+    mov byte [r15 + str_md_fps - kmain + 4], 'F'
+    mov byte [r15 + str_md_fps - kmain + 5], 'P'
+    mov byte [r15 + str_md_fps - kmain + 6], 'S'
+    mov byte [r15 + str_md_fps - kmain + 7], 0
+
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; ==============================================================================
+; md_render_menubar: Top Menu Bar (height 28)
+; ==============================================================================
+md_render_menubar:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+
     xor ecx, ecx
     xor edx, edx
     mov esi, R2D_SCREEN_W
@@ -253,6 +341,14 @@ modern_desktop_render:
     lea rsi, [r15 + str_md_menu_set - kmain]
     call r2d_draw_text_ui_aa
 
+    ; Real-time FPS indicator
+    call md_format_fps
+    mov ecx, R2D_SCREEN_W - 165
+    mov edx, 6
+    mov eax, 0xFF10B981               ; Vibrant Emerald Green
+    lea rsi, [r15 + str_md_fps - kmain]
+    call r2d_draw_text_ui_aa
+
     ; Menu bar right clock
     mov ecx, R2D_SCREEN_W - 78
     mov edx, 6
@@ -260,10 +356,25 @@ modern_desktop_render:
     lea rsi, [r15 + str_md_clock - kmain]
     call r2d_draw_text_ui_aa
 
-    ; 3. Render all active open windows in Z-order
-    call wm_render_all
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
 
-    ; 4. Floating Bottom Dock (w=320, h=68, x=800, y=996)
+; ==============================================================================
+; md_render_dock: Floating Bottom Dock (w=320, h=68, x=800, y=996)
+; ==============================================================================
+md_render_dock:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+
     mov ecx, 800
     mov edx, 996
     mov esi, 320
@@ -349,24 +460,6 @@ modern_desktop_render:
     mov eax, 0xFFF8FAFC
     call r2d_draw_rounded_rect_aa
 @@:
-
-    ; 5. Flip clean backbuffer to VRAM LFB
-    call r2d_flip
-
-    ; 6. Draw mouse cursor directly to VRAM LFB
-    mov ecx, [r15 + md_mouse_x - kmain]
-    mov edx, [r15 + md_mouse_y - kmain]
-    mov [r15 + md_mouse_prev_x - kmain], ecx
-    mov [r15 + md_mouse_prev_y - kmain], edx
-    call r2d_draw_cursor_lfb
-
-    ; Release GUI compositor lock
-    mov dword [r15 + gui_lock - kmain], 0
-
-    pop r11
-    pop r10
-    pop r9
-    pop r8
     pop rdi
     pop rsi
     pop rdx
@@ -378,5 +471,6 @@ modern_desktop_render:
 ; ==============================================================================
 ; md_handle_mouse: Delegate to Window Manager mouse dispatcher
 ; ==============================================================================
+
 md_handle_mouse:
     jmp wm_handle_mouse

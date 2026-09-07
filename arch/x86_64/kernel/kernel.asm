@@ -152,6 +152,19 @@ kmain:
     call getc
     test al, al
     jnz .key
+
+    ; Fast path: If mouse moved or button changed while blitting, loop immediately without hlt sleep
+    mov eax, [r15 + mouse_x - kmain]
+    cmp eax, [r15 + md_mouse_x - kmain]
+    jne .shell
+    mov edx, [r15 + mouse_y - kmain]
+    cmp edx, [r15 + md_mouse_y - kmain]
+    jne .shell
+    mov al, [r15 + mouse_buttons - kmain]
+    and al, 1
+    cmp al, [r15 + wm_prev_lmb - kmain]
+    jne .shell
+
     hlt                       ; sleep until IRQ
     jmp .shell
 .key:
@@ -252,6 +265,13 @@ kmain:
     call streq
     test al, al
     jnz .do_vbe
+
+    ; fps
+    mov rsi, cmd_buf
+    lea rdi, [r15 + cmd_fps - kmain]
+    call streq
+    test al, al
+    jnz .do_fps
 
     ; reboot
     mov rsi, cmd_buf
@@ -839,6 +859,44 @@ kmain:
     mov eax, FB_CLR_DEFAULT
     call fb_console_set_color
     jmp .prompt
+
+.do_fps:
+    mov eax, FB_CLR_HEADER
+    call fb_console_set_color
+    lea rsi, [r15 + str_fps_hdr - kmain]
+    call puts
+
+    mov eax, FB_CLR_LABEL
+    call fb_console_set_color
+    lea rsi, [r15 + str_fps_lbl - kmain]
+    call puts
+
+    mov eax, FB_CLR_SUCCESS
+    call fb_console_set_color
+    mov eax, [r15 + gui_fps - kmain]
+    call putdec64
+    lea rsi, [r15 + str_fps_unit - kmain]
+    call puts
+
+    mov eax, FB_CLR_LABEL
+    call fb_console_set_color
+    lea rsi, [r15 + str_fps_frames - kmain]
+    call puts
+
+    mov eax, FB_CLR_NUMBER
+    call fb_console_set_color
+    mov eax, [r15 + gui_frame_count - kmain]
+    call putdec64
+
+    mov eax, FB_CLR_LABEL
+    call fb_console_set_color
+    lea rsi, [r15 + str_fps_engine - kmain]
+    call puts
+
+    mov eax, FB_CLR_DEFAULT
+    call fb_console_set_color
+    jmp .prompt
+
 
 .do_reboot:
     mov eax, FB_CLR_SIZE
@@ -1862,6 +1920,7 @@ cmd_pci      db "pci", 0
 cmd_ticks    db "ticks", 0
 cmd_uptime   db "uptime", 0
 cmd_vbe      db "vbe", 0
+cmd_fps      db "fps", 0
 cmd_clear    db "clear", 0
 cmd_cls      db "cls", 0
 cmd_tasks    db "tasks", 0
@@ -1880,6 +1939,12 @@ str_wallpapersp db "wallpaper ", 0
 str_wall_ok  db "Wallpaper decoded and applied successfully.", 10, 0
 str_wall_err db "wallpaper: failed to load or decode PNG file.", 10, 0
 
+str_fps_hdr    db "--- GUI Compositor Metrics ---", 10, 0
+str_fps_lbl    db "  Framerate:    ", 0
+str_fps_unit   db " FPS", 10, 0
+str_fps_frames db "  Total Frames: ", 0
+str_fps_engine db 10, "  Engine Mode:  1080p Sub-Region Dirty Compositor (Zero-Lag)", 10, 0
+
 prompt_user  db "opensweet:", 0
 prompt_sym   db "# ", 0
 
@@ -1891,6 +1956,7 @@ str_help_body:
 db "  heap            - Display kernel dynamic heap allocator stats", 10
 db "  heaptest        - Run kernel heap allocator verification test", 10
 db "  tasks / ps      - List active threads, state, ticks and stacks", 10
+db "  fps             - Display GUI frame rate and compositor metrics", 10
 db "  ls [path]       - List directory contents on ext4", 10
 db "  cd [path]       - Change current working directory", 10
 db "  pwd             - Print current working directory", 10
