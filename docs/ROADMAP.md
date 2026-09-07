@@ -1,44 +1,91 @@
-# Дорожная карта Opensweet OS
+# Дорожная карта OpenSweet OS (x86_64 Pure Assembly)
 
-## Фаза 0 — x86_64 фундамент (ГОТОВО)
-- [x] MBR -> protected mode -> long mode (FASM)
-- [x] Identity map 1GB, 2MB pages
-- [x] VGA text + COM1 serial
-- [x] PS/2 клавиатура (polled), echo-shell
+Никаких ложных обещаний, портирования на C/Rust и мультиархитектурных иллюзий. Проект развивается исключительно как бескомпромиссная монолитная операционная система на чистом ассемблере x86_64 (Flat Assembler / FASM) для современных ПК.
 
-## Фаза 1 — ядро x86_64
-- [x] IDT + обработчики исключений 0-31 (halt-loop + печать вектора/RIP), тест-команды `exc`/`div`
-- [x] Прерывания вместо polling: remap 8259 PIC, PIT ~1kHz тики (`ticks`), IRQ1 клавиатура -> ring buffer, hlt-idle
-- [x] Local APIC: включение, маскировка LVT, таймер periodic 1кГц; PIC через LINT0=ExtINT; dual EOI; полное сохранение контекста в IRQ
-- [x] E820 memory map (boot) -> PMM bitmap 256MB (`mem`: free/alloc/free/alloc-EQ)
-- [x] VMM: vmm_map/vmm_unmap 4KB с аллокацией таблиц по требованию (`map`: запись/чтение через новую трансляцию)
-- [x] Higher-half kernel: org 0xFFFF800000010000, PML4[256] -> 2MB @ phys 0, трамплин из identity; R15=база образа, R14=0 для low-refs
-- [x] Вытесняющая многозадачность (Preemptive Multitasking Scheduler): квантование APIC, TCB, переключение контекста, фоновые демоны (clock, sysmon), команды `tasks`/`ps`
-- [x] Динамический аллокатор памяти ядра (Kernel Heap): `kmalloc`, `kzalloc`, `kfree`, `krealloc`, boundary-tag splitting & coalescing, динамическое расширение через PMM, команды `heap`/`heaptest`
-- Загрузка через UEFI (PE32+ образ) — FASM умеет PE64
-- Кольцо защиты Ring 3 (User Space) и системные вызовы `syscall`/`sysret`
+---
 
-## Фаза 2 — подсистемы
-- [x] Блочный слой: ATA PIO драйвер (LBA28, primary master+slave, polling, таймауты), команда `ata` (identify + дамп сектора), make-disk.cmd тестовый образ
-- [x] ext4: read-only VFS (Superblock, Block Groups, Inode Table, Extents tree, Directory indexing), команды `ls`, `cd`, `pwd`, `cat`, `stat`
-- [x] Full HD Графика (1920x1080 @ 32bpp VBE LFB) и 2D композитор: альфа-блендинг, скругленные углы, тени, субпиксельный сглаженный векторный курсор мыши
-- [x] Оконный менеджер (Window Manager): Z-order, фокус, плавный драг окон, док-панель приложений, верхнее меню
-- [x] Встроенный декодер PNG на чистом ассемблере x86_64: парсинг чанков IHDR/IDAT/IEND, zlib/deflate декомпрессия (Huffman, LZ77), фильтрация сканлайнов, обои рабочего стола (`wallpaper`)
-- littlefs: портирование эталонного кода (чистый C99) — нужен компилятор в ядре или ручной транслят; вариант: собрать через GCC и слинковать
-- LVGL: framebuffer-драйвер (VBE/VESA или UEFI GOP), lv_port_disp
-- Ввод: USB HID (xHCI) для мыши; BT — BLE HOG через контроллер (ESP32 как сопроцессор по UART/SPI — самый быстрый путь)
+## Фаза 0 — Фундамент Long Mode (ГОТОВО)
+- [x] MBR загрузчик (512 байт, BIOS INT 13h LBA) -> Stage 2 (16 КБ).
+- [x] Переход Real Mode (16-бит) -> Protected Mode (32-бит) -> Long Mode (64-бит).
+- [x] Сбор карты памяти BIOS E820.
+- [x] Инициализация видеорежима VBE 32bpp Linear Framebuffer (1920x1080).
+- [x] Identity map первых 4 ГБ физической памяти (2MB / 1GB страницы).
+- [x] Higher-half ядро: база `0xFFFF800000010000`, 4-уровневый paging (PML4).
 
-## Фаза 3 — другие архитектуры
-| Арх    | Инструменты                          | Плата/QEMU            |
-|--------|--------------------------------------|-----------------------|
-| ARM64  | LLVM (`clang --target=aarch64-none-elf`) или aarch64-none-elf-gcc | QEMU virt, PL011 |
-| RISC-V | riscv64-unknown-elf-gcc / clang      | QEMU virt + SBI       |
-| Xtensa | crosstool-NG `xtensa-esp32s3-elf-`   | ESP32-S3 (реальное железо) |
+---
 
-FASM нативно не собирает эти архитектуры. Варианты:
-1. LLVM (один clang покрывает arm64+riscv64, Xtensa — из fork Espressif)
-2. fasmg + macro-пакеты (экспериментально)
+## Фаза 1 — Архитектурное ядро и подсистемы памяти (ГОТОВО)
+- [x] 64-битная IDT: обработчики исключений 0–31 (дамп регистров, CR2, RIP, RSP).
+- [x] Контроллеры прерываний: ремап 8259 PIC + аппаратный Local APIC (LVT periodic timer 1 кГц).
+- [x] PMM (Physical Memory Manager): битмап физических страниц (4 КБ).
+- [x] VMM (Virtual Memory Manager): `vmm_map`/`vmm_unmap` с динамическим выделением page tables.
+- [x] Kernel Heap (Динамическая куча ядра): `kmalloc`, `kzalloc`, `kfree`, `krealloc` на boundary-tag дескрипторах со слиянием свободных фрагментов и динамическим ростом через PMM.
+- [x] Вытесняющий планировщик (Preemptive Scheduler): APIC-квантование, TCB, переключение контекста.
+- [x] Базовые драйверы: COM1 UART (115200 бод), PS/2 клавиатура и PS/2 мышь (IRQ-driven).
 
-## Фаза 4 — WiFi/BT HID
-- Путь А: сопроцессор ESP32 (WiFi+BT на борту, прошивка на NimBLE), связь с ядром по UART-H4/SPI
-- Путь Б: полноценный стек (Zephyr-подход) — очень дорого
+---
+
+## Фаза 2 — Хранилище и Файловая Система ext4 (В ПРОЦЕССЕ)
+- [x] ATA PIO блочный драйвер (LBA28, Primary/Secondary, Identify + Sector Read).
+- [x] ext4 read-only VFS на чистом ассемблере:
+  - [x] Superblock (`0xEF53`), дескрипторы групп блоков (GDT 32/64-bit).
+  - [x] Inode Table, чтение метаданных.
+  - [x] Extents Tree: декодирование leaf и index узлов, чтение файлов.
+  - [x] Чтение линейных каталогов, поиск по путям (`ext4_lookup`, `ext4_read_file`).
+- [ ] Кэширование блоков VFS (Unified Buffer Cache в оперативной памяти).
+- [ ] Запись в ext4 (read-write):
+  - Аллокация свободных блоков через Block Bitmap.
+  - Аллокация инодов через Inode Bitmap.
+  - Добавление записей в каталоги, создание и удаление файлов.
+- [ ] Переход от устаревшего ATA PIO к современным контроллерам шины PCI:
+  - [ ] Сканирование шины PCI (Configuration Space, Class/Subclass/Vendor detection).
+  - [ ] AHCI / SATA драйвер (чтение/запись через DMA и Command Lists).
+  - [ ] NVMe драйвер (PCIe Gen3/4, Submission/Completion Queues, прямой DMA).
+
+---
+
+## Фаза 3 — Графическая среда и Оконный Менеджер (В ПРОЦЕССЕ)
+- [x] 32bpp Linear Framebuffer композитор с Backbuffer в ОЗУ.
+- [x] Оптимизация Damage Rect Tracking (грязные прямоугольники): перерисовка только изменившихся регионов экрана (60+ FPS при перемещении окон).
+- [x] Графические примитивы: альфа-блендинг (ARGB), скругленные углы, мягкие тени, градиенты.
+- [x] Векторный курсор мыши со сглаживанием (sub-pixel AA) и тенью.
+- [x] Шрифтовой рендерер: растровый 8x16 + сглаженные шрифты интерфейса.
+- [x] Window Manager (WM): стек окон, Z-order, плавный драг окон за заголовок, фокус, кнопки закрытия.
+- [x] Окружение рабочего стола: Topbar (часы, индикаторы), нижний Dock запуска приложений.
+- [x] Нативный PNG-декодер на FASM x86_64: парсинг IHDR/IDAT/IEND, zlib/deflate декомпрессор (деревья Хаффмана, LZ77), сканлайн-фильтры (Sub/Up/Avg/Paeth), загрузка обоев.
+- [x] Настоящие системные GUI-приложения:
+  - [x] **Ext4 Explorer**: живой просмотр файлов и каталогов с ext4-диска.
+  - [x] **System Monitor**: живой мониторинг PMM RAM, Kernel Heap, APIC тиков, вендора CPU.
+  - [x] **Terminal**: консольный терминал в графическом окне.
+- [ ] SIMD векторная оптимизация композитора: ускорение альфа-блендинга и пересылки строк через SSE2 / AVX2.
+- [ ] Графические приложения: текстовый редактор (Notepad) и просмотрщик изображений (Image Viewer).
+
+---
+
+## Фаза 4 — Пользовательское пространство (Ring 3) и Системные вызовы (ABI)
+- [ ] Разделение Ring 0 (Kernel) и Ring 3 (User Space).
+- [ ] Механизм системных вызовов x86_64: `syscall` / `sysret` (MSR EFER.SCE, LSTAR, STAR, SFMASK).
+- [ ] Изоляция адресных пространств процессов (отдельный PML4 на каждый пользовательский процесс).
+- [ ] Формат исполняемых файлов: плоский 64-битный исполняемый бинарник (`.app` / `.bin`) или минимальный ELF64.
+- [ ] OpenSweet Assembly SDK: набор макросов и вызовов ABI для написания программ под OpenSweet на FASM.
+
+---
+
+## Фаза 5 — Сетевой стек и Аудио
+- [ ] PCI драйвер сетевой карты: Intel Gigabit Ethernet (e1000) и VirtIO-Net.
+- [ ] Сетевой стек ядра на чистом ассемблере:
+  - L2: Ethernet II, буферизация фреймов.
+  - L3: ARP (кэш соответствия IP/MAC), IPv4, ICMP (обработка и отправка ping).
+  - L4: UDP сокеты, базовый TCP (handshake, sliding window, передача данных).
+- [ ] Сетевые утилиты: `ping`, DNS клиент, HTTP клиент.
+- [ ] Аудиодрайвер: Intel High Definition Audio (Intel HDA) / AC97, базовый микшер звука.
+
+---
+
+## Фаза 6 — Современная загрузка (UEFI x86_64)
+- [ ] UEFI Bootloader на FASM (формат PE32+ x86_64):
+  - Прямой старт в 64-битном Long Mode без 16-битного BIOS legacy real mode.
+  - Опрос видеорежимов через EFI GOP (Graphics Output Protocol).
+  - Чтение ядра с загрузочного раздела FAT32 через EFI Simple File System Protocol.
+  - Вызов ExitBootServices и передача управления ядру.
+
