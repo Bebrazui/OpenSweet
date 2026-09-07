@@ -729,6 +729,12 @@ wm_handle_mouse:
     ; Pre-render active window into R2D_WIN_CACHE for zero-lag blitting
     call wm_capture_drag_surface
     mov byte [r15 + md_term_dirty - kmain], 0   ; Avoid full-screen render stall on drag start!
+
+    ; Instantly blit focused window to screen on first touch!
+    mov eax, r8d
+    mov edx, r9d
+    call wm_drag_step
+
     jmp .mouse_ret
 
 .body_click:
@@ -782,44 +788,16 @@ wm_handle_mouse:
     mov edx, ecx
 @@:
 
-    ; Always store latest target window coordinates
-    mov [r15 + wm_x - kmain + rbx*4], eax
-    mov [r15 + wm_y - kmain + rbx*4], edx
-
     ; Check if window position actually changed compared to last blitted position!
     cmp eax, [r15 + wm_drag_prev_x - kmain]
-    jne .check_throttle
+    jne @f
     cmp edx, [r15 + wm_drag_prev_y - kmain]
     je .mouse_ret                     ; Position unchanged, return!
-
-.check_throttle:
-    ; Throttle dirty blits to 60+ FPS (10 ms interval)
-    mov eax, [r15 + timer_ticks - kmain]
-    sub eax, [r15 + wm_last_drag_tick - kmain]
-    cmp eax, 10
-    jb .throttle_cursor
-
-    mov eax, [r15 + timer_ticks - kmain]
-    mov [r15 + wm_last_drag_tick - kmain], eax
-
-    mov eax, [r15 + wm_x - kmain + rbx*4]
-    mov edx, [r15 + wm_y - kmain + rbx*4]
+@@:
+    ; Update coordinates and blit immediately with zero dropped frames
+    mov [r15 + wm_x - kmain + rbx*4], eax
+    mov [r15 + wm_y - kmain + rbx*4], edx
     call wm_drag_step
-    jmp .mouse_ret
-
-.throttle_cursor:
-    ; Fast 1-microsecond cursor update without heavy VRAM window blit
-    mov ecx, [r15 + md_mouse_prev_x - kmain]
-    mov edx, [r15 + md_mouse_prev_y - kmain]
-    call r2d_restore_cursor_lfb
-
-    mov eax, [r15 + md_mouse_x - kmain]
-    mov [r15 + md_mouse_prev_x - kmain], eax
-    mov edx, [r15 + md_mouse_y - kmain]
-    mov [r15 + md_mouse_prev_y - kmain], edx
-
-    mov ecx, eax
-    call r2d_draw_cursor_lfb
     jmp .mouse_ret
 
 .mouse_ret:

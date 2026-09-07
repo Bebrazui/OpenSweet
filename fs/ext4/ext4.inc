@@ -101,6 +101,8 @@ ext4_inode_load:
     push rdx
     push rsi
     push rdi
+    cmp dword [r15 + ext4_ipg - kmain], 0
+    je .err
     dec eax
     xor edx, edx
     div dword [r15 + ext4_ipg - kmain]      ; eax = group, edx = index
