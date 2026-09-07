@@ -3,7 +3,8 @@ param(
     [string]$KeysCsv = 'd i v ret',
     [int]$BootWaitSec = 3,
     [int]$SettleMS = 300,
-    [string]$MonitorPort = '4444'
+    [string]$MonitorPort = '4444',
+    [string]$ScreenDump = ''
 )
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot\..
@@ -30,7 +31,12 @@ try {
         $s.Write($b, 0, $b.Length)
         Start-Sleep -Milliseconds $SettleMS
     }
-    Start-Sleep -Seconds 2
+    Start-Sleep -Seconds 1
+    if ($ScreenDump) {
+        $b = [Text.Encoding]::ASCII.GetBytes("screendump $ScreenDump`n")
+        $s.Write($b, 0, $b.Length)
+        Start-Sleep -Milliseconds 800
+    }
     $b = [Text.Encoding]::ASCII.GetBytes("quit`n")
     $s.Write($b, 0, $b.Length)
     Start-Sleep -Seconds 1

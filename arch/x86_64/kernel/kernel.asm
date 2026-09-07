@@ -21,11 +21,11 @@ MEMMAP_COUNT = 0x6000
 MEMMAP_BASE  = 0x6100
 
 ; --- physical memory manager: bitmap of 4KB pages, covers first 256MB ---
-PMM_BITMAP   = 0x20000            ; 8KB bitmap, identity-mapped low RAM
+PMM_BITMAP   = 0x60000            ; 8KB bitmap, identity-mapped low RAM
 BITMAP_BITS  = 65536              ; 256MB / 4KB
 BITMAP_DWORDS = BITMAP_BITS / 32
 BITMAP_BYTES = BITMAP_BITS / 8
-RESERVE_PAGES = 0x23               ; low boot structures + kernel + bitmap
+RESERVE_PAGES = 0x100             ; first 1MB (BIOS, kernel image, page tables, stacks)
 
 ; --- VMM test target ---
 TEST_VIRT    = 0x6000000000
@@ -37,6 +37,8 @@ VBS_HEIGHT = 0x5014
 VBS_BPP    = 0x501A
 VBS_LFB    = 0x5028
 VBS_OK     = 0x50FE
+IN_OFF_MODE = 0
+IN_OFF_SIZE = 4
 
 org 0xFFFF800000010000
 use64
@@ -91,33 +93,10 @@ kmain:
     sti
     call apic_init
     call pmm_init
+    call kheap_init
+    call fb_console_init
     call ata_init
-    mov al,'D'
-    call putc
-    mov eax, dword [r15 + ata_sectors - kmain]
-    call puthex64
-    mov al, byte [r15 + ata_drv - kmain]
-    call putc
-    mov al, 10
-    call putc
     call ext4_mount
-    call putc
-    call puthex64
-    mov al, 10
-    call putc
-    mov al,'F'
-    call putc
-    mov al,'G'
-    call putc
-    mov al,'H'
-    call putc
-    mov al,'I'
-    call putc
-    mov al,'J'
-    call putc
-
-    mov rsi, banner
-    call puts
 
     ; --- CPU vendor via CPUID ---
     xor eax, eax
@@ -126,17 +105,50 @@ kmain:
     mov dword [r15 + vendor - kmain+4], edx
     mov dword [r15 + vendor - kmain+8], ecx
     mov byte [r15 + vendor - kmain+12], 0
-    mov rsi, cpu_msg
-    call puts
-    mov rsi, vendor
-    call puts
-    mov al, 10
-    call putc
 
-    mov rsi, prompt
+    call mouse_init
+    call modern_desktop_init
+
+    ; Initialize Preemptive Multitasking Scheduler
+    call sched_init
+
+    ; Spawn Background Clock Daemon (Task 1)
+    lea rsi, [r15 + str_name_clock - kmain]
+    lea rdx, [r15 + task_clock_daemon - kmain]
+    call task_create
+
+    ; Spawn Background System Monitor Daemon (Task 2)
+    lea rsi, [r15 + str_name_sysmon - kmain]
+    lea rdx, [r15 + task_sysmon_daemon - kmain]
+    call task_create
+
+    ; Welcome Banner
+    mov eax, FB_CLR_HEADER
+    call fb_console_set_color
+    lea rsi, [r15 + str_os_title - kmain]
     call puts
+
+    mov eax, FB_CLR_LABEL
+    call fb_console_set_color
+    lea rsi, [r15 + str_os_subtitle - kmain]
+    call puts
+
+    mov eax, FB_CLR_SUCCESS
+    call fb_console_set_color
+    lea rsi, [r15 + str_os_ready - kmain]
+    call puts
+
+    mov eax, FB_CLR_DEFAULT
+    call fb_console_set_color
+    jmp .prompt
 
 .shell:
+    call md_handle_mouse
+    cmp byte [r15 + md_term_dirty - kmain], 0
+    je .no_render
+    mov byte [r15 + md_term_dirty - kmain], 0
+    call modern_desktop_render
+.no_render:
     call getc
     test al, al
     jnz .key
@@ -148,7 +160,7 @@ kmain:
     cmp al, 8
     je .bs
     movzx ecx, byte [r15 + cmd_len - kmain]
-    cmp ecx, 63
+    cmp ecx, 127
     jae .echo
     mov byte [r15 + cmd_buf - kmain + rcx], al
     inc byte [r15 + cmd_len - kmain]
@@ -172,48 +184,685 @@ kmain:
     mov byte [r15 + cmd_len - kmain], 0
 
     ; --- dispatch command ---
+    cmp byte [r15 + cmd_buf - kmain], 0
+    je .prompt
+
+    ; help
     mov rsi, cmd_buf
-    mov rdi, cmd_exc
+    lea rdi, [r15 + cmd_help - kmain]
     call streq
     test al, al
-    jnz .do_exc
+    jnz .do_help
+
+    ; clear / cls
     mov rsi, cmd_buf
-    mov rdi, cmd_div
+    lea rdi, [r15 + cmd_clear - kmain]
     call streq
     test al, al
-    jnz .do_div
+    jnz .do_clear
     mov rsi, cmd_buf
-    mov rdi, cmd_ticks
+    lea rdi, [r15 + cmd_cls - kmain]
     call streq
     test al, al
-    jnz .do_ticks
+    jnz .do_clear
+
+    ; pwd
     mov rsi, cmd_buf
-    mov rdi, cmd_mem
+    lea rdi, [r15 + cmd_pwd - kmain]
+    call streq
+    test al, al
+    jnz .do_pwd
+
+    ; mem
+    mov rsi, cmd_buf
+    lea rdi, [r15 + cmd_mem - kmain]
     call streq
     test al, al
     jnz .do_mem
+
+    ; cpu
     mov rsi, cmd_buf
-    mov rdi, cmd_map
+    lea rdi, [r15 + cmd_cpu - kmain]
     call streq
     test al, al
-    jnz .do_map
+    jnz .do_cpu
+
+    ; pci
     mov rsi, cmd_buf
-    mov rdi, cmd_ata
+    lea rdi, [r15 + cmd_pci - kmain]
+    call streq
+    test al, al
+    jnz .do_pci
+
+    ; uptime / ticks
+    mov rsi, cmd_buf
+    lea rdi, [r15 + cmd_uptime - kmain]
+    call streq
+    test al, al
+    jnz .do_uptime
+    mov rsi, cmd_buf
+    lea rdi, [r15 + cmd_ticks - kmain]
+    call streq
+    test al, al
+    jnz .do_uptime
+
+    ; vbe
+    mov rsi, cmd_buf
+    lea rdi, [r15 + cmd_vbe - kmain]
+    call streq
+    test al, al
+    jnz .do_vbe
+
+    ; reboot
+    mov rsi, cmd_buf
+    lea rdi, [r15 + cmd_reboot - kmain]
+    call streq
+    test al, al
+    jnz .do_reboot
+
+    ; poweroff / exit
+    mov rsi, cmd_buf
+    lea rdi, [r15 + cmd_poweroff - kmain]
+    call streq
+    test al, al
+    jnz .do_poweroff
+    mov rsi, cmd_buf
+    lea rdi, [r15 + cmd_exit - kmain]
+    call streq
+    test al, al
+    jnz .do_poweroff
+
+    ; ata
+    mov rsi, cmd_buf
+    lea rdi, [r15 + cmd_ata - kmain]
     call streq
     test al, al
     jnz .do_ata
-    mov rdi, cmd_ls
+
+    ; map
+    mov rsi, cmd_buf
+    lea rdi, [r15 + cmd_map - kmain]
+    call streq
+    test al, al
+    jnz .do_map
+
+    ; exc
+    mov rsi, cmd_buf
+    lea rdi, [r15 + cmd_exc - kmain]
+    call streq
+    test al, al
+    jnz .do_exc
+
+    ; div
+    mov rsi, cmd_buf
+    lea rdi, [r15 + cmd_div - kmain]
+    call streq
+    test al, al
+    jnz .do_div
+
+    ; ls: check if "ls" exact or starts with "ls "
+    mov rsi, cmd_buf
+    lea rdi, [r15 + cmd_ls - kmain]
     call streq
     test al, al
     jnz .do_ls
-    ; prefix command "cat <path>"
+    mov rsi, cmd_buf
+    lea rdi, [r15 + str_lssp - kmain]
+    mov ecx, 3
+    call strpref
+    test al, al
+    jnz .do_ls
+
+    ; cd: check if "cd" exact or starts with "cd "
+    mov rsi, cmd_buf
+    lea rdi, [r15 + cmd_cd - kmain]
+    call streq
+    test al, al
+    jnz .do_cd
+    mov rsi, cmd_buf
+    lea rdi, [r15 + str_cdsp - kmain]
+    mov ecx, 3
+    call strpref
+    test al, al
+    jnz .do_cd
+
+    ; cat: starts with "cat "
     mov rsi, cmd_buf
     lea rdi, [r15 + str_catsp - kmain]
     mov ecx, 4
     call strpref
     test al, al
     jnz .do_cat
+
+    ; stat: starts with "stat "
+    mov rsi, cmd_buf
+    lea rdi, [r15 + str_statsp - kmain]
+    mov ecx, 5
+    call strpref
+    test al, al
+    jnz .do_stat
+
+    ; wallpaper: "wallpaper" or "wallpaper <path>"
+    mov rsi, cmd_buf
+    lea rdi, [r15 + cmd_wallpaper - kmain]
+    call streq
+    test al, al
+    jnz .do_wallpaper_default
+    mov rsi, cmd_buf
+    lea rdi, [r15 + str_wallpapersp - kmain]
+    mov ecx, 10
+    call strpref
+    test al, al
+    jnz .do_wallpaper_arg
+
+    ; tasks / ps
+    mov rsi, cmd_buf
+    lea rdi, [r15 + cmd_tasks - kmain]
+    call streq
+    test al, al
+    jnz .do_tasks
+    mov rsi, cmd_buf
+    lea rdi, [r15 + cmd_ps - kmain]
+    call streq
+    test al, al
+    jnz .do_tasks
+
+    ; heap
+    mov rsi, cmd_buf
+    lea rdi, [r15 + cmd_heap - kmain]
+    call streq
+    test al, al
+    jnz .do_heap
+
+    ; heaptest
+    mov rsi, cmd_buf
+    lea rdi, [r15 + cmd_heaptest - kmain]
+    call streq
+    test al, al
+    jnz .do_heaptest
+
+    ; Unknown command
+    mov eax, FB_CLR_ERROR
+    call fb_console_set_color
+    lea rsi, [r15 + str_cmd_notfound1 - kmain]
+    call puts
+    lea rsi, [r15 + cmd_buf - kmain]
+    call puts
+    lea rsi, [r15 + str_cmd_notfound2 - kmain]
+    call puts
+    mov eax, FB_CLR_DEFAULT
+    call fb_console_set_color
     jmp .prompt
+
+.do_heaptest:
+    call kheap_selftest
+    jmp .prompt
+
+.do_heap:
+    call kheap_print
+    jmp .prompt
+
+.do_tasks:
+    call sched_print_tasks
+    jmp .prompt
+
+.do_help:
+    mov eax, FB_CLR_HEADER
+    call fb_console_set_color
+    lea rsi, [r15 + str_help_hdr - kmain]
+    call puts
+    mov eax, FB_CLR_DEFAULT
+    call fb_console_set_color
+    lea rsi, [r15 + str_help_body - kmain]
+    call puts
+    jmp .prompt
+
+.do_clear:
+    call fb_console_clear
+    jmp .prompt
+
+.do_pwd:
+    call ext4_pwd
+    jmp .prompt
+
+.do_cd:
+    cmp byte [r15 + ext4_ok - kmain], 0
+    je .fs_err
+    lea rsi, [r15 + cmd_buf - kmain + 2]
+    call ext4_cd
+    jmp .prompt
+
+.do_ls:
+    cmp byte [r15 + ext4_ok - kmain], 0
+    je .fs_err
+    lea rsi, [r15 + cmd_buf - kmain + 2]
+.ls_sp:
+    cmp byte [rsi], ' '
+    jne .ls_sp_done
+    inc rsi
+    jmp .ls_sp
+.ls_sp_done:
+    cmp byte [rsi], 0
+    je .ls_cwd
+    call ext4_lookup
+    test eax, eax
+    jz .fs_err
+    call ext4_inode_load
+    jc .fs_err
+    call ext4_ls_print
+    jmp .prompt
+.ls_cwd:
+    mov eax, [r15 + ext4_cwd_inode - kmain]
+    call ext4_inode_load
+    jc .fs_err
+    call ext4_ls_print
+    jmp .prompt
+
+.do_cat:
+    cmp byte [r15 + ext4_ok - kmain], 0
+    je .fs_err
+    lea rsi, [r15 + cmd_buf - kmain + 3]
+.cat_sp:
+    cmp byte [rsi], ' '
+    jne .cat_sp_done
+    inc rsi
+    jmp .cat_sp
+.cat_sp_done:
+    cmp byte [rsi], 0
+    je .cat_usage
+
+    call ext4_lookup
+    test eax, eax
+    jz .fs_err
+    call ext4_inode_load
+    jc .fs_err
+    movzx edx, word [r15 + ext4_inode - kmain + IN_OFF_MODE]
+    and edx, 0xF000
+    cmp edx, 0x4000
+    je .cat_isdir
+
+    call ext4_cat_print
+    mov al, 10
+    call putc
+    jmp .prompt
+
+.cat_usage:
+    mov eax, FB_CLR_LABEL
+    call fb_console_set_color
+    lea rsi, [r15 + str_cat_usage - kmain]
+    call puts
+    mov eax, FB_CLR_DEFAULT
+    call fb_console_set_color
+    jmp .prompt
+
+.cat_isdir:
+    mov eax, FB_CLR_ERROR
+    call fb_console_set_color
+    lea rsi, [r15 + str_cat_isdir - kmain]
+    call puts
+    mov eax, FB_CLR_DEFAULT
+    call fb_console_set_color
+    jmp .prompt
+
+.do_stat:
+    cmp byte [r15 + ext4_ok - kmain], 0
+    je .fs_err
+    lea rsi, [r15 + cmd_buf - kmain + 4]
+    call ext4_stat_print
+    jmp .prompt
+
+.do_wallpaper_default:
+    cmp byte [r15 + ext4_ok - kmain], 0
+    je .fs_err
+    lea rsi, [r15 + str_default_wallpaper - kmain]
+    jmp .do_load_wall
+
+.do_wallpaper_arg:
+    cmp byte [r15 + ext4_ok - kmain], 0
+    je .fs_err
+    lea rsi, [r15 + cmd_buf - kmain + 10]
+.skip_wall_sp:
+    cmp byte [rsi], ' '
+    jne .do_load_wall
+    inc rsi
+    jmp .skip_wall_sp
+
+.do_load_wall:
+    call png_load_wallpaper_from_ext4
+    jnc .wall_cmd_ok
+    mov eax, FB_CLR_ERROR
+    call fb_console_set_color
+    lea rsi, [r15 + str_wall_err - kmain]
+    call puts
+    mov eax, FB_CLR_DEFAULT
+    call fb_console_set_color
+    jmp .prompt
+
+.wall_cmd_ok:
+    mov eax, FB_CLR_SUCCESS
+    call fb_console_set_color
+    lea rsi, [r15 + str_wall_ok - kmain]
+    call puts
+    mov eax, FB_CLR_DEFAULT
+    call fb_console_set_color
+    call modern_desktop_render
+    jmp .prompt
+
+.do_mem:
+    mov eax, FB_CLR_HEADER
+    call fb_console_set_color
+    lea rsi, [r15 + str_mem_hdr - kmain]
+    call puts
+
+    call count_free                   ; r8d = free pages count
+    mov r9d, 65536
+    sub r9d, r8d                      ; r9d = used pages count
+
+    mov eax, FB_CLR_LABEL
+    call fb_console_set_color
+    lea rsi, [r15 + str_mem_total - kmain]
+    call puts
+
+    mov eax, FB_CLR_LABEL
+    call fb_console_set_color
+    lea rsi, [r15 + str_mem_used - kmain]
+    call puts
+    mov eax, FB_CLR_NUMBER
+    call fb_console_set_color
+    mov eax, r9d
+    call putdec64
+    lea rsi, [r15 + str_mem_pages - kmain]
+    call puts
+
+    mov eax, FB_CLR_LABEL
+    call fb_console_set_color
+    lea rsi, [r15 + str_mem_free - kmain]
+    call puts
+    mov eax, FB_CLR_SUCCESS
+    call fb_console_set_color
+    mov eax, r8d
+    call putdec64
+    lea rsi, [r15 + str_mem_pages - kmain]
+    call puts
+
+    mov eax, FB_CLR_LABEL
+    call fb_console_set_color
+    lea rsi, [r15 + str_mem_pgsz - kmain]
+    call puts
+
+    mov eax, FB_CLR_DEFAULT
+    call fb_console_set_color
+    jmp .prompt
+
+.do_cpu:
+    mov eax, FB_CLR_HEADER
+    call fb_console_set_color
+    lea rsi, [r15 + str_cpu_hdr - kmain]
+    call puts
+
+    mov eax, FB_CLR_LABEL
+    call fb_console_set_color
+    lea rsi, [r15 + str_cpu_lbl_vendor - kmain]
+    call puts
+    mov eax, FB_CLR_FILE
+    call fb_console_set_color
+    lea rsi, [r15 + vendor - kmain]
+    call puts
+    mov al, 10
+    call putc
+
+    ; Processor Brand String (CPUID 0x80000002..0x80000004)
+    mov eax, 0x80000000
+    cpuid
+    cmp eax, 0x80000004
+    jb .no_brand
+
+    lea rdi, [r15 + cpu_brand_str - kmain]
+    mov eax, 0x80000002
+    cpuid
+    mov [rdi + 0], eax
+    mov [rdi + 4], ebx
+    mov [rdi + 8], ecx
+    mov [rdi + 12], edx
+    mov eax, 0x80000003
+    cpuid
+    mov [rdi + 16], eax
+    mov [rdi + 20], ebx
+    mov [rdi + 24], ecx
+    mov [rdi + 28], edx
+    mov eax, 0x80000004
+    cpuid
+    mov [rdi + 32], eax
+    mov [rdi + 36], ebx
+    mov [rdi + 40], ecx
+    mov [rdi + 44], edx
+    mov byte [rdi + 48], 0
+
+    mov eax, FB_CLR_LABEL
+    call fb_console_set_color
+    lea rsi, [r15 + str_cpu_lbl_model - kmain]
+    call puts
+    mov eax, FB_CLR_FILE
+    call fb_console_set_color
+    lea rsi, [r15 + cpu_brand_str - kmain]
+    call puts
+    mov al, 10
+    call putc
+
+.no_brand:
+    mov eax, 1
+    cpuid
+    mov r8d, edx
+    mov r9d, ecx
+
+    mov eax, FB_CLR_LABEL
+    call fb_console_set_color
+    lea rsi, [r15 + str_cpu_lbl_feat - kmain]
+    call puts
+    mov eax, FB_CLR_SUCCESS
+    call fb_console_set_color
+
+    test r8d, 1 shl 9
+    jz @f
+    lea rsi, [r15 + str_feat_apic - kmain]
+    call puts
+@@: test r8d, 1 shl 4
+    jz @f
+    lea rsi, [r15 + str_feat_tsc - kmain]
+    call puts
+@@: test r8d, 1 shl 5
+    jz @f
+    lea rsi, [r15 + str_feat_msr - kmain]
+    call puts
+@@: test r8d, 1 shl 25
+    jz @f
+    lea rsi, [r15 + str_feat_sse - kmain]
+    call puts
+@@: test r8d, 1 shl 26
+    jz @f
+    lea rsi, [r15 + str_feat_sse2 - kmain]
+    call puts
+@@: test r9d, 1 shl 0
+    jz @f
+    lea rsi, [r15 + str_feat_sse3 - kmain]
+    call puts
+@@: test r9d, 1 shl 28
+    jz @f
+    lea rsi, [r15 + str_feat_avx - kmain]
+    call puts
+@@: mov al, 10
+    call putc
+
+    mov eax, FB_CLR_DEFAULT
+    call fb_console_set_color
+    jmp .prompt
+
+.do_pci:
+    mov eax, FB_CLR_HEADER
+    call fb_console_set_color
+    lea rsi, [r15 + str_pci_hdr - kmain]
+    call puts
+
+    xor r8d, r8d                      ; dev 0..31
+.pci_dev_loop:
+    xor r9d, r9d                      ; func 0..7
+.pci_func_loop:
+    mov eax, 0x80000000
+    mov ecx, r8d
+    shl ecx, 11
+    or eax, ecx
+    mov ecx, r9d
+    shl ecx, 8
+    or eax, ecx
+
+    mov dx, 0xCF8
+    out dx, eax
+    mov dx, 0xCFC
+    in eax, dx
+
+    cmp ax, 0xFFFF
+    je .pci_next_func
+
+    mov r10d, eax
+
+    ; Read Class Code (reg 2, offset 8)
+    mov eax, 0x80000000
+    mov ecx, r8d
+    shl ecx, 11
+    or eax, ecx
+    mov ecx, r9d
+    shl ecx, 8
+    or eax, ecx
+    or eax, 0x08
+    mov dx, 0xCF8
+    out dx, eax
+    mov dx, 0xCFC
+    in eax, dx
+    shr eax, 16
+    mov r11d, eax
+
+    mov eax, FB_CLR_DIR
+    call fb_console_set_color
+    lea rsi, [r15 + str_pci_prefix - kmain]
+    call puts
+
+    mov eax, FB_CLR_FILE
+    call fb_console_set_color
+    mov al, r8b
+    call puthex8
+    mov al, '.'
+    call putc
+    mov al, r9b
+    add al, '0'
+    call putc
+
+    lea rsi, [r15 + str_pci_vend - kmain]
+    call puts
+    mov eax, r10d
+    call puthex16
+
+    lea rsi, [r15 + str_pci_dev - kmain]
+    call puts
+    mov eax, r10d
+    shr eax, 16
+    call puthex16
+
+    lea rsi, [r15 + str_pci_cls - kmain]
+    call puts
+    mov eax, r11d
+    shr eax, 8
+    and eax, 0xFF
+    call puthex8
+
+    cmp al, 0x06
+    je .cls_bridge
+    cmp al, 0x03
+    je .cls_vga
+    cmp al, 0x01
+    je .cls_storage
+    cmp al, 0x02
+    je .cls_net
+    jmp .cls_done
+
+.cls_bridge:
+    mov eax, FB_CLR_MUTED
+    call fb_console_set_color
+    lea rsi, [r15 + str_cls_bridge - kmain]
+    call puts
+    jmp .cls_done
+.cls_vga:
+    mov eax, FB_CLR_SUCCESS
+    call fb_console_set_color
+    lea rsi, [r15 + str_cls_vga - kmain]
+    call puts
+    jmp .cls_done
+.cls_storage:
+    mov eax, FB_CLR_SIZE
+    call fb_console_set_color
+    lea rsi, [r15 + str_cls_storage - kmain]
+    call puts
+    jmp .cls_done
+.cls_net:
+    mov eax, FB_CLR_DIR
+    call fb_console_set_color
+    lea rsi, [r15 + str_cls_net - kmain]
+    call puts
+
+.cls_done:
+    mov al, 10
+    call putc
+
+.pci_next_func:
+    inc r9d
+    cmp r9d, 8
+    jb .pci_func_loop
+
+    inc r8d
+    cmp r8d, 32
+    jb .pci_dev_loop
+
+    mov eax, FB_CLR_DEFAULT
+    call fb_console_set_color
+    jmp .prompt
+
+.do_uptime:
+    mov eax, FB_CLR_LABEL
+    call fb_console_set_color
+    lea rsi, [r15 + str_uptime_lbl - kmain]
+    call puts
+    mov eax, FB_CLR_NUMBER
+    call fb_console_set_color
+    mov eax, [r15 + timer_ticks - kmain]
+    call putdec64
+    lea rsi, [r15 + str_uptime_ticks - kmain]
+    call puts
+    mov eax, FB_CLR_DEFAULT
+    call fb_console_set_color
+    jmp .prompt
+
+.do_reboot:
+    mov eax, FB_CLR_SIZE
+    call fb_console_set_color
+    lea rsi, [r15 + str_reboot_msg - kmain]
+    call puts
+    mov al, 0xFE
+    out 0x64, al
+    hlt
+    jmp .prompt
+
+.do_poweroff:
+    mov eax, FB_CLR_SIZE
+    call fb_console_set_color
+    lea rsi, [r15 + str_poweroff_msg - kmain]
+    call puts
+    mov ax, 0x2000
+    mov dx, 0x604
+    out dx, ax
+    mov dx, 0xB004
+    out dx, ax
+    hlt
+    jmp .prompt
+
 .do_exc:
     db 0xCC                   ; int3 -> #BP (vector 3)
 .do_div:
@@ -221,45 +870,8 @@ kmain:
     xor edx, edx
     div ecx                   ; -> #DE (vector 0)
 .do_ticks:
-    mov rsi, ticks_msg
-    call puts
-    mov eax, [r15 + timer_ticks - kmain]
-    call puthex64
-    mov al, 10
-    call putc
-    jmp .prompt
-.do_mem:
-    call count_free           ; r8d = free pages
-    mov rsi, msg_freepages
-    call puts
-    mov eax, r8d
-    call puthex64
-    mov al, 10
-    call putc
-    ; alloc -> free -> alloc must return same page
-    call pmm_alloc
-    mov r8, rax
-    mov rdi, rax
-    call pmm_free
-    call pmm_alloc
-    mov r9, rax
-    mov rsi, msg_a
-    call puts
-    mov rax, r8
-    call puthex64
-    mov rsi, msg_b
-    call puts
-    mov rax, r9
-    call puthex64
-    cmp r8, r9
-    je .mem_eq
-    mov rsi, msg_ne
-    jmp .mem_prn
-.mem_eq:
-    mov rsi, msg_eq
-.mem_prn:
-    call puts
-    jmp .prompt
+    jmp .do_uptime
+
 .do_map:
     call pmm_alloc_zero       ; phys page (zeroed)
     test rax, rax
@@ -287,15 +899,14 @@ kmain:
     mov rsi, msg_oom
     call puts
     jmp .prompt
+
 .do_ata:
-    ; sectors count of data drive
     mov rsi, msg_atasec
     call puts
     mov eax, dword [r15 + ata_sectors - kmain]
     call puthex64
     mov al, 10
     call putc
-    ; read sector 0 into ata_buf and dump first 16 bytes
     lea rdi, [r15 + ata_buf - kmain]
     xor eax, eax             ; LBA 0
     mov ecx, 1
@@ -326,49 +937,60 @@ kmain:
     mov rsi, msg_ataerr
     call puts
     jmp .prompt
-.do_ls:
-    cmp byte [r15 + ext4_ok - kmain], 0
-    je .fs_err
-    mov eax, 2                    ; root inode
-    call ext4_inode_load
-    jc .fs_err
-    mov al, 10
-    call putc
-    jmp .prompt
-.do_cat:
-    cmp byte [r15 + ext4_ok - kmain], 0
-    je .fs_err
-    lea rsi, [r15 + cmd_buf - kmain]
-    add rsi, 4                    ; skip "cat "
-    lea rdi, [r15 + e4t_path - kmain]
-    mov byte [rdi], '/'
-    inc rdi
-.cat_cp:
-    lodsb
-    test al, al
-    jz .cat_cpd
-    stosb
-    jmp .cat_cp
-.cat_cpd:
-    mov byte [rdi], 0
-    lea rsi, [r15 + e4t_path - kmain]
-    call ext4_lookup
-    test eax, eax
-    jz .fs_err
-    call ext4_inode_load
-    jc .fs_err
-    call ext4_cat_print
-    mov al, 10
-    call putc
-    jmp .prompt
+
 .fs_err:
-    mov rsi, msg_fserr
+    mov eax, FB_CLR_ERROR
+    call fb_console_set_color
+    lea rsi, [r15 + msg_fserr - kmain]
     call puts
+    mov eax, FB_CLR_DEFAULT
+    call fb_console_set_color
+    jmp .prompt
+
+.do_vbe:
+    mov eax, FB_CLR_LABEL
+    call fb_console_set_color
+    lea rsi, [r15 + str_vbe_hdr - kmain]
+    call puts
+    mov eax, FB_CLR_NUMBER
+    call fb_console_set_color
+    movzx eax, word [r14 + VBS_WIDTH]
+    call putdec64
+    mov al, 'x'
+    call putc
+    movzx eax, word [r14 + VBS_HEIGHT]
+    call putdec64
+    lea rsi, [r15 + str_vbe_at - kmain]
+    call puts
+    movzx eax, byte [r14 + VBS_BPP]
+    call putdec64
+    lea rsi, [r15 + str_vbe_bpp - kmain]
+    call puts
+    movzx eax, word [r14 + VBS_PITCH]
+    call putdec64
+    lea rsi, [r15 + str_vbe_lfb - kmain]
+    call puts
+    mov eax, dword [r14 + VBS_LFB]
+    call puthex32
+    mov al, 10
+    call putc
+    mov eax, FB_CLR_DEFAULT
+    call fb_console_set_color
     jmp .prompt
 
 .prompt:
-    mov rsi, prompt
+    mov byte [r15 + cmd_len - kmain], 0
+    mov eax, FB_CLR_PROMPT
+    call fb_console_set_color
+    lea rsi, [r15 + prompt_user - kmain]
     call puts
+    lea rsi, [r15 + ext4_cwd_path - kmain]
+    call puts
+    lea rsi, [r15 + prompt_sym - kmain]
+    call puts
+    mov eax, FB_CLR_DEFAULT
+    call fb_console_set_color
+    call modern_desktop_render
     jmp .shell
 
 ; --- read next ASCII from keyboard ring buffer; AL=0 if empty ---
@@ -437,89 +1059,31 @@ puts:
 .done:
     ret
 
-; --- print char AL to serial + VGA ---
+; --- print char AL to serial + Framebuffer Console ---
 putc:
     push rax
-    push rcx
+    push rbx
     push rdx
-    push rdi
-    push rsi
 
-    ; serial
-    mov rsi, rax
-.wait:
+    mov bl, al                        ; bl holds character safely
+
+    ; 1. Serial COM1
+.wait_com1:
     mov dx, COM1+5
-    in  al, dx
+    in al, dx
     test al, 0x20
-    jz  .wait
+    jz .wait_com1
     mov dx, COM1
-    mov al, sil
+    mov al, bl
     out dx, al
-    mov rax, rsi
 
-    ; VGA
-    cmp al, 10
-    je  .nl
-    cmp al, 13
-    je  .out
-    cmp al, 8
-    je  .bs
-    movzx edx, word [r15 + cur - kmain]
-    mov rdi, VGA_BASE
-    lea rdi, [rdi + rdx*2]
-    mov [rdi], al
-    mov byte [rdi+1], 0x07
-    inc word [r15 + cur - kmain]
-    cmp word [r15 + cur - kmain], COLS*ROWS
-    jb  .out
-    call scroll
-    jmp .out
-.nl:
-    movzx eax, word [r15 + cur - kmain]
-    xor edx, edx
-    mov ecx, COLS
-    div rcx                   ; rax=row, rdx=col
-    sub rax, rdx
-    add rax, COLS             ; next row start
-    cmp rax, COLS*ROWS
-    jb  .set_cur
-    call scroll
-    mov rax, COLS*(ROWS-1)
-.set_cur:
-    mov [r15 + cur - kmain], ax
-    jmp .out
-.bs:
-    cmp word [r15 + cur - kmain], 0
-    je  .out
-    dec word [r15 + cur - kmain]
-    movzx edx, word [r15 + cur - kmain]
-    mov rdi, VGA_BASE
-    lea rdi, [rdi + rdx*2]
-    mov word [rdi], 0x0720
-.out:
-    pop rsi
-    pop rdi
+    ; 2. Modern Terminal buffer
+    mov al, bl
+    call md_term_putc
+
     pop rdx
-    pop rcx
+    pop rbx
     pop rax
-    ret
-
-scroll:
-    push rsi
-    push rdi
-    push rcx
-    push rax
-    mov rsi, VGA_BASE + COLS*2
-    mov rdi, VGA_BASE
-    mov ecx, (ROWS-1)*COLS
-    rep movsw
-    mov ecx, COLS
-    mov ax, 0x0720
-    rep stosw
-    pop rax
-    pop rcx
-    pop rdi
-    pop rsi
     ret
 
 ; --- IDT: vectors 0..31 -> exception stubs, halt-loop on fault ---
@@ -600,6 +1164,18 @@ init_idt:
     mov word [rdi+2], 0x18
     mov byte [rdi+5], 0x8E
 
+    ; entry 49 (0x31) = voluntary yield software interrupt (int 0x31)
+    lea rax, [r15 + isr_yield - kmain]
+    mov rdi, 49*16
+    add rdi, r11
+    mov [rdi], ax
+    shr rax, 16
+    mov word [rdi+6], ax
+    shr rax, 16
+    mov [rdi+8], eax
+    mov word [rdi+2], 0x18
+    mov byte [rdi+5], 0x8E
+
     lidt tword [r15 + idtr - kmain]
     ret
 
@@ -619,9 +1195,9 @@ pic_init:
     mov al, 0x01              ; ICW4: 8086 mode
     out 0x21, al
     out 0xA1, al
-    mov al, 0xFC              ; mask all but timer+kbd
+    mov al, 0xF8              ; unmask IRQ0 (timer), IRQ1 (kbd), IRQ2 (cascade)
     out 0x21, al
-    mov al, 0xFF
+    mov al, 0xEF              ; unmask IRQ12 (mouse on slave PIC line 4)
     out 0xA1, al
     ret
 
@@ -637,51 +1213,53 @@ pit_init:
 
 ; --- hardware IRQ common: EOI by source + dispatch ---
 common_irq:
-    ; full context save: we run on an arbitrary interrupted thread
-    push rax
+    ; Unified 15-GPR context save matching isr_yield and task_create
+    xchg [rsp], rax           ; swap vector with rax: [rsp] = rax, rax = vector
+    push rbx
     push rcx
     push rdx
-    push rbx
     push rsi
     push rdi
+    push rbp
     push r8
     push r9
     push r10
-    push r11                  ; vector now at [rsp + 10*8]
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15                  ; all 15 GPRs now on stack
+    mov r12, rax              ; save vector in r12
 
     ; always ack BOTH controllers - covers PIC, LAPIC-EXTINT and LAPIC paths
     mov al, 0x20
     out 0x20, al
+    out 0xA0, al
     mov ecx, LAPIC_EOI
     xor eax, eax
     mov dword [ecx], eax
 
-    mov rax, [rsp+80]
-    cmp rax, TIMER_VEC
+    cmp r12, TIMER_VEC
     je .timer
-    cmp rax, 32               ; legacy PIT IRQ0 (pre-switch)
+    cmp r12, 32               ; legacy PIT IRQ0 (pre-switch)
     je .timer
-    cmp rax, 33               ; IRQ1 keyboard
+    cmp r12, 33               ; IRQ1 keyboard
     je .kbd
-    jmp .ret
+    cmp r12, 44               ; IRQ12 mouse (32 + 12 = 44)
+    je .mouse
+    jmp sched_restore
+
 .timer:
     inc dword [r15 + timer_ticks - kmain]
-    jmp .ret
+    jmp sched_tick
+
 .kbd:
     call kb_irq
-.ret:
-    pop r11
-    pop r10
-    pop r9
-    pop r8
-    pop rdi
-    pop rsi
-    pop rbx
-    pop rdx
-    pop rcx
-    pop rax
-    add rsp, 8                ; drop pushed vector -> rsp points at RIP
-    iretq
+    jmp sched_restore
+
+.mouse:
+    call mouse_irq
+    jmp sched_restore
 
 irq_spur:
     push 47                   ; dummy vector -> unknown path, just EOI
@@ -801,6 +1379,16 @@ pmm_init:
     and eax, 31
     bts dword [r14 + PMM_BITMAP + r8*4], eax
     loop .setr
+
+    ; re-reserve GUI/wallpaper pages [0x2000, 0x4600) (38MB @ 0x02000000)
+    mov ecx, 9728
+.set_bb:
+    lea eax, [ecx + 0x1FFF]
+    mov r8, rax
+    shr r8, 5
+    and eax, 31
+    bts dword [r14 + PMM_BITMAP + r8*4], eax
+    loop .set_bb
     ret
 
 ; RAX = phys addr of free page (0 = OOM)
@@ -846,6 +1434,125 @@ pmm_free:
     shr ecx, 5
     and edi, 31
     btr dword [r14 + PMM_BITMAP + rcx*4], edi
+    ret
+
+; RDI = number of contiguous pages needed
+; Returns: RAX = phys addr of first page (or 0 on OOM)
+pmm_alloc_contiguous:
+    push rbx
+    push rcx
+    push rdx
+    push r8
+    push r9
+    push r10
+
+    mov r8d, edi                      ; r8d = pages needed
+    test r8d, r8d
+    jz .fail
+
+    mov ebx, RESERVE_PAGES            ; start after reserved pages
+.search_start:
+    cmp ebx, BITMAP_BITS
+    jae .fail
+
+    ; Check bit ebx
+    mov eax, ebx
+    shr eax, 5                        ; dword idx
+    mov edx, ebx
+    and edx, 31                       ; bit idx
+    bt dword [r14 + PMM_BITMAP + rax*4], edx
+    jc .next_start                    ; 1 = used
+
+    ; Bit ebx is free! Check if next r8d-1 bits are also free
+    mov ecx, 1
+.check_span:
+    cmp ecx, r8d
+    jae .found_span
+
+    lea eax, [ebx + ecx]
+    cmp eax, BITMAP_BITS
+    jae .fail
+
+    mov r9, rax
+    shr r9, 5
+    and eax, 31
+    bt dword [r14 + PMM_BITMAP + r9*4], eax
+    jc .span_broken
+    inc ecx
+    jmp .check_span
+
+.span_broken:
+    lea ebx, [ebx + ecx + 1]
+    jmp .search_start
+
+.next_start:
+    inc ebx
+    jmp .search_start
+
+.found_span:
+    ; Mark all r8d bits as used
+    xor ecx, ecx
+.mark_span:
+    lea eax, [ebx + ecx]
+    mov r9, rax
+    shr r9, 5
+    and eax, 31
+    bts dword [r14 + PMM_BITMAP + r9*4], eax
+    inc ecx
+    cmp ecx, r8d
+    jb .mark_span
+
+    ; Zero all allocated pages
+    mov rax, rbx
+    shl rax, 12                       ; phys address
+    push rax
+    mov rdi, rax
+    mov ecx, r8d
+    shl ecx, 12 - 3                   ; r8d * 4096 / 8 = r8d * 512 qwords
+    xor eax, eax
+    rep stosq
+    pop rax
+    jmp .done
+
+.fail:
+    xor eax, eax
+
+.done:
+    pop r10
+    pop r9
+    pop r8
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; RDI = phys addr, RSI = count
+pmm_free_contiguous:
+    push rax
+    push rbx
+    push rcx
+    push rdi
+    push rsi
+
+    shr rdi, 12                       ; page index
+    xor ecx, ecx
+.free_loop:
+    cmp ecx, esi
+    jae .free_done
+    lea eax, [edi + ecx]
+    mov rbx, rax
+    shr rbx, 5
+    and eax, 31
+    btr dword [r14 + PMM_BITMAP + rbx*4], eax
+    inc ecx
+    jmp .free_loop
+
+.free_done:
+    pop rsi
+    pop rdi
+    pop rcx
+    pop rbx
+    pop rax
     ret
 
 ; count free pages -> R8D
@@ -967,7 +1674,19 @@ common_ex:
     call putc                 ; low digit
     mov rsi, at_msg
     call puts
-    mov rax, [rsp+8]          ; RIP from trap frame
+    mov rax, [rsp+8]          ; RIP from trap frame (was [rsp+16])
+    call puthex64
+    mov al, ' '
+    call putc
+    mov al, 'C'
+    call putc
+    mov al, 'R'
+    call putc
+    mov al, '2'
+    call putc
+    mov al, '='
+    call putc
+    mov rax, cr2
     call puthex64
     mov al, 10
     call putc
@@ -1033,6 +1752,91 @@ puthex64:
     pop rax
     ret
 
+; --- print RAX in decimal ---
+putdec64:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+
+    test rax, rax
+    jnz .non_zero
+    mov al, '0'
+    call putc
+    jmp .dec_done
+
+.non_zero:
+    xor ecx, ecx                      ; digit count
+    mov rbx, 10
+.div_loop:
+    xor edx, edx
+    div rbx                           ; rax = rax / 10, rdx = remainder
+    push rdx                          ; push remainder
+    inc ecx
+    test rax, rax
+    jnz .div_loop
+
+.print_loop:
+    pop rax
+    add al, '0'
+    call putc
+    dec ecx
+    jnz .print_loop
+
+.dec_done:
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; --- print EAX as 8 hex digits ---
+puthex32:
+    push rax
+    push rcx
+    mov ecx, 8
+.l32:
+    rol eax, 4
+    push rax
+    call hexdigit
+    call putc
+    pop rax
+    dec ecx
+    jnz .l32
+    pop rcx
+    pop rax
+    ret
+
+; --- print AX as 4 hex digits ---
+puthex16:
+    push rax
+    push rcx
+    mov ecx, 4
+.l16:
+    rol ax, 4
+    push rax
+    call hexdigit
+    call putc
+    pop rax
+    dec ecx
+    jnz .l16
+    pop rcx
+    pop rax
+    ret
+
+; --- print AL as 2 hex digits ---
+puthex8:
+    push rax
+    push rax
+    shr al, 4
+    call hexdigit
+    call putc
+    pop rax
+    call hexdigit
+    call putc
+    pop rax
+    ret
+
 align 16
 banner   db "Opensweet OS 0.0.2 [x86_64] higher-half - built with FASM", 10, 0
 cpu_msg  db "CPU: ", 0
@@ -1044,11 +1848,120 @@ exc_msg  db "EXCEPTION ", 0
 at_msg   db " @ ", 0
 cmd_exc  db "exc", 0
 cmd_div  db "div", 0
-cmd_ticks db "ticks", 0
-cmd_mem   db "mem", 0
-cmd_map   db "map", 0
+cmd_map  db "map", 0
+cmd_help     db "help", 0
+cmd_ls       db "ls", 0
+cmd_cd       db "cd", 0
+cmd_pwd      db "pwd", 0
+cmd_cat      db "cat", 0
+cmd_stat     db "stat", 0
+cmd_wallpaper db "wallpaper", 0
+cmd_mem      db "mem", 0
+cmd_cpu      db "cpu", 0
+cmd_pci      db "pci", 0
+cmd_ticks    db "ticks", 0
+cmd_uptime   db "uptime", 0
+cmd_vbe      db "vbe", 0
+cmd_clear    db "clear", 0
+cmd_cls      db "cls", 0
+cmd_tasks    db "tasks", 0
+cmd_ps       db "ps", 0
+cmd_heap     db "heap", 0
+cmd_heaptest db "heaptest", 0
+cmd_reboot   db "reboot", 0
+cmd_poweroff db "poweroff", 0
+cmd_exit     db "exit", 0
+
+str_lssp     db "ls ", 0
+str_cdsp     db "cd ", 0
+str_statsp   db "stat ", 0
+str_wallpapersp db "wallpaper ", 0
+
+str_wall_ok  db "Wallpaper decoded and applied successfully.", 10, 0
+str_wall_err db "wallpaper: failed to load or decode PNG file.", 10, 0
+
+prompt_user  db "opensweet:", 0
+prompt_sym   db "# ", 0
+
+str_cmd_notfound1 db "opensweet: command not found: '", 0
+str_cmd_notfound2 db "' (type 'help' for available commands)", 10, 0
+
+str_help_hdr db "=== Opensweet OS Available Commands ===", 10, 0
+str_help_body:
+db "  heap            - Display kernel dynamic heap allocator stats", 10
+db "  heaptest        - Run kernel heap allocator verification test", 10
+db "  tasks / ps      - List active threads, state, ticks and stacks", 10
+db "  ls [path]       - List directory contents on ext4", 10
+db "  cd [path]       - Change current working directory", 10
+db "  pwd             - Print current working directory", 10
+db "  cat <file>      - Print file contents from ext4", 10
+db "  stat <file>     - Display inode and extent metadata", 10
+db "  wallpaper [path]- Load and apply PNG wallpaper from ext4", 10
+db "  mem             - Display physical memory (PMM) stats", 10
+db "  cpu             - Display CPU vendor, brand and features", 10
+db "  pci             - Scan and enumerate PCI bus devices", 10
+db "  uptime / ticks  - Show timer ticks and system uptime", 10
+db "  vbe             - Show VBE framebuffer mode details", 10
+db "  clear           - Clear terminal screen", 10
+db "  reboot          - Reboot system via 8042 reset", 10
+db "  poweroff        - Power off virtual machine", 10
+db 0
+
+str_os_title    db "Opensweet OS v0.0.2 [x86_64 Long Mode]", 10, 0
+str_os_subtitle db "SMP Kernel | ext4 Read-Only VFS | 1024x768 Framebuffer Console", 10, 0
+str_os_ready    db "System initialized successfully. Type 'help' for available commands.", 10, 10, 0
+
+str_cat_usage   db "Usage: cat <file>", 10, 0
+str_cat_isdir   db "cat: is a directory", 10, 0
+
+str_mem_hdr     db "--- Physical Memory Manager (PMM) ---", 10, 0
+str_mem_total   db "  Total RAM:    256 MB (65536 physical pages)", 10, 0
+str_mem_used    db "  Used Pages:   ", 0
+str_mem_free    db "  Free Pages:   ", 0
+str_mem_pages   db " pages", 10, 0
+str_mem_pgsz    db "  Page Size:    4096 bytes (4 KB)", 10, 0
+
+str_cpu_hdr     db "--- CPU Diagnostics (CPUID) ---", 10, 0
+str_cpu_lbl_vendor db "  Vendor:       ", 0
+str_cpu_lbl_model  db "  Model:        ", 0
+str_cpu_lbl_feat   db "  Features:     ", 0
+str_feat_apic   db "APIC ", 0
+str_feat_tsc    db "TSC ", 0
+str_feat_msr    db "MSR ", 0
+str_feat_sse    db "SSE ", 0
+str_feat_sse2   db "SSE2 ", 0
+str_feat_sse3   db "SSE3 ", 0
+str_feat_avx    db "AVX ", 0
+
+str_pci_hdr     db "--- PCI Bus 0 Device Scan ---", 10, 0
+str_pci_prefix  db "  [PCI] 00:", 0
+str_pci_vend    db "  Vendor: 0x", 0
+str_pci_dev     db "  Device: 0x", 0
+str_pci_cls     db "  Class: 0x", 0
+str_cls_bridge  db " (Host / PCI Bridge)", 0
+str_cls_vga     db " (VGA Display Controller)", 0
+str_cls_storage db " (Mass Storage / IDE Controller)", 0
+str_cls_net     db " (Network Controller)", 0
+
+str_uptime_lbl  db "System Uptime:  ", 0
+str_uptime_ticks db " timer ticks", 10, 0
+
+str_reboot_msg  db "Rebooting system...", 10, 0
+str_poweroff_msg db "Powering off virtual machine...", 10, 0
+
+cpu_brand_str   rb 64
+
 cmd_ata   db "ata", 0
-cmd_ls    db "ls", 0
+str_vbe_hdr   db "VBE Framebuffer: ", 0
+str_vbe_at    db " @ ", 0
+str_vbe_bpp   db " bpp, Pitch: ", 0
+str_vbe_lfb   db " bytes, LFB: 0x", 0
+cmd_gui   db "gui", 0
+msg_gui_ok db "GUI rendered to VBE framebuffer (1024x768x32bpp WM desktop)", 10, 0
+cmd_mouse db "mouse", 0
+msg_mouse_x db "mouse: x=", 0
+msg_mouse_y db " y=", 0
+msg_mouse_btn db " btn=", 0
 str_catsp db "cat ", 0
 msg_freepages db "free_pages=", 0
 msg_a     db " a=", 0
@@ -1079,7 +1992,7 @@ kb_tail  db 0
 timer_ticks dd 0
 ticks_msg db "ticks=", 0
 cmd_len  db 0
-cmd_buf  rb 64
+cmd_buf  rb 128
 
 align 16
 idt      rb 256*16
@@ -1101,7 +2014,12 @@ db "ZXCVBNM<>?",0,0,0," "
 rb 0x53-$+keymap_shift
 
 include '..\drivers\ata.asm'
+include '..\drivers\mouse.asm'
 include 'D:\Opensweet\fs\ext4\ext4.inc'
+include '..\drivers\console.asm'
+include 'D:\Opensweet\gui\modern_desktop.inc'
+include 'D:\Opensweet\kernel\sched.inc'
+include 'D:\Opensweet\kernel\heap.inc'
 
 ; ================= framebuffer test pattern (proves VBE LFB works) =================
 ; fills screen with per-pixel gradient: R=x, G=y, B=(x+y) & 255
@@ -1109,10 +2027,13 @@ fb_test_pattern:
     cmp byte [r14 + VBS_OK], 1
     jne .ret
     ; load params
+    movzx eax, word [r14 + VBS_PITCH]
     mov [r15 + vbe_pitch - kmain], eax
     movzx eax, word [r14 + VBS_WIDTH]
     mov [r15 + vbe_width - kmain], eax
+    movzx eax, word [r14 + VBS_HEIGHT]
     mov [r15 + vbe_height - kmain], eax
+    mov eax, dword [r14 + VBS_LFB]
     mov [r15 + vbe_lfb - kmain], eax
 
     xor r8d, r8d                     ; y = 0

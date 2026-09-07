@@ -48,9 +48,19 @@ start:
     dec si
     jnz .read_loop
 
+    mov al, '1'                     ; DEBUG: stage2 loaded
+    mov ah, 0x0E
+    mov bx, 0x0007
+    int 0x10
+
+    mov dl, [boot_drive]
     jmp 0:0x0600                    ; hand off to stage2
 
 die:
+    mov al, 'D'
+    mov ah, 0x0E
+    mov bx, 0x0007
+    int 0x10
     hlt
     jmp die
 

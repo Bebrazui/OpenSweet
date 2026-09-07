@@ -217,7 +217,9 @@ disk_read_blocks:
     jz .ok
 .dr_loop:
     push rcx
+    push rax
     call ata_read_one
+    pop rax
     pop rcx
     jnc .dr_ok
     mov al, 'X'              ; DEBUG: sector read failed

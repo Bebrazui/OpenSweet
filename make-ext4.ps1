@@ -40,19 +40,22 @@ PutU32 ($gdt + 8)  10                       # bg_inode_table (blocks 10..13)
 
 # ---- helper: write an extents-root inode into inode table ----
 function ExtentLeaf([long]$inoOff, [long]$fsBlock, [int]$len, [int]$size, [int]$mode) {
-    PutU16 $inoOff 0xF30A                   # eh_magic
-    PutU16 ($inoOff + 2) 1                  # eh_entries
-    PutU16 ($inoOff + 4) 3                  # eh_max
-    PutU16 ($inoOff + 6) 0                  # eh_depth
-    PutU32 ($inoOff + 8) 0                  # eh_generation
-    PutU32 ($inoOff + 12) 0                 # ee_block
-    PutU16 ($inoOff + 16) $len              # ee_len
-    PutU16 ($inoOff + 18) 0                 # ee_start_hi
-    PutU32 ($inoOff + 20) $fsBlock          # ee_start_lo
-    PutU16 $inoOff $mode                    # i_mode (overwrite low bytes)
-    PutU16 ($inoOff + 2) 0                  # uid
+    PutU16 $inoOff $mode                    # i_mode
+    PutU16 ($inoOff + 2) 0                  # i_uid
     PutU32 ($inoOff + 4) $size              # i_size_lo
     PutU32 ($inoOff + 32) 0x80000           # i_flags = EXTENTS
+
+    # extent header at i_block (offset 40)
+    $ext = $inoOff + 40
+    PutU16 $ext 0xF30A                      # eh_magic
+    PutU16 ($ext + 2) 1                     # eh_entries
+    PutU16 ($ext + 4) 4                     # eh_max
+    PutU16 ($ext + 6) 0                     # eh_depth
+    PutU32 ($ext + 8) 0                     # eh_generation
+    PutU32 ($ext + 12) 0                    # ee_block
+    PutU16 ($ext + 16) $len                 # ee_len
+    PutU16 ($ext + 18) 0                    # ee_start_hi
+    PutU32 ($ext + 20) $fsBlock             # ee_start_lo
 }
 
 $itable = 10 * $BS
@@ -62,6 +65,15 @@ ExtentLeaf ($itable + 1 * 128) 20 1 1024 0x41ED
 ExtentLeaf ($itable + 10 * 128) 21 1 26 0x81A4
 # inode 12 = big.txt -> blocks 22..25 (extent len 4)
 ExtentLeaf ($itable + 11 * 128) 22 4 4096 0x81A4
+
+$wallPath = Join-Path $PSScriptRoot "build\wallpaper.png"
+$hasWall = Test-Path $wallPath
+if ($hasWall) {
+    $wallBytes = [IO.File]::ReadAllBytes($wallPath)
+    $wallBlocks = [int][Math]::Ceiling($wallBytes.Length / 1024.0)
+    # inode 13 = wallpaper.png -> blocks 26..(26 + wallBlocks - 1)
+    ExtentLeaf ($itable + 12 * 128) 26 $wallBlocks $wallBytes.Length 0x81A4
+}
 
 # ---- root dir data @ block 20 ----
 $d = 20 * $BS
@@ -76,13 +88,23 @@ function DirEntry([long]$off, [int]$ino, [string]$name, [byte]$type, [int]$recle
 DirEntry $d        2  '.'        2 12
 DirEntry ($d + 12) 2  '..'       2 12
 DirEntry ($d + 24) 11 'hello.txt' 1 20
-DirEntry ($d + 44) 12 'big.txt'   1 (1024 - 44)
+if ($hasWall) {
+    DirEntry ($d + 44) 12 'big.txt'       1 20
+    DirEntry ($d + 64) 13 'wallpaper.png' 1 (1024 - 64)
+} else {
+    DirEntry ($d + 44) 12 'big.txt'       1 (1024 - 44)
+}
 
 # ---- file data ----
 $hello = [Text.Encoding]::ASCII.GetBytes("Hello from Opensweet ext4!`n")
 Put (21 * $BS) $hello
 $pat = [Text.Encoding]::ASCII.GetBytes("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
 for ($i = 0; $i -lt 4096; $i++) { $img[(22 * $BS) + $i] = $pat[$i % $pat.Length] }
+
+if ($hasWall) {
+    Put (26 * $BS) $wallBytes
+    echo "Added wallpaper.png ($($wallBytes.Length) bytes, $wallBlocks blocks) to disk image"
+}
 
 [IO.File]::WriteAllBytes('build\disk.img', $img)
 echo "Build OK: build\disk.img (minimal ext4, 1KB blocks)"

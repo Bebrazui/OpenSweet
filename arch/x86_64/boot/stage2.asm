@@ -16,6 +16,7 @@ start:
     mov ss, ax
     mov sp, 0xFF00
     sti
+    mov [boot_drive], dl
 
     ; --- init COM1 38400 8N1 ---
     mov dx, 0x3F9
@@ -43,7 +44,8 @@ start:
     mov al, 'S'
     call rs_putc
 
-    mov [boot_drive], dl
+    mov al, '2'
+    call tty_putc
 
     ; --- load kernel: LBA->CHS per IDE geometry ---
     mov ax, KERNEL_LOAD_SEG
@@ -80,6 +82,8 @@ start:
     jnz .read_loop
     mov al, 'K'
     call rs_putc
+    mov al, '3'
+    call tty_putc
 
     ; --- e820 memory map -> count dword @0x6000, entries @0x6100 ---
     xor ax, ax
@@ -110,72 +114,130 @@ start:
     xor ax, ax
     mov es, ax
     mov di, 0x5000
+    mov dword [di], 'VBE2'
     mov ax, 0x4F00
     int 0x10
     cmp ax, 0x004F
-    jne .vbe_none
-    cmp dword [di], 'ASEV'
+    je .vbe_ax_ok
+    mov al, 'x'
+    call rs_putc
+    jmp .vbe_none
+.vbe_ax_ok:
+    mov al, [di]
+    call rs_putc
+    mov al, [di+1]
+    call rs_putc
+    mov al, [di+2]
+    call rs_putc
+    mov al, [di+3]
+    call rs_putc
+    cmp dword [di], 'VESA'
     jne .vbe_none
 
+    mov word [0x5030], 0
     mov si, [di + 0x0E]
     mov dx, [di + 0x10]
-    mov gs, dx
-    mov cx, 256
 .vbe_mode_loop:
+    mov gs, dx
     mov bx, [gs:si]
     cmp bx, 0xFFFF
-    je .vbe_none
+    jne .vbe_check_entry
+    ; End of list: do we have a fallback mode saved in 0x5030?
+    cmp word [0x5030], 0
+    jne .vbe_found
+    jmp .vbe_none
+
+.vbe_check_entry:
     push es
+    push si
+    push dx
     xor ax, ax
     mov es, ax
     mov di, 0x5200
     mov cx, bx
     mov ax, 0x4F01
     int 0x10
+    pop dx
+    pop si
     pop es
     cmp ax, 0x004F
     jne .vbe_next
+
+    ; Check mode attributes (0x0091: supported, color, LFB)
     mov ax, [es:0x5200]
     and ax, 0x0091
     cmp ax, 0x0091
     jne .vbe_next
-    movzx eax, word [es:0x5212]
-    cmp eax, 640
-    jb .vbe_next
-    movzx eax, word [es:0x5214]
-    cmp eax, 400
-    jb .vbe_next
-    cmp byte [es:0x521A], 32
+
+    ; Check 32 bpp
+    cmp byte [es:0x5219], 32
     jne .vbe_next
 
+    ; Preferred match: 1920x1080 @ 32bpp
+    cmp word [es:0x5212], 1920
+    jne .check_fallback
+    cmp word [es:0x5214], 1080
+    jne .check_fallback
+
+    ; Exact 1920x1080 found: select immediately!
     mov ax, [es:0x5210]
     mov [0x5010], ax
     mov ax, [es:0x5212]
     mov [0x5012], ax
     mov ax, [es:0x5214]
     mov [0x5014], ax
-    mov al, [es:0x521A]
+    mov al, [es:0x5219]
     mov [0x501A], al
     mov eax, [es:0x5228]
     mov [0x5028], eax
     mov [0x5030], bx
     jmp .vbe_found
+
+.check_fallback:
+    ; Check if >= 1024x768 and no fallback saved yet
+    cmp word [es:0x5212], 1024
+    jb .vbe_next
+    cmp word [es:0x5214], 768
+    jb .vbe_next
+    cmp word [0x5030], 0
+    jne .vbe_next
+
+    ; Save fallback mode
+    mov ax, [es:0x5210]
+    mov [0x5010], ax
+    mov ax, [es:0x5212]
+    mov [0x5012], ax
+    mov ax, [es:0x5214]
+    mov [0x5014], ax
+    mov al, [es:0x5219]
+    mov [0x501A], al
+    mov eax, [es:0x5228]
+    mov [0x5028], eax
+    mov [0x5030], bx
+
 .vbe_next:
     add si, 2
-    dec cx
-    jnz .vbe_mode_loop
-    jmp .vbe_none
+    jmp .vbe_mode_loop
 .vbe_found:
     mov bx, [0x5030]
     or bx, 0x4000
     mov ax, 0x4F02
     int 0x10
     cmp ax, 0x004F
-    jne .vbe_none
+    jne .vbe_set_fail
     mov byte [0x50FE], 1
     mov al, 'V'
     call rs_putc
+    jmp .vbe_done
+.vbe_set_fail:
+    mov al, 'E'
+    call rs_putc
+.halt2:
+    hlt
+    jmp .halt2
 .vbe_none:
+    mov al, 'N'
+    call rs_putc
 .vbe_done:
 
     ; --- enable A20 ---
@@ -197,6 +259,31 @@ disk_error:
     hlt
     jmp .halt
 
+; --- serial/teletype out (16-bit real mode) ---
+tty_putc:
+    push bx
+    push cx
+    mov ah, 0x0E
+    mov bx, 0x0007
+    int 0x10
+    pop cx
+    pop bx
+    ret
+
+rs_putc:
+    push dx
+    push ax
+.wait:
+    mov dx, 0x3FD
+    in al, dx
+    test al, 0x20
+    jz .wait
+    pop ax
+    mov dx, 0x3F8
+    out dx, al
+    pop dx
+    ret
+
 use32
 pm_entry:
     mov ax, DATA_SEL
@@ -207,20 +294,24 @@ pm_entry:
     mov ss, ax
     mov esp, 0xFF00
 
-    ; page tables: PML4@0x1000, PDPT@0x2000, PD@0x3000, PDPT_K@0x4000? (see below)
+    ; page tables: clear PML4@0x1000..0x4FFF (16KB) and PD_B@0x7000..0x7FFF (4KB)
+    ; (0x5000..0x5FFF is VBE info, 0x6000..0x6FFF is e820 memmap)
     mov edi, 0x1000
     xor eax, eax
-    mov ecx, 0xC00
+    mov ecx, 0x1000                     ; 16KB (0x1000..0x4FFF)
+    rep stosd
+    mov edi, 0x7000
+    mov ecx, 0x400                      ; 4KB (0x7000..0x7FFF)
     rep stosd
 
     mov dword [0x1000], 0x2001          ; PML4[0] -> PDPT
     mov dword [0x2000], 0x3001          ; PDPT[0] -> PD
     mov dword [0x2018], 0xC0000087      ; PDPT[3]: 1GB @3GB (LAPIC/VBE LFB)
 
-    ; higher-half: PML4[256] -> PDPT_B@0x4000 -> PD_B@0x5000 -> 2MB @ phys 0
+    ; higher-half: PML4[256] -> PDPT_B@0x4000 -> PD_B@0x7000 -> 2MB @ phys 0
     mov dword [0x1800], 0x4001
-    mov dword [0x4000], 0x5001
-    mov dword [0x5000], 0x83
+    mov dword [0x4000], 0x7001
+    mov dword [0x7000], 0x83
 
     mov edi, 0x3000
     mov eax, 0x83
@@ -287,18 +378,3 @@ cur_head   db 0
 cur_sec    db 0
 KERNEL_LOAD_SEG = 0x1000
 err_msg db "DISK ERR", 0
-
-; --- serial out (AL = char) ---
-rs_putc:
-    push dx
-    push ax
-.wait:
-    mov dx, 0x3FD
-    in al, dx
-    test al, 0x20
-    jz .wait
-    pop ax
-    mov dx, 0x3F8
-    out dx, al
-    pop dx
-    ret
