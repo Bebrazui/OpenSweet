@@ -512,18 +512,11 @@ wm_handle_mouse:
     push r11
     push r12
 
-    ; 1. Bounds-clamp mouse coordinates
+    ; 1. Bounds-clamped mouse coordinates directly from mouse driver
     mov eax, [r15 + mouse_x - kmain]
-    cmp eax, R2D_SCREEN_W - CURSOR_AA_W
-    jbe @f
-    mov eax, R2D_SCREEN_W - CURSOR_AA_W
-@@: mov [r15 + md_mouse_x - kmain], eax
-
+    mov [r15 + md_mouse_x - kmain], eax
     mov edx, [r15 + mouse_y - kmain]
-    cmp edx, R2D_SCREEN_H - CURSOR_AA_H
-    jbe @f
-    mov edx, R2D_SCREEN_H - CURSOR_AA_H
-@@: mov [r15 + md_mouse_y - kmain], edx
+    mov [r15 + md_mouse_y - kmain], edx
 
     ; 2. Check mouse button transitions
     movzx ebx, byte [r15 + mouse_buttons - kmain]
@@ -614,10 +607,6 @@ wm_handle_mouse:
     ja .test_windows
 
     ; Click is inside Dock! Determine icon:
-    ; Icon 0 (Terminal): 800..879
-    ; Icon 1 (Files):    880..959
-    ; Icon 2 (System):   960..1039
-    ; Icon 3 (Settings): 1040..1120
     cmp eax, 880
     jae @f
     mov al, APP_TERM
@@ -675,8 +664,6 @@ wm_handle_mouse:
 
     ; HIT WINDOW ebx!
     ; Check 1: Traffic Light Red Close Button
-    ; Button center at (wx + 19, wy + 16), radius 5
-    ; Box: x in [wx + 9, wx + 26], y in [wy + 6, wy + 26]
     mov ecx, r8d
     add ecx, 9
     cmp eax, ecx
@@ -730,10 +717,23 @@ wm_handle_mouse:
     call wm_capture_drag_surface
     mov byte [r15 + md_term_dirty - kmain], 0   ; Avoid full-screen render stall on drag start!
 
-    ; Instantly blit focused window to screen on first touch!
-    mov eax, r8d
-    mov edx, r9d
-    call wm_drag_step
+    ; Timestamp of drag start for 60 FPS pacing
+    mov eax, [r15 + timer_ticks - kmain]
+    mov [r15 + wm_last_drag_tick - kmain], eax
+
+    ; Flip freshly captured active window to screen immediately (<1 ms)
+    mov ecx, [r15 + wm_drag_surf_x0 - kmain]
+    mov edx, [r15 + wm_drag_surf_y0 - kmain]
+    mov esi, [r15 + wm_drag_surf_w - kmain]
+    mov edi, [r15 + wm_drag_surf_h - kmain]
+    call r2d_flip_rect
+
+    ; Draw cursor directly over window
+    mov ecx, [r15 + md_mouse_x - kmain]
+    mov edx, [r15 + md_mouse_y - kmain]
+    mov [r15 + md_mouse_prev_x - kmain], ecx
+    mov [r15 + md_mouse_prev_y - kmain], edx
+    call r2d_draw_cursor_lfb
 
     jmp .mouse_ret
 
@@ -788,15 +788,28 @@ wm_handle_mouse:
     mov edx, ecx
 @@:
 
-    ; Check if window position actually changed compared to last blitted position!
-    cmp eax, [r15 + wm_drag_prev_x - kmain]
-    jne @f
-    cmp edx, [r15 + wm_drag_prev_y - kmain]
-    je .mouse_ret                     ; Position unchanged, return!
-@@:
-    ; Update coordinates and blit immediately with zero dropped frames
+    ; Always store latest target coordinates
     mov [r15 + wm_x - kmain + rbx*4], eax
     mov [r15 + wm_y - kmain + rbx*4], edx
+
+    ; Check if window position actually changed compared to last blitted position!
+    cmp eax, [r15 + wm_drag_prev_x - kmain]
+    jne .check_drag_pacing
+    cmp edx, [r15 + wm_drag_prev_y - kmain]
+    je .mouse_ret                     ; Position unchanged, return!
+
+.check_drag_pacing:
+    ; 60 FPS Frame Pacing: at least 16 ms since last blit (coalesce 1000 Hz packets)
+    mov eax, [r15 + timer_ticks - kmain]
+    sub eax, [r15 + wm_last_drag_tick - kmain]
+    cmp eax, 16
+    jb .mouse_ret                     ; < 16 ms: coalesce! Will be flushed on next tick
+
+    mov eax, [r15 + timer_ticks - kmain]
+    mov [r15 + wm_last_drag_tick - kmain], eax
+
+    mov eax, [r15 + wm_x - kmain + rbx*4]
+    mov edx, [r15 + wm_y - kmain + rbx*4]
     call wm_drag_step
     jmp .mouse_ret
 
@@ -1459,5 +1472,44 @@ wm_paste_drag_surface:
     pop rbx
     pop rax
     ret
+
+; ==============================================================================
+; wm_drag_flush_pending: Flush coalesced drag step if 16ms elapsed and moved
+; ==============================================================================
+wm_drag_flush_pending:
+    push rax
+    push rbx
+    push rdx
+
+    movzx ebx, byte [r15 + wm_drag_app - kmain]
+    cmp ebx, APP_COUNT
+    jae .dfp_done
+
+    mov eax, [r15 + wm_x - kmain + rbx*4]
+    cmp eax, [r15 + wm_drag_prev_x - kmain]
+    jne .dfp_check_time
+    mov edx, [r15 + wm_y - kmain + rbx*4]
+    cmp edx, [r15 + wm_drag_prev_y - kmain]
+    je .dfp_done
+
+.dfp_check_time:
+    mov eax, [r15 + timer_ticks - kmain]
+    sub eax, [r15 + wm_last_drag_tick - kmain]
+    cmp eax, 16
+    jb .dfp_done
+
+    mov eax, [r15 + timer_ticks - kmain]
+    mov [r15 + wm_last_drag_tick - kmain], eax
+
+    mov eax, [r15 + wm_x - kmain + rbx*4]
+    mov edx, [r15 + wm_y - kmain + rbx*4]
+    call wm_drag_step
+
+.dfp_done:
+    pop rdx
+    pop rbx
+    pop rax
+    ret
+
 
 

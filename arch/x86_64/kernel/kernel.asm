@@ -156,11 +156,16 @@ kmain:
 .shell:
     call md_handle_mouse
     cmp byte [r15 + wm_drag_app - kmain], 0xFF
-    jne .no_render              ; Drag in progress: NEVER trigger full-screen render!
+    jne .drag_check             ; Drag in progress
     cmp byte [r15 + md_term_dirty - kmain], 0
     je .no_render
     mov byte [r15 + md_term_dirty - kmain], 0
     call modern_desktop_render
+    jmp .no_render
+
+.drag_check:
+    call wm_drag_flush_pending
+
 .no_render:
     call getc
     test al, al
@@ -177,6 +182,18 @@ kmain:
     and al, 1
     cmp al, [r15 + wm_prev_lmb - kmain]
     jne .shell
+
+    ; If window drag is in progress and position moved, loop immediately to maintain 60 FPS pacing
+    cmp byte [r15 + wm_drag_app - kmain], 0xFF
+    je @f
+    movzx eax, byte [r15 + wm_drag_app - kmain]
+    mov edx, [r15 + wm_x - kmain + rax*4]
+    cmp edx, [r15 + wm_drag_prev_x - kmain]
+    jne .shell
+    mov edx, [r15 + wm_y - kmain + rax*4]
+    cmp edx, [r15 + wm_drag_prev_y - kmain]
+    jne .shell
+@@:
 
     hlt                       ; sleep until IRQ
     jmp .shell
