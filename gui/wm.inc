@@ -51,6 +51,15 @@ str_title_term db "Terminal - Opensweet Shell (x86_64)", 0
 str_title_file db "File Explorer - ext4 Storage (/)", 0
 str_title_sys  db "System Monitor", 0
 str_title_set  db "Settings & Personalization", 0
+str_wm_drag_log   db "[WM] drag_step x=", 0
+str_wm_y_log      db " y=", 0
+str_wm_w_log      db " w=", 0
+str_wm_h_log      db " h=", 0
+str_wm_cyc_log    db " cycles=", 0
+str_wm_flip_cyc   db " flip_cyc=", 0
+str_wm_touch_log  db "[WM] touch_down app=", 0
+str_wm_rel_log    db "[WM] lmb_release", 10, 0
+
 
 ; ==============================================================================
 ; wm_init: Initialize Window Manager default state
@@ -537,15 +546,18 @@ wm_handle_mouse:
     jz .just_hover
 
     ; Transition: Click Released
+    lea rsi, [r15 + str_wm_rel_log - kmain]
+    call serial_puts
+
     movzx ebx, byte [r15 + wm_drag_app - kmain]
     cmp ebx, APP_COUNT
     jae .release_no_drag
 
     ; Flush any throttled final movement if window ended at different position
     mov eax, [r15 + wm_x - kmain + rbx*4]
+    mov edx, [r15 + wm_y - kmain + rbx*4]
     cmp eax, [r15 + wm_drag_prev_x - kmain]
     jne .flush_final_drag
-    mov edx, [r15 + wm_y - kmain + rbx*4]
     cmp edx, [r15 + wm_drag_prev_y - kmain]
     je .release_done
 .flush_final_drag:
@@ -693,6 +705,13 @@ wm_handle_mouse:
     ja .body_click
 
     ; Title bar clicked: Bring to front and start dragging
+    lea rsi, [r15 + str_wm_touch_log - kmain]
+    call serial_puts
+    movzx eax, bl
+    call serial_putdec64
+    mov al, 10
+    call serial_putc
+
     mov al, bl
     call wm_bring_to_front
 
@@ -844,9 +863,16 @@ wm_drag_step:
     push r11
     push r12
     push r13
+    push r14
+    push rbp
 
     mov r12d, eax                     ; r12d = new_x
     mov r13d, edx                     ; r13d = new_y
+
+    rdtsc
+    shl rdx, 32
+    or rax, rdx
+    mov r14, rax                        ; r14 = start cycles
 
     mov r8d, [r15 + wm_drag_prev_x - kmain] ; r8d = old_x
     mov r9d, [r15 + wm_drag_prev_y - kmain] ; r9d = old_y
@@ -992,11 +1018,22 @@ wm_drag_step:
 .render_done:
 
     ; Step 5: Flip only dirty rect to VRAM LFB (~3-5 ms)
+    rdtsc
+    shl rdx, 32
+    or rax, rdx
+    mov rbp, rax
+
     mov ecx, [r15 + wm_drag_dirty_x - kmain]
     mov edx, [r15 + wm_drag_dirty_y - kmain]
     mov esi, [r15 + wm_drag_dirty_w - kmain]
     mov edi, [r15 + wm_drag_dirty_h - kmain]
     call r2d_flip_rect
+
+    rdtsc
+    shl rdx, 32
+    or rax, rdx
+    sub rax, rbp
+    mov rbp, rax
 
     ; Step 6: Draw cursor directly to VRAM LFB at new position
     mov ecx, [r15 + md_mouse_x - kmain]
@@ -1011,7 +1048,42 @@ wm_drag_step:
     ; Release GUI lock
     mov dword [r15 + gui_lock - kmain], 0
 
+    rdtsc
+    shl rdx, 32
+    or rax, rdx
+    sub rax, r14
+    mov r14, rax                        ; r14 = elapsed cycles
+
+    lea rsi, [r15 + str_wm_drag_log - kmain]
+    call serial_puts
+    mov eax, [r15 + wm_drag_dirty_x - kmain]
+    call serial_putdec64
+    lea rsi, [r15 + str_wm_y_log - kmain]
+    call serial_puts
+    mov eax, [r15 + wm_drag_dirty_y - kmain]
+    call serial_putdec64
+    lea rsi, [r15 + str_wm_w_log - kmain]
+    call serial_puts
+    mov eax, [r15 + wm_drag_dirty_w - kmain]
+    call serial_putdec64
+    lea rsi, [r15 + str_wm_h_log - kmain]
+    call serial_puts
+    mov eax, [r15 + wm_drag_dirty_h - kmain]
+    call serial_putdec64
+    lea rsi, [r15 + str_wm_cyc_log - kmain]
+    call serial_puts
+    mov rax, r14
+    call serial_putdec64
+    lea rsi, [r15 + str_wm_flip_cyc - kmain]
+    call serial_puts
+    mov rax, rbp
+    call serial_putdec64
+    mov al, 10
+    call serial_putc
+
 .step_skip_blit:
+    pop rbp
+    pop r14
     pop r13
     pop r12
     pop r11
@@ -1308,11 +1380,11 @@ wm_capture_drag_surface:
     mov ecx, [r15 + wm_drag_surf_x0 - kmain]
     mov edx, [r15 + wm_drag_surf_y0 - kmain]
     mov esi, [r15 + wm_drag_surf_w - kmain]
-    mov edi, [r15 + wm_drag_surf_h - kmain]
+    mov r11d, [r15 + wm_drag_surf_h - kmain]
 
     test esi, esi
     jle .cap_done
-    test edi, edi
+    test r11d, r11d
     jle .cap_done
 
     mov r12d, esi
@@ -1320,9 +1392,9 @@ wm_capture_drag_surface:
     test r12d, r12d
     jz .cap_done
 
-    xor ebx, ebx                                ; row = 0..edi-1
+    xor ebx, ebx                                ; row = 0..r11d-1
 .cap_row:
-    cmp ebx, edi
+    cmp ebx, r11d
     jge .cap_finish
 
     mov eax, edx

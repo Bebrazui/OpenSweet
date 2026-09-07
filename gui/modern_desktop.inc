@@ -36,10 +36,12 @@ str_md_menu_s   db "System", 0
 str_md_menu_set db "Settings", 0
 str_md_clock    db "14:38:00", 0
 str_md_fps      db " 60 FPS", 0
-
 str_md_banner1  db "Opensweet OS v0.0.3 [x86_64 Long Mode] - 1920x1080 @ 32bpp", 0
 str_md_banner2  db "Type 'help' for list of available hardware and ext4 commands.", 0
 str_md_prompt   db "opensweet:/#", 0
+str_log_frender db "[DESKTOP] full_render cycles=", 0
+
+
 
 ; ==============================================================================
 ; modern_desktop_init: Initialize desktop state, clear terminal buffer
@@ -211,6 +213,13 @@ modern_desktop_render:
     push r9
     push r10
     push r11
+    push r12
+    push r13
+
+    rdtsc
+    shl rdx, 32
+    or rax, rdx
+    mov r12, rax                        ; r12 = start cycles
 
     ; Acquire GUI compositor lock to prevent concurrent daemon blitting
     mov dword [r15 + gui_lock - kmain], 1
@@ -240,6 +249,20 @@ modern_desktop_render:
     ; Release GUI compositor lock
     mov dword [r15 + gui_lock - kmain], 0
 
+    rdtsc
+    shl rdx, 32
+    or rax, rdx
+    sub rax, r12
+    mov r13, rax
+    lea rsi, [r15 + str_log_frender - kmain]
+    call serial_puts
+    mov rax, r13
+    call serial_putdec64
+    mov al, 10
+    call serial_putc
+
+    pop r13
+    pop r12
     pop r11
     pop r10
     pop r9

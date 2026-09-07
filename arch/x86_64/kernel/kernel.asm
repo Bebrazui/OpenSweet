@@ -183,18 +183,6 @@ kmain:
     cmp al, [r15 + wm_prev_lmb - kmain]
     jne .shell
 
-    ; If window drag is in progress and position moved, loop immediately to maintain 60 FPS pacing
-    cmp byte [r15 + wm_drag_app - kmain], 0xFF
-    je @f
-    movzx eax, byte [r15 + wm_drag_app - kmain]
-    mov edx, [r15 + wm_x - kmain + rax*4]
-    cmp edx, [r15 + wm_drag_prev_x - kmain]
-    jne .shell
-    mov edx, [r15 + wm_y - kmain + rax*4]
-    cmp edx, [r15 + wm_drag_prev_y - kmain]
-    jne .shell
-@@:
-
     hlt                       ; sleep until IRQ
     jmp .shell
 .key:
@@ -1178,6 +1166,69 @@ putc:
     pop rbx
     pop rax
     ret
+
+; --- COM1-only serial output (bypasses terminal buffer and dirty flags) ---
+serial_putc:
+    push rax
+    push rdx
+.sp_wait:
+    mov dx, COM1+5
+    in al, dx
+    test al, 0x20
+    jz .sp_wait
+    mov dx, COM1
+    mov al, byte [rsp + 8]
+    out dx, al
+    pop rdx
+    pop rax
+    ret
+
+serial_puts:
+    push rax
+    push rsi
+.sps_loop:
+    lodsb
+    test al, al
+    jz .sps_done
+    call serial_putc
+    jmp .sps_loop
+.sps_done:
+    pop rsi
+    pop rax
+    ret
+
+serial_putdec64:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    test rax, rax
+    jnz .spd_nz
+    mov al, '0'
+    call serial_putc
+    jmp .spd_done
+.spd_nz:
+    mov rbx, 10
+    xor ecx, ecx
+.spd_div:
+    xor edx, edx
+    div rbx
+    push rdx
+    inc ecx
+    test rax, rax
+    jnz .spd_div
+.spd_out:
+    pop rax
+    add al, '0'
+    call serial_putc
+    loop .spd_out
+.spd_done:
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
 
 ; --- IDT: vectors 0..31 -> exception stubs, halt-loop on fault ---
 init_idt:
