@@ -1389,10 +1389,10 @@ r2d_draw_cursor_lfb:
     push r8
     push r9
     push r10
+    push r11
 
     mov r8d, ecx                      ; x
     mov r9d, edx                      ; y
-    lea rsi, [r15 + cursor_aa_data - kmain]
 
     mov r10d, [r15 + vbe_lfb - kmain]
     test r10d, r10d
@@ -1414,6 +1414,12 @@ r2d_draw_cursor_lfb:
     mov eax, r8d
     lea rdi, [rdi + rax*4]
 
+    ; Explicitly compute pointer to row ebx in cursor_aa_data
+    ; Immune to horizontal clipping and never desynchronizes!
+    lea rsi, [r15 + cursor_aa_data - kmain]
+    imul eax, ebx, (CURSOR_AA_W * 4)
+    add rsi, rax
+
     xor ecx, ecx                      ; col 0..CURSOR_AA_W-1
 .cur_lfb_col:
     cmp ecx, CURSOR_AA_W
@@ -1424,12 +1430,16 @@ r2d_draw_cursor_lfb:
     cmp eax, R2D_SCREEN_W
     jae .cur_lfb_next_row
 
-    lodsd
+    mov eax, [rsi + rcx*4]
+    test eax, 0xFF000000              ; Skip completely transparent pixels
+    jz .cur_lfb_skip_pix
+
     push rdi
     lea rdi, [rdi + rcx*4]
     call r2d_blend_pixel
     pop rdi
 
+.cur_lfb_skip_pix:
     inc ecx
     jmp .cur_lfb_col
 
@@ -1438,6 +1448,7 @@ r2d_draw_cursor_lfb:
     jmp .cur_lfb_row
 
 .cur_lfb_done:
+    pop r11
     pop r10
     pop r9
     pop r8
@@ -1463,12 +1474,27 @@ r2d_restore_cursor_lfb:
     push r8
     push r9
     push r10
+    push r11
 
     mov r8d, ecx                      ; x
     mov r9d, edx                      ; y
     mov r10d, [r15 + vbe_lfb - kmain]
     test r10d, r10d
     jz .res_done
+
+    cmp r8d, R2D_SCREEN_W
+    jae .res_done
+    cmp r9d, R2D_SCREEN_H
+    jae .res_done
+
+    ; Clamp width to min(CURSOR_AA_W, R2D_SCREEN_W - r8d)
+    mov eax, R2D_SCREEN_W
+    sub eax, r8d
+    cmp eax, CURSOR_AA_W
+    jbe @f
+    mov eax, CURSOR_AA_W
+@@:
+    mov r11d, eax                     ; r11d = clamped width (1..CURSOR_AA_W)
 
     xor ebx, ebx                      ; row 0..CURSOR_AA_H-1
 .res_row:
@@ -1488,15 +1514,16 @@ r2d_restore_cursor_lfb:
     lea rsi, [rsi + rax*4]
     lea rdi, [rdi + rax*4]
 
-    ; (CURSOR_AA_W / 2) qwords per row
+    ; Copy clamped pixels as dwords (exact width, never overflows scanline!)
     cld
-    mov ecx, (CURSOR_AA_W / 2)
-    rep movsq
+    mov ecx, r11d
+    rep movsd
 
     inc ebx
     jmp .res_row
 
 .res_done:
+    pop r11
     pop r10
     pop r9
     pop r8
@@ -1529,17 +1556,26 @@ r2d_redraw_clock_lfb:
     cmp dword [r15 + gui_lock - kmain], 0
     jne .clk_done
 
+    ; If a window is currently being dragged near the top bar, skip clock redraw
+    movzx ebx, byte [r15 + wm_drag_app - kmain]
+    cmp ebx, APP_COUNT
+    jae .clk_drag_ok
+    cmp dword [r15 + wm_y - kmain + rbx*4], 35
+    jle .clk_done
+.clk_drag_ok:
+
     ; 1. Restore pristine background from R2D_WALLPAPER_CACHE to R2D_BACKBUFFER
+    ; Seamless rect x = 1834, w = 86 (1834..1920)
     xor ebx, ebx                      ; row 0..27
 .clk_restore_bg:
     cmp ebx, 28
     jae .clk_bg_restored
 
     imul eax, ebx, R2D_PITCH
-    lea rsi, [rax + R2D_WALLPAPER_CACHE + (R2D_SCREEN_W - 85)*4]
-    lea rdi, [rax + R2D_BACKBUFFER + (R2D_SCREEN_W - 85)*4]
+    lea rsi, [rax + R2D_WALLPAPER_CACHE + 1834*4]
+    lea rdi, [rax + R2D_BACKBUFFER + 1834*4]
     cld
-    mov ecx, 40                       ; 80 dwords = 40 qwords
+    mov ecx, 43                       ; 86 dwords = 43 qwords
     rep movsq
 
     inc ebx
@@ -1547,9 +1583,9 @@ r2d_redraw_clock_lfb:
 
 .clk_bg_restored:
     ; 2. Apply translucent menubar tint
-    mov ecx, R2D_SCREEN_W - 85
+    mov ecx, 1834
     xor edx, edx                      ; y = 0
-    mov esi, 80
+    mov esi, 86
     mov edi, 28
     mov eax, 0xC00F172A               ; Translucent Slate 900
     call r2d_fill_rect_alpha
@@ -1561,7 +1597,7 @@ r2d_redraw_clock_lfb:
     lea rsi, [r15 + str_md_clock - kmain]
     call r2d_draw_text_ui_aa
 
-    ; 4. Blit 80x28 rectangle from R2D_BACKBUFFER directly to VRAM LFB
+    ; 4. Blit 86x28 rectangle from R2D_BACKBUFFER directly to VRAM LFB
     mov eax, [r15 + vbe_lfb - kmain]
     test eax, eax
     jz .clk_done
@@ -1569,20 +1605,34 @@ r2d_redraw_clock_lfb:
     xor ebx, ebx                      ; row 0..27
 .clk_row:
     cmp ebx, 28
-    jae .clk_done
+    jae .clk_blit_done
 
     imul eax, ebx, R2D_PITCH
-    lea rsi, [rax + R2D_BACKBUFFER + (R2D_SCREEN_W - 85)*4]
+    lea rsi, [rax + R2D_BACKBUFFER + 1834*4]
     add eax, [r15 + vbe_lfb - kmain]
-    lea rdi, [rax + (R2D_SCREEN_W - 85)*4]
+    lea rdi, [rax + 1834*4]
 
-    ; 80 dwords = 40 qwords
+    ; 86 dwords = 43 qwords
     cld
-    mov ecx, 40
+    mov ecx, 43
     rep movsq
 
     inc ebx
     jmp .clk_row
+
+.clk_blit_done:
+    ; 5. If mouse cursor intersects clock rect [1834..1920] x [0..28], redraw cursor immediately!
+    mov eax, [r15 + mouse_x - kmain]
+    add eax, CURSOR_AA_W
+    cmp eax, 1834
+    jle .clk_done
+    mov eax, [r15 + mouse_y - kmain]
+    cmp eax, 28
+    jge .clk_done
+
+    mov ecx, [r15 + mouse_x - kmain]
+    mov edx, [r15 + mouse_y - kmain]
+    call r2d_draw_cursor_lfb
 
 .clk_done:
     pop r12
@@ -1625,18 +1675,18 @@ r2d_redraw_fps_lfb:
     ; 1. Format current FPS string
     call md_format_fps
 
-    ; 2. Restore 80x28 menubar background from R2D_WALLPAPER_CACHE to R2D_BACKBUFFER
-    ; at x = R2D_SCREEN_W - 170
+    ; 2. Restore 84x28 menubar background from R2D_WALLPAPER_CACHE to R2D_BACKBUFFER
+    ; at x = 1750 (1750..1834 seamlessly meets clock at 1834)
     xor ebx, ebx                      ; row 0..27
 .fps_restore_bg:
     cmp ebx, 28
     jae .fps_bg_restored
 
     imul eax, ebx, R2D_PITCH
-    lea rsi, [rax + R2D_WALLPAPER_CACHE + (R2D_SCREEN_W - 170)*4]
-    lea rdi, [rax + R2D_BACKBUFFER + (R2D_SCREEN_W - 170)*4]
+    lea rsi, [rax + R2D_WALLPAPER_CACHE + 1750*4]
+    lea rdi, [rax + R2D_BACKBUFFER + 1750*4]
     cld
-    mov ecx, 40                       ; 80 dwords = 40 qwords
+    mov ecx, 42                       ; 84 dwords = 42 qwords
     rep movsq
 
     inc ebx
@@ -1644,9 +1694,9 @@ r2d_redraw_fps_lfb:
 
 .fps_bg_restored:
     ; 3. Apply translucent menubar tint
-    mov ecx, R2D_SCREEN_W - 170
+    mov ecx, 1750
     xor edx, edx                      ; y = 0
-    mov esi, 80
+    mov esi, 84
     mov edi, 28
     mov eax, 0xC00F172A               ; Translucent Slate 900
     call r2d_fill_rect_alpha
@@ -1658,7 +1708,7 @@ r2d_redraw_fps_lfb:
     lea rsi, [r15 + str_md_fps - kmain]
     call r2d_draw_text_ui_aa
 
-    ; 5. Blit 80x28 rectangle from R2D_BACKBUFFER directly to VRAM LFB
+    ; 5. Blit 84x28 rectangle from R2D_BACKBUFFER directly to VRAM LFB
     mov eax, [r15 + vbe_lfb - kmain]
     test eax, eax
     jz .fps_done
@@ -1666,19 +1716,36 @@ r2d_redraw_fps_lfb:
     xor ebx, ebx                      ; row 0..27
 .fps_row:
     cmp ebx, 28
-    jae .fps_done
+    jae .fps_blit_done
 
     imul eax, ebx, R2D_PITCH
-    lea rsi, [rax + R2D_BACKBUFFER + (R2D_SCREEN_W - 170)*4]
+    lea rsi, [rax + R2D_BACKBUFFER + 1750*4]
     add eax, [r15 + vbe_lfb - kmain]
-    lea rdi, [rax + (R2D_SCREEN_W - 170)*4]
+    lea rdi, [rax + 1750*4]
 
     cld
-    mov ecx, 40                       ; 80 dwords = 40 qwords
+    mov ecx, 42                       ; 84 dwords = 42 qwords
     rep movsq
 
     inc ebx
     jmp .fps_row
+
+.fps_blit_done:
+    ; 6. If mouse cursor intersects FPS rect [1750..1834] x [0..28], redraw cursor immediately!
+    mov eax, [r15 + mouse_x - kmain]
+    add eax, CURSOR_AA_W
+    cmp eax, 1750
+    jle .fps_done
+    mov eax, [r15 + mouse_x - kmain]
+    cmp eax, 1834
+    jge .fps_done
+    mov eax, [r15 + mouse_y - kmain]
+    cmp eax, 28
+    jge .fps_done
+
+    mov ecx, [r15 + mouse_x - kmain]
+    mov edx, [r15 + mouse_y - kmain]
+    call r2d_draw_cursor_lfb
 
 .fps_done:
     pop r12

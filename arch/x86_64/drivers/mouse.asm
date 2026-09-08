@@ -279,7 +279,7 @@ mouse_process_packet:
     mov r8d, [r15 + vbe_width - kmain]
     test r8d, r8d
     jz .x_saved
-    sub r8d, 18
+    sub r8d, 20
     cmp ecx, r8d
     jle .cx_le_max
     mov ecx, r8d
@@ -287,7 +287,7 @@ mouse_process_packet:
 .x_saved:
     mov [r15 + mouse_x - kmain], ecx
 
-    ; 5. Update and clamp mouse_y: [0, vbe_height - 18]
+    ; 5. Update and clamp mouse_y: [0, vbe_height - 20]
     ; In PS/2, positive dy is UP, but screen Y goes DOWN -> sub dy!
     mov ecx, [r15 + mouse_y - kmain]
     sub ecx, edx                                   ; y - dy
@@ -298,7 +298,7 @@ mouse_process_packet:
     mov r8d, [r15 + vbe_height - kmain]
     test r8d, r8d
     jz .y_saved
-    sub r8d, 18
+    sub r8d, 20
     cmp ecx, r8d
     jle .cy_le_max
     mov ecx, r8d
