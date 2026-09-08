@@ -750,6 +750,11 @@ wm_handle_mouse:
     add edi, 36
     call r2d_flip_rect
 
+    ; Restore previous cursor
+    mov ecx, [r15 + md_mouse_prev_x - kmain]
+    mov edx, [r15 + md_mouse_prev_y - kmain]
+    call r2d_restore_cursor_lfb
+
     ; Draw cursor directly over window
     mov ecx, [r15 + md_mouse_x - kmain]
     mov edx, [r15 + md_mouse_y - kmain]
@@ -779,7 +784,7 @@ wm_handle_mouse:
     ; --- LMB HELD: DRAGGING ---
     movzx ebx, byte [r15 + wm_drag_app - kmain]
     cmp ebx, APP_COUNT
-    jae .mouse_ret
+    jae .just_hover
 
     ; Compute new window coordinates
     mov eax, [r15 + md_mouse_x - kmain]
@@ -877,40 +882,85 @@ wm_drag_step:
     or rax, rdx
     mov r14, rax                        ; r14 = start cycles
 
+    ; 0. Restore previous cursor from backbuffer before any window movement
+    mov ecx, [r15 + md_mouse_prev_x - kmain]
+    mov edx, [r15 + md_mouse_prev_y - kmain]
+    call r2d_restore_cursor_lfb
+
     mov r8d, [r15 + wm_drag_prev_x - kmain] ; r8d = old_x
     mov r9d, [r15 + wm_drag_prev_y - kmain] ; r9d = old_y
     mov r10d, [r15 + wm_w - kmain + rbx*4]  ; r10d = win_w
     mov r11d, [r15 + wm_h - kmain + rbx*4]  ; r11d = win_h
 
-    ; X_min = min(old_x, new_x)
+    ; X_min = min(old_x, new_x, mouse_x, mouse_prev_x)
     mov ecx, r8d
     cmp ecx, r12d
     jbe .xmin_ok
     mov ecx, r12d
 .xmin_ok:
+    cmp ecx, [r15 + md_mouse_x - kmain]
+    jbe @f
+    mov ecx, [r15 + md_mouse_x - kmain]
+@@:
+    cmp ecx, [r15 + md_mouse_prev_x - kmain]
+    jbe @f
+    mov ecx, [r15 + md_mouse_prev_x - kmain]
+@@:
 
-    ; Y_min = min(old_y, new_y)
+    ; Y_min = min(old_y, new_y, mouse_y, mouse_prev_y)
     mov edx, r9d
     cmp edx, r13d
     jbe .ymin_ok
     mov edx, r13d
 .ymin_ok:
+    cmp edx, [r15 + md_mouse_y - kmain]
+    jbe @f
+    mov edx, [r15 + md_mouse_y - kmain]
+@@:
+    cmp edx, [r15 + md_mouse_prev_y - kmain]
+    jbe @f
+    mov edx, [r15 + md_mouse_prev_y - kmain]
+@@:
 
-    ; X_max = max(old_x, new_x) + win_w
+    ; X_max = max(old_x + win_w, new_x + win_w, mouse_x + 20, mouse_prev_x + 20)
     mov esi, r8d
     cmp esi, r12d
     jae .xmax_ok
     mov esi, r12d
 .xmax_ok:
     add esi, r10d
+    mov eax, [r15 + md_mouse_x - kmain]
+    add eax, CURSOR_AA_W
+    cmp esi, eax
+    jae @f
+    mov esi, eax
+@@:
+    mov eax, [r15 + md_mouse_prev_x - kmain]
+    add eax, CURSOR_AA_W
+    cmp esi, eax
+    jae @f
+    mov esi, eax
+@@:
 
-    ; Y_max = max(old_y, new_y) + win_h
+    ; Y_max = max(old_y + win_h, new_y + win_h, mouse_y + 20, mouse_prev_y + 20)
     mov edi, r9d
     cmp edi, r13d
     jae .ymax_ok
     mov edi, r13d
 .ymax_ok:
     add edi, r11d
+    mov eax, [r15 + md_mouse_y - kmain]
+    add eax, CURSOR_AA_H
+    cmp edi, eax
+    jae @f
+    mov edi, eax
+@@:
+    mov eax, [r15 + md_mouse_prev_y - kmain]
+    add eax, CURSOR_AA_H
+    cmp edi, eax
+    jae @f
+    mov edi, eax
+@@:
 
     ; Expand bounding box with shadow margin (18 px)
     sub ecx, 18
