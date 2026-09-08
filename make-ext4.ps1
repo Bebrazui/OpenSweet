@@ -108,6 +108,52 @@ if ($hasGui) {
     ExtentLeaf ($itable + 14 * 128) $guiStartBlock $guiBlocks $guiBytes.Length 0x81ED
 }
 
+# ---- compile C applications (calc.elf, notepad.elf) ----
+$gccPath = Join-Path $PSScriptRoot "tools\w64devkit\bin\gcc.exe"
+$objcopyPath = Join-Path $PSScriptRoot "tools\w64devkit\bin\objcopy.exe"
+$crt0 = Join-Path $PSScriptRoot "user\crt0.s"
+$incDir = Join-Path $PSScriptRoot "include"
+
+$calcSrc = Join-Path $PSScriptRoot "user\calc.c"
+$calcExe = Join-Path $PSScriptRoot "build\calc.exe"
+$calcElf = Join-Path $PSScriptRoot "build\calc.elf"
+if (Test-Path $calcSrc) {
+    & $gccPath "-B$(Split-Path $gccPath)" "-I$incDir" -mabi=sysv -nostdlib "-Wl,--image-base=0x400000" -O2 $crt0 $calcSrc -o $calcExe
+    if (Test-Path $calcExe) {
+        & $objcopyPath -O elf64-x86-64 $calcExe $calcElf
+        Remove-Item $calcExe -ErrorAction SilentlyContinue
+    }
+}
+$hasCalc = Test-Path $calcElf
+$calcBlocks = 0
+$calcStartBlock = $guiStartBlock + $guiBlocks
+if ($hasCalc) {
+    $calcBytes = [IO.File]::ReadAllBytes($calcElf)
+    $calcBlocks = [int][Math]::Ceiling($calcBytes.Length / 1024.0)
+    # inode 16 = calc.elf
+    ExtentLeaf ($itable + 15 * 128) $calcStartBlock $calcBlocks $calcBytes.Length 0x81ED
+}
+
+$noteSrc = Join-Path $PSScriptRoot "user\notepad.c"
+$noteExe = Join-Path $PSScriptRoot "build\notepad.exe"
+$noteElf = Join-Path $PSScriptRoot "build\notepad.elf"
+if (Test-Path $noteSrc) {
+    & $gccPath "-B$(Split-Path $gccPath)" "-I$incDir" -mabi=sysv -nostdlib "-Wl,--image-base=0x400000" -O2 $crt0 $noteSrc -o $noteExe
+    if (Test-Path $noteExe) {
+        & $objcopyPath -O elf64-x86-64 $noteExe $noteElf
+        Remove-Item $noteExe -ErrorAction SilentlyContinue
+    }
+}
+$hasNote = Test-Path $noteElf
+$noteBlocks = 0
+$noteStartBlock = $calcStartBlock + $calcBlocks
+if ($hasNote) {
+    $noteBytes = [IO.File]::ReadAllBytes($noteElf)
+    $noteBlocks = [int][Math]::Ceiling($noteBytes.Length / 1024.0)
+    # inode 17 = notepad.elf
+    ExtentLeaf ($itable + 16 * 128) $noteStartBlock $noteBlocks $noteBytes.Length 0x81ED
+}
+
 # ---- root dir data @ block 20 ----
 $d = 20 * $BS
 function DirEntry([long]$off, [int]$ino, [string]$name, [byte]$type, [int]$reclen) {
@@ -129,12 +175,20 @@ if ($hasWall) {
     $curOff += 24
 }
 if ($hasElf) {
-    $rec = if ($hasGui) { 20 } else { $d + 1024 - $curOff }
-    DirEntry $curOff 14 'hello.elf' 1 $rec
+    DirEntry $curOff 14 'hello.elf' 1 20
     $curOff += 20
 }
 if ($hasGui) {
-    DirEntry $curOff 15 'gui_demo.elf' 1 ($d + 1024 - $curOff)
+    DirEntry $curOff 15 'gui_demo.elf' 1 20
+    $curOff += 20
+}
+if ($hasCalc) {
+    $rec = if ($hasNote) { 20 } else { $d + 1024 - $curOff }
+    DirEntry $curOff 16 'calc.elf' 1 $rec
+    $curOff += 20
+}
+if ($hasNote) {
+    DirEntry $curOff 17 'notepad.elf' 1 ($d + 1024 - $curOff)
 }
 
 # ---- file data ----
@@ -155,7 +209,16 @@ if ($hasGui) {
     Put ($guiStartBlock * $BS) $guiBytes
     echo "Added gui_demo.elf ($($guiBytes.Length) bytes, $guiBlocks blocks) to disk image"
 }
+if ($hasCalc) {
+    Put ($calcStartBlock * $BS) $calcBytes
+    echo "Added calc.elf ($($calcBytes.Length) bytes, $calcBlocks blocks) to disk image"
+}
+if ($hasNote) {
+    Put ($noteStartBlock * $BS) $noteBytes
+    echo "Added notepad.elf ($($noteBytes.Length) bytes, $noteBlocks blocks) to disk image"
+}
 
 [IO.File]::WriteAllBytes('build\disk.img', $img)
 echo "Build OK: build\disk.img (minimal ext4, 1KB blocks)"
+
 

@@ -186,6 +186,27 @@ kmain:
     hlt                       ; sleep until IRQ
     jmp .shell
 .key:
+    ; Check if focused window is a user application window (wm_focus_app >= 4)
+    cmp byte [r15 + wm_focus_app - kmain], 4
+    jb .term_key
+
+    ; Route key to user application event queue
+    movzx ebx, byte [r15 + wm_focus_app - kmain]
+    sub ebx, 4                         ; ebx = slot (0..3)
+    shl ebx, 4                         ; slot * 16
+    lea rdi, [r15 + wm_user_events - kmain + rbx]
+    mov dword [rdi + 0], 4             ; EVENT_KEY_DOWN = 4
+    mov dword [rdi + 4], 0
+    mov dword [rdi + 8], 0
+    movzx eax, al                      ; ASCII key code
+    mov dword [rdi + 12], eax          ; param = key
+    movzx ebx, byte [r15 + wm_focus_app - kmain]
+    sub ebx, 4
+    mov byte [r15 + wm_user_has_event - kmain + rbx], 1
+    mov byte [r15 + md_term_dirty - kmain], 1
+    jmp .shell
+
+.term_key:
     cmp al, 10
     je .enter
     cmp al, 8
