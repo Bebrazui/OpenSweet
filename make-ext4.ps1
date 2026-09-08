@@ -68,11 +68,29 @@ ExtentLeaf ($itable + 11 * 128) 22 4 4096 0x81A4
 
 $wallPath = Join-Path $PSScriptRoot "build\wallpaper.png"
 $hasWall = Test-Path $wallPath
+$wallBlocks = 0
 if ($hasWall) {
     $wallBytes = [IO.File]::ReadAllBytes($wallPath)
     $wallBlocks = [int][Math]::Ceiling($wallBytes.Length / 1024.0)
     # inode 13 = wallpaper.png -> blocks 26..(26 + wallBlocks - 1)
     ExtentLeaf ($itable + 12 * 128) 26 $wallBlocks $wallBytes.Length 0x81A4
+}
+
+# ---- compile and add hello.elf ----
+$fasmPath = "C:\Users\ttt79\Downloads\fasmw17335\FASM.EXE"
+$helloAsm = Join-Path $PSScriptRoot "user\hello.asm"
+$helloElf = Join-Path $PSScriptRoot "build\hello.elf"
+if (Test-Path $helloAsm) {
+    & $fasmPath $helloAsm $helloElf | Out-Null
+}
+$hasElf = Test-Path $helloElf
+$elfBlocks = 0
+$elfStartBlock = 26 + $wallBlocks
+if ($hasElf) {
+    $elfBytes = [IO.File]::ReadAllBytes($helloElf)
+    $elfBlocks = [int][Math]::Ceiling($elfBytes.Length / 1024.0)
+    # inode 14 = hello.elf -> blocks elfStartBlock..(elfStartBlock + elfBlocks - 1)
+    ExtentLeaf ($itable + 13 * 128) $elfStartBlock $elfBlocks $elfBytes.Length 0x81ED
 }
 
 # ---- root dir data @ block 20 ----
@@ -88,11 +106,19 @@ function DirEntry([long]$off, [int]$ino, [string]$name, [byte]$type, [int]$recle
 DirEntry $d        2  '.'        2 12
 DirEntry ($d + 12) 2  '..'       2 12
 DirEntry ($d + 24) 11 'hello.txt' 1 20
-if ($hasWall) {
-    DirEntry ($d + 44) 12 'big.txt'       1 20
-    DirEntry ($d + 64) 13 'wallpaper.png' 1 (1024 - 64)
+DirEntry ($d + 44) 12 'big.txt'   1 20
+
+$curOff = $d + 64
+if ($hasWall -and $hasElf) {
+    DirEntry $curOff 13 'wallpaper.png' 1 24
+    $curOff += 24
+    DirEntry $curOff 14 'hello.elf'     1 ($d + 1024 - $curOff)
+} elseif ($hasWall) {
+    DirEntry $curOff 13 'wallpaper.png' 1 ($d + 1024 - $curOff)
+} elseif ($hasElf) {
+    DirEntry $curOff 14 'hello.elf'     1 ($d + 1024 - $curOff)
 } else {
-    DirEntry ($d + 44) 12 'big.txt'       1 (1024 - 44)
+    DirEntry ($d + 44) 12 'big.txt'     1 ($d + 1024 - ($d + 44))
 }
 
 # ---- file data ----
@@ -104,6 +130,10 @@ for ($i = 0; $i -lt 4096; $i++) { $img[(22 * $BS) + $i] = $pat[$i % $pat.Length]
 if ($hasWall) {
     Put (26 * $BS) $wallBytes
     echo "Added wallpaper.png ($($wallBytes.Length) bytes, $wallBlocks blocks) to disk image"
+}
+if ($hasElf) {
+    Put ($elfStartBlock * $BS) $elfBytes
+    echo "Added hello.elf ($($elfBytes.Length) bytes, $elfBlocks blocks) to disk image"
 }
 
 [IO.File]::WriteAllBytes('build\disk.img', $img)

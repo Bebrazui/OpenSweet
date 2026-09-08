@@ -431,6 +431,38 @@ kmain:
     test al, al
     jnz .do_ring3
 
+    ; exec: starts with "exec " or exact "exec"
+    mov rsi, cmd_buf
+    lea rdi, [r15 + cmd_exec - kmain]
+    call streq
+    test al, al
+    jnz .do_exec_noarg
+    mov rsi, cmd_buf
+    lea rdi, [r15 + str_execsp - kmain]
+    mov ecx, 5
+    call strpref
+    test al, al
+    jnz .do_exec
+
+    ; run: starts with "run " or exact "run"
+    mov rsi, cmd_buf
+    lea rdi, [r15 + cmd_run - kmain]
+    call streq
+    test al, al
+    jnz .do_exec_noarg
+    mov rsi, cmd_buf
+    lea rdi, [r15 + str_runsp - kmain]
+    mov ecx, 4
+    call strpref
+    test al, al
+    jnz .do_run
+
+    ; Direct execution if command ends with ".elf"
+    mov rsi, cmd_buf
+    call elf_check_is_elf_command
+    test al, al
+    jnz .do_exec_direct
+
     ; Unknown command
     mov eax, FB_CLR_ERROR
     call fb_console_set_color
@@ -442,6 +474,39 @@ kmain:
     call puts
     mov eax, FB_CLR_DEFAULT
     call fb_console_set_color
+    jmp .prompt
+
+.do_exec:
+    lea rsi, [r15 + cmd_buf - kmain + 5]
+    jmp .do_exec_common
+
+.do_run:
+    lea rsi, [r15 + cmd_buf - kmain + 4]
+    jmp .do_exec_common
+
+.do_exec_direct:
+    lea rsi, [r15 + cmd_buf - kmain]
+    jmp .do_exec_common
+
+.do_exec_noarg:
+    mov eax, FB_CLR_LABEL
+    call fb_console_set_color
+    lea rsi, [r15 + str_exec_usage - kmain]
+    call puts
+    mov eax, FB_CLR_DEFAULT
+    call fb_console_set_color
+    jmp .prompt
+
+.do_exec_common:
+.skip_exec_sp:
+    cmp byte [rsi], ' '
+    jne @f
+    inc rsi
+    jmp .skip_exec_sp
+@@:
+    cmp byte [rsi], 0
+    je .do_exec_noarg
+    call elf_load_from_ext4
     jmp .prompt
 
 .do_ring3:
@@ -1448,14 +1513,17 @@ init_gdt_tss:
     mov rdi, 0x2000
     or dword [rdi], 0x07
 
-    ; Enable User on PD[2] (0x400000..0x5FFFFF, 2MB User Code/Data)
+    ; Enable User on PD[2..7] (0x400000..0xFFFFFF, 12MB User Space: Code, Data, BSS, Stack)
     mov rdi, 0x3000
-    mov dword [rdi + 2*8], 0x00400087
-    mov dword [rdi + 2*8 + 4], 0
-
-    ; Enable User on PD[3] (0x600000..0x7FFFFF, 2MB User Stack)
-    mov dword [rdi + 3*8], 0x00600087
-    mov dword [rdi + 3*8 + 4], 0
+    mov eax, 0x00400087
+    mov ecx, 2
+.map_user_pd:
+    mov [rdi + rcx*8], eax
+    mov dword [rdi + rcx*8 + 4], 0
+    add eax, 0x00200000
+    inc ecx
+    cmp ecx, 8
+    jb .map_user_pd
 
     ; Flush TLB
     mov rax, cr3
@@ -1885,33 +1953,54 @@ vmm_map:
     mov rsi, 0x1000           ; PML4 (linear == phys)
 
 .lvl_pdpt:
+    test r11b, 4
+    jz @f
+    or byte [rsi + rdx*8], 4
+@@:
     mov rbx, [rsi + rdx*8]
     test rbx, rbx
     jnz .have_pdpt
     call pmm_alloc_zero
-    or al, 3                  ; P|RW
+    mov cl, r11b
+    and cl, 4
+    or cl, 3
+    or al, cl
     mov [rsi + rdx*8], rax
 .have_pdpt:
     mov rsi, [rsi + rdx*8]
     and esi, 0xFFFFF000
 
 .lvl_pd:
+    test r11b, 4
+    jz @f
+    or byte [rsi + r8*8], 4
+@@:
     mov rbx, [rsi + r8*8]
     test rbx, rbx
     jnz .have_pd
     call pmm_alloc_zero
-    or al, 3
+    mov cl, r11b
+    and cl, 4
+    or cl, 3
+    or al, cl
     mov [rsi + r8*8], rax
 .have_pd:
     mov rsi, [rsi + r8*8]
     and esi, 0xFFFFF000
 
 .lvl_pt:
+    test r11b, 4
+    jz @f
+    or byte [rsi + r9*8], 4
+@@:
     mov rbx, [rsi + r9*8]
     test rbx, rbx
     jnz .have_pt
     call pmm_alloc_zero
-    or al, 3
+    mov cl, r11b
+    and cl, 4
+    or cl, 3
+    or al, cl
     mov [rsi + r9*8], rax
 .have_pt:
     mov rsi, [rsi + r9*8]
@@ -2366,11 +2455,17 @@ cmd_poweroff db "poweroff", 0
 cmd_exit     db "exit", 0
 cmd_ring3    db "ring3", 0
 cmd_user     db "user", 0
+cmd_exec     db "exec", 0
+cmd_run      db "run", 0
 
 str_name_user    db "user3", 0
 str_launch_ring3 db "[Kernel] Deploying 64-bit user binary to 0x400000...", 10, 0
 str_ring3_ok     db "[Kernel] Ring 3 task spawned! Executing with CPL=3.", 10, 0
 str_ring3_err    db "[Kernel] Failed to spawn Ring 3 task: no free slots.", 10, 0
+
+str_execsp       db "exec ", 0
+str_runsp        db "run ", 0
+str_exec_usage   db "Usage: exec <path/to/binary.elf>", 10, 0
 
 str_lssp     db "ls ", 0
 str_cdsp     db "cd ", 0
@@ -2394,6 +2489,7 @@ str_cmd_notfound2 db "' (type 'help' for available commands)", 10, 0
 
 str_help_hdr db "=== Opensweet OS Available Commands ===", 10, 0
 str_help_body:
+db "  exec <path>     - Load and execute 64-bit ELF binary from ext4", 10
 db "  ring3 / user    - Spawn isolated Ring 3 user process (CPL=3, Syscalls)", 10
 db "  heap            - Display kernel dynamic heap allocator stats", 10
 db "  heaptest        - Run kernel heap allocator verification test", 10
@@ -2565,6 +2661,7 @@ include 'D:\Opensweet\kernel\sched.inc'
 include 'D:\Opensweet\kernel\heap.inc'
 include 'D:\Opensweet\kernel\syscall.inc'
 include 'D:\Opensweet\kernel\test_user.inc'
+include 'D:\Opensweet\kernel\elf.inc'
 
 ; ================= framebuffer test pattern (proves VBE LFB works) =================
 ; fills screen with per-pixel gradient: R=x, G=y, B=(x+y) & 255
