@@ -419,6 +419,18 @@ kmain:
     test al, al
     jnz .do_heaptest
 
+    ; ring3 / user
+    mov rsi, cmd_buf
+    lea rdi, [r15 + cmd_ring3 - kmain]
+    call streq
+    test al, al
+    jnz .do_ring3
+    mov rsi, cmd_buf
+    lea rdi, [r15 + cmd_user - kmain]
+    call streq
+    test al, al
+    jnz .do_ring3
+
     ; Unknown command
     mov eax, FB_CLR_ERROR
     call fb_console_set_color
@@ -430,6 +442,33 @@ kmain:
     call puts
     mov eax, FB_CLR_DEFAULT
     call fb_console_set_color
+    jmp .prompt
+
+.do_ring3:
+    lea rsi, [r15 + str_launch_ring3 - kmain]
+    call puts
+
+    ; 1. Copy user binary to 0x400000 (User space memory)
+    lea rsi, [r15 + user_app_bin - kmain]
+    mov rdi, 0x400000
+    mov ecx, (USER_APP_BIN_SIZE + 7) / 8
+    rep movsq
+
+    ; 2. Create and launch Ring 3 user task
+    lea rsi, [r15 + str_name_user - kmain]
+    mov rdx, 0x400000                 ; User RIP entry
+    mov r8,  0x7FFF00                 ; User RSP stack
+    call task_create_user
+    cmp eax, -1
+    je .ring3_failed
+
+    lea rsi, [r15 + str_ring3_ok - kmain]
+    call puts
+    jmp .prompt
+
+.ring3_failed:
+    lea rsi, [r15 + str_ring3_err - kmain]
+    call puts
     jmp .prompt
 
 .do_heaptest:
@@ -1250,7 +1289,7 @@ init_idt:
     mov word [rdi+6], ax      ; offset 31:16
     shr rax, 16
     mov [rdi+8], eax          ; offset 63:32
-    mov word [rdi+2], 0x18    ; CODE64_SEL
+    mov word [rdi+2], CODE64_SEL
     mov byte [rdi+5], 0x8E    ; present | ring0 | interrupt gate
 
     ; If vector 8 (#DF - Double Fault), assign IST1 (1)
@@ -1277,7 +1316,7 @@ init_idt:
     mov word [rdi+6], ax
     shr rax, 16
     mov [rdi+8], eax
-    mov word [rdi+2], 0x18    ; CODE64_SEL
+    mov word [rdi+2], CODE64_SEL
     mov byte [rdi+5], 0x8E    ; present | ring0 | interrupt gate
     add rsi, 8
     inc rbx
@@ -1296,7 +1335,7 @@ init_idt:
     mov word [rdi+6], ax
     shr rax, 16
     mov [rdi+8], eax
-    mov word [rdi+2], 0x18
+    mov word [rdi+2], CODE64_SEL
     mov byte [rdi+5], 0x8E
     inc ebx
     cmp ebx, 256
@@ -1311,10 +1350,10 @@ init_idt:
     mov word [rdi+6], ax
     shr rax, 16
     mov [rdi+8], eax
-    mov word [rdi+2], 0x18
+    mov word [rdi+2], CODE64_SEL
     mov byte [rdi+5], 0x8E
 
-    ; entry 49 (0x31) = voluntary yield software interrupt (int 0x31)
+    ; entry 49 (0x31) = voluntary yield software interrupt (int 0x31, DPL=3 for Ring 3 user tasks!)
     lea rax, [r15 + isr_yield - kmain]
     mov rdi, 49*16
     add rdi, r11
@@ -1323,8 +1362,8 @@ init_idt:
     mov word [rdi+6], ax
     shr rax, 16
     mov [rdi+8], eax
-    mov word [rdi+2], 0x18
-    mov byte [rdi+5], 0x8E
+    mov word [rdi+2], CODE64_SEL
+    mov byte [rdi+5], 0xEE    ; present | Ring 3 accessible | interrupt gate
 
     lidt tword [r15 + idtr - kmain]
     ret
@@ -1383,6 +1422,13 @@ init_gdt_tss:
     ; 4. Load 64-bit GDT: LGDT
     lgdt tword [r15 + gdtr64 - kmain]
 
+    ; Far return to reload CS with new CODE64_SEL (0x08)
+    push CODE64_SEL
+    lea rax, [.cs_reloaded]
+    push rax
+    retfq
+.cs_reloaded:
+
     ; Reload data segment registers with DATA64_SEL (0x10)
     mov ax, DATA64_SEL
     mov ds, ax
@@ -1394,6 +1440,29 @@ init_gdt_tss:
     ; 5. Load Task Register with TSS: LTR
     mov ax, TSS_SEL              ; 0x30
     ltr ax
+
+    ; 6. Enable User permissions in Page Tables for User Mode (Ring 3)
+    ; Enable User (bit 2) on PML4[0] and PDPT[0]
+    mov rdi, 0x1000
+    or dword [rdi], 0x07
+    mov rdi, 0x2000
+    or dword [rdi], 0x07
+
+    ; Enable User on PD[2] (0x400000..0x5FFFFF, 2MB User Code/Data)
+    mov rdi, 0x3000
+    mov dword [rdi + 2*8], 0x00400087
+    mov dword [rdi + 2*8 + 4], 0
+
+    ; Enable User on PD[3] (0x600000..0x7FFFFF, 2MB User Stack)
+    mov dword [rdi + 3*8], 0x00600087
+    mov dword [rdi + 3*8 + 4], 0
+
+    ; Flush TLB
+    mov rax, cr3
+    mov cr3, rax
+
+    ; 7. Initialize Syscall MSRs (STAR, LSTAR, FMASK, EFER.SCE)
+    call syscall_init
 
     pop rdi
     pop rcx
@@ -2071,6 +2140,35 @@ common_ex:
 @@:
     mov al, 10
     call putc
+
+    ; Check if exception occurred in Ring 3 user task
+    cmp r12d, 14
+    je .chk_has_err
+    cmp r12d, 13
+    je .chk_has_err
+    cmp r12d, 12
+    je .chk_has_err
+    cmp r12d, 11
+    je .chk_has_err
+    cmp r12d, 10
+    je .chk_has_err
+    cmp r12d, 8
+    je .chk_has_err
+    cmp r12d, 17
+    je .chk_has_err
+    mov rax, [rsp + 17*8]             ; CS without err code
+    jmp .chk_cs
+.chk_has_err:
+    mov rax, [rsp + 18*8]             ; CS with err code
+.chk_cs:
+    test al, 3
+    jz .halt                          ; Kernel exception -> halt
+
+    ; Ring 3 user space exception: terminate task gracefully!
+    lea rsi, [r15 + str_sys_crash - kmain]
+    call puts
+    call task_exit
+
 .halt:
     cli
     hlt
@@ -2266,6 +2364,13 @@ cmd_heaptest db "heaptest", 0
 cmd_reboot   db "reboot", 0
 cmd_poweroff db "poweroff", 0
 cmd_exit     db "exit", 0
+cmd_ring3    db "ring3", 0
+cmd_user     db "user", 0
+
+str_name_user    db "user3", 0
+str_launch_ring3 db "[Kernel] Deploying 64-bit user binary to 0x400000...", 10, 0
+str_ring3_ok     db "[Kernel] Ring 3 task spawned! Executing with CPL=3.", 10, 0
+str_ring3_err    db "[Kernel] Failed to spawn Ring 3 task: no free slots.", 10, 0
 
 str_lssp     db "ls ", 0
 str_cdsp     db "cd ", 0
@@ -2289,6 +2394,7 @@ str_cmd_notfound2 db "' (type 'help' for available commands)", 10, 0
 
 str_help_hdr db "=== Opensweet OS Available Commands ===", 10, 0
 str_help_body:
+db "  ring3 / user    - Spawn isolated Ring 3 user process (CPL=3, Syscalls)", 10
 db "  heap            - Display kernel dynamic heap allocator stats", 10
 db "  heaptest        - Run kernel heap allocator verification test", 10
 db "  tasks / ps      - List active threads, state, ticks and stacks", 10
@@ -2404,19 +2510,19 @@ idtr     dw 4095
 align 16
 gdt64_start:
     dq 0                         ; 0x00: Null descriptor
-CODE32_SEL    = 0x08             ; 0x08: 32-bit Compatibility Code
+CODE64_SEL    = 0x08             ; 0x08: 64-bit Kernel Code (Ring 0, 64-bit long mode)
     dw 0xFFFF, 0x0000
-    db 0x00, 0x9A, 0xCF, 0x00
+    db 0x00, 0x9A, 0xAF, 0x00
 DATA64_SEL    = 0x10             ; 0x10: 64-bit Kernel Data (Ring 0, read/write)
     dw 0xFFFF, 0x0000
     db 0x00, 0x92, 0xCF, 0x00
-CODE64_SEL    = 0x18             ; 0x18: 64-bit Kernel Code (Ring 0, 64-bit long mode)
+USER_CODE32_SEL = 0x18           ; 0x18: 32-bit Compatibility User Code (for SYSRET base)
     dw 0xFFFF, 0x0000
-    db 0x00, 0x9A, 0xAF, 0x00
-USER_DATA_SEL = 0x20             ; 0x20: 64-bit User Data (Ring 3, read/write)
+    db 0x00, 0xFA, 0xCF, 0x00
+USER_DATA_SEL = 0x20             ; 0x20: 64-bit User Data (Ring 3, read/write, RPL 3 = 0x23)
     dw 0xFFFF, 0x0000
     db 0x00, 0xF2, 0xCF, 0x00    ; Present=1, DPL=3, S=1, Type=2 (Data RW)
-USER_CODE_SEL = 0x28             ; 0x28: 64-bit User Code (Ring 3, 64-bit long mode)
+USER_CODE_SEL = 0x28             ; 0x28: 64-bit User Code (Ring 3, 64-bit long mode, RPL 3 = 0x2B)
     dw 0xFFFF, 0x0000
     db 0x00, 0xFA, 0xAF, 0x00    ; Present=1, DPL=3, S=1, Type=10 (Code RX, L=1)
 TSS_SEL       = 0x30             ; 0x30: 64-bit TSS Descriptor (16 bytes = 2 slots: 0x30 and 0x38)
@@ -2457,6 +2563,8 @@ include '..\drivers\console.asm'
 include 'D:\Opensweet\gui\modern_desktop.inc'
 include 'D:\Opensweet\kernel\sched.inc'
 include 'D:\Opensweet\kernel\heap.inc'
+include 'D:\Opensweet\kernel\syscall.inc'
+include 'D:\Opensweet\kernel\test_user.inc'
 
 ; ================= framebuffer test pattern (proves VBE LFB works) =================
 ; fills screen with per-pixel gradient: R=x, G=y, B=(x+y) & 255

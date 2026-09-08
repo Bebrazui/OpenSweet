@@ -22,7 +22,9 @@ TCB_SLICE       = 0x14                ; uint32: Remaining quantum in ticks
 TCB_TICKS       = 0x18                ; uint64: Total CPU ticks accumulated
 TCB_STACK_BASE  = 0x20                ; uint64: Bottom of stack memory
 TCB_STACK_TOP   = 0x28                ; uint64: Top of stack memory
-TCB_NAME        = 0x30                ; 16 bytes: ASCIIZ task name
+TCB_NAME        = 0x30                ; 8 bytes: ASCIIZ task name
+TCB_USER_RSP    = 0x38                ; uint64: Saved user RSP for Ring 3 task
+TCB_IS_USER     = 0x3C                ; uint32: 1 if Ring 3 user task, 0 if kernel
 TCB_FXSAVE      = 0x40                ; 512 bytes: 16-byte aligned FXSAVE/FXRSTOR area (FPU/MMX/SSE XMM0..15)
 TCB_SIZE        = 576                 ; 0x40 + 512 = 576 bytes (multiple of 16, aligns each task)
 
@@ -168,9 +170,9 @@ task_create:
     ; Followed by 15 GPRs: RAX, RBX, RCX, RDX, RSI, RDI, RBP, R8..R15
     mov r9, r8                        ; r9 = current top of stack
 
-    ; Push SS (0x10)
+    ; Push SS (DATA64_SEL = 0x10)
     sub r9, 8
-    mov qword [r9], 0x10
+    mov qword [r9], DATA64_SEL
 
     ; Push RSP (initial stack top)
     sub r9, 8
@@ -180,9 +182,9 @@ task_create:
     sub r9, 8
     mov qword [r9], 0x202
 
-    ; Push CS (0x18 = 64-bit kernel code selector)
+    ; Push CS (CODE64_SEL = 0x08)
     sub r9, 8
-    mov qword [r9], 0x18
+    mov qword [r9], CODE64_SEL
 
     ; Push RIP (task entry point in RDX)
     sub r9, 8
@@ -221,7 +223,7 @@ task_create:
     pop rdi
     pop rsi
 
-    ; Mark task ready
+    ; Mark task as READY
     mov dword [rdi + TCB_STATE], TASK_READY
     inc dword [r15 + sched_task_cnt - kmain]
 
@@ -232,6 +234,145 @@ task_create:
     mov eax, -1
 
 .create_done:
+    pop r9
+    pop r8
+    pop rsi
+    pop rdi
+    pop rcx
+    pop rbx
+    ret
+
+; ==============================================================================
+; task_create_user: Create a new Ring 3 user task
+; RSI = name string (ASCIIZ)
+; RDX = user RIP entry point (e.g. 0x400000)
+; R8  = user RSP initial stack top (e.g. 0x7FFF00)
+; Returns: EAX = task ID (or -1 on error)
+; ==============================================================================
+task_create_user:
+    push rbx
+    push rcx
+    push rdi
+    push rsi
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+
+    mov r10, rdx                      ; user RIP
+    mov r11, r8                       ; user RSP
+
+    ; Find free TCB slot (1..MAX_TASKS-1)
+    mov ebx, 1
+.find_user_slot:
+    cmp ebx, MAX_TASKS
+    jae .create_user_fail
+
+    imul eax, ebx, TCB_SIZE
+    lea rdi, [r15 + task_table - kmain + rax]
+    cmp dword [rdi + TCB_STATE], TASK_UNUSED
+    je .user_slot_found
+    cmp dword [rdi + TCB_STATE], TASK_DEAD
+    je .user_slot_found
+    inc ebx
+    jmp .find_user_slot
+
+.create_user_fail:
+    mov eax, -1
+    jmp .create_user_done
+
+.user_slot_found:
+    ; RDI points to TCB for slot ebx
+    mov dword [rdi + TCB_ID], ebx
+    mov dword [rdi + TCB_SLEEP], 0
+    mov dword [rdi + TCB_SLICE], SCHED_QUANTUM
+    mov qword [rdi + TCB_TICKS], 0
+    mov dword [rdi + TCB_IS_USER], 1
+    mov [rdi + TCB_USER_RSP], r11
+
+    ; Copy name (up to 7 chars)
+    push rsi
+    push rdi
+    lea rdi, [rdi + TCB_NAME]
+    xor ecx, ecx
+.copy_user_name:
+    lodsb
+    stosb
+    test al, al
+    jz .user_name_done
+    inc ecx
+    cmp ecx, 7
+    jb .copy_user_name
+    mov byte [rdi], 0
+.user_name_done:
+    pop rdi
+    pop rsi
+
+    ; Setup private kernel stack for task ebx (for IRQs & TSS.RSP0)
+    imul eax, ebx, TASK_STACK_SIZE
+    lea r8, [r15 + task_stacks - kmain + rax]
+    mov [rdi + TCB_STACK_BASE], r8
+    add r8, TASK_STACK_SIZE
+    mov [rdi + TCB_STACK_TOP], r8
+
+    ; Initialize kernel stack frame for iretq transition to Ring 3!
+    mov r9, r8
+
+    ; Push SS (USER_DATA_SEL | 3 = 0x23)
+    sub r9, 8
+    mov qword [r9], (USER_DATA_SEL or 3)
+
+    ; Push RSP (User RSP in r11)
+    sub r9, 8
+    mov qword [r9], r11
+
+    ; Push RFLAGS (0x202 = IF=1, interrupts enabled)
+    sub r9, 8
+    mov qword [r9], 0x202
+
+    ; Push CS (USER_CODE_SEL | 3 = 0x2B)
+    sub r9, 8
+    mov qword [r9], (USER_CODE_SEL or 3)
+
+    ; Push RIP (User RIP in r10)
+    sub r9, 8
+    mov qword [r9], r10
+
+    ; Push 15 GPRs (RAX..R15 = 0)
+    sub r9, 8*15
+    push rdi
+    lea rdi, [r9]
+    xor eax, eax
+    mov ecx, 30                       ; 15 qwords = 30 dwords
+    rep stosd
+    pop rdi
+
+    ; Saved RSP in TCB points to the top of the GPR frame
+    mov [rdi + TCB_RSP], r9
+
+    ; Initialize task FPU/SSE state from clean Task 0 state
+    push rsi
+    push rdi
+    push rcx
+    lea rsi, [r15 + task_table - kmain + TCB_FXSAVE]
+    lea rdi, [rdi + TCB_FXSAVE]
+    mov ecx, 512 / 8
+    rep movsq
+    pop rcx
+    pop rdi
+    pop rsi
+
+    ; Mark task as READY
+    mov dword [rdi + TCB_STATE], TASK_READY
+    inc dword [r15 + sched_task_cnt - kmain]
+
+    mov eax, ebx
+
+.create_user_done:
+    pop r12
+    pop r11
+    pop r10
     pop r9
     pop r8
     pop rsi
