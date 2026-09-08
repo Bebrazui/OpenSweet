@@ -3,12 +3,16 @@
 ; Implements SYSCALL/SYSRET (IA32_STAR, IA32_LSTAR, IA32_FMASK, EFER.SCE).
 ; ==============================================================================
 
-SYS_EXIT      = 0
-SYS_WRITE     = 1
-SYS_READ      = 2
-SYS_SLEEP     = 3
-SYS_YIELD     = 4
-SYS_UPTIME    = 5
+SYS_EXIT           = 0
+SYS_WRITE          = 1
+SYS_READ           = 2
+SYS_SLEEP          = 3
+SYS_YIELD          = 4
+SYS_UPTIME         = 5
+SYS_GUI_CREATE_WIN = 10
+SYS_GUI_UPDATE_WIN = 11
+SYS_GUI_POLL_EVENT = 12
+SYS_GUI_CLOSE_WIN  = 13
 
 align 16
 sys_user_rsp       dq 0
@@ -121,6 +125,14 @@ syscall_entry:
     je .do_yield
     cmp eax, SYS_UPTIME
     je .do_uptime
+    cmp eax, SYS_GUI_CREATE_WIN
+    je .do_gui_create_win
+    cmp eax, SYS_GUI_UPDATE_WIN
+    je .do_gui_update_win
+    cmp eax, SYS_GUI_POLL_EVENT
+    je .do_gui_poll_event
+    cmp eax, SYS_GUI_CLOSE_WIN
+    je .do_gui_close_win
 
     ; Unimplemented syscall
     mov rax, -1
@@ -159,6 +171,26 @@ syscall_entry:
 
 .do_uptime:
     mov eax, [r15 + timer_ticks - kmain]
+    jmp .syscall_ret
+
+.do_gui_create_win:
+    ; RDI = title, RSI = x, RDX = y, R10 = w, R8 = h
+    call wm_create_user_window
+    jmp .syscall_ret
+
+.do_gui_update_win:
+    ; RDI = win_id
+    call wm_update_user_window
+    jmp .syscall_ret
+
+.do_gui_poll_event:
+    ; RDI = win_id, RSI = user_event_ptr
+    call wm_poll_user_event
+    jmp .syscall_ret
+
+.do_gui_close_win:
+    ; RDI = win_id
+    call wm_close_user_window
     jmp .syscall_ret
 
 .syscall_ret:

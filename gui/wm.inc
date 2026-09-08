@@ -9,22 +9,26 @@ APP_TERM     = 0   ; Interactive Shell Terminal
 APP_FILES    = 1   ; ext4 File Explorer
 APP_SYS      = 2   ; System Monitor
 APP_SETTINGS = 3   ; Settings & Personalization
-APP_COUNT    = 4
+APP_USER_0   = 4   ; User Application 0
+APP_USER_1   = 5   ; User Application 1
+APP_USER_2   = 6   ; User Application 2
+APP_USER_3   = 7   ; User Application 3
+APP_COUNT    = 8
 
 ; Window Lifecycle States
 WM_STATE_CLOSED = 0
 WM_STATE_OPEN   = 1
 
 align 16
-; Application Descriptors & Geometry
-wm_state      db 1, 0, 0, 0                     ; Term open by default, others closed
-wm_x          dd 120, 760, 1260, 520
-wm_y          dd 80,  120, 160,  240
-wm_w          dd 680, 620, 480,  560
-wm_h          dd 600, 560, 480,  440
+; Application Descriptors & Geometry (8 windows: 4 system + 4 dynamic user apps)
+wm_state      db 1, 0, 0, 0, 0, 0, 0, 0         ; Term open by default, others closed
+wm_x          dd 120, 760, 1260, 520, 240, 300, 360, 420
+wm_y          dd 80,  120, 160,  240, 140, 180, 220, 260
+wm_w          dd 680, 620, 480,  560, 500, 500, 500, 500
+wm_h          dd 600, 560, 480,  440, 380, 380, 380, 380
 
 ; Global Compositor / WM State
-wm_z_order    db 0, 1, 2, 3                     ; App IDs from back (0) to front (open_count - 1)
+wm_z_order    db 0, 1, 2, 3, 4, 5, 6, 7         ; App IDs from back (0) to front (open_count - 1)
 wm_open_count db 1                              ; Number of active open windows
 wm_focus_app  db 0                              ; Currently focused application ID
 wm_drag_app        db 0xFF                           ; 0xFF = no window being dragged
@@ -38,6 +42,14 @@ wm_drag_dirty_x    dd 0
 wm_drag_dirty_y    dd 0
 wm_drag_dirty_w    dd 0
 wm_drag_dirty_h    dd 0
+
+; Dynamic User Window Storage (4 slots: 0..3 for apps 4..7)
+align 16
+wm_user_canvas    dq 0x00800000, 0x00A00000, 0x00C00000, 0x00E00000
+wm_user_titles    rb 4 * 64
+wm_user_has_event db 0, 0, 0, 0
+align 16
+wm_user_events    rb 4 * 16
 
 ; Window Titles
 str_title_term db "Terminal - Opensweet Shell (x86_64)", 0
@@ -65,6 +77,11 @@ wm_init:
     mov byte [r15 + wm_state - kmain + 1], 0     ; Files CLOSED
     mov byte [r15 + wm_state - kmain + 2], 0     ; Sys CLOSED
     mov byte [r15 + wm_state - kmain + 3], 0     ; Settings CLOSED
+    mov byte [r15 + wm_state - kmain + 4], 0     ; User 0 CLOSED
+    mov byte [r15 + wm_state - kmain + 5], 0     ; User 1 CLOSED
+    mov byte [r15 + wm_state - kmain + 6], 0     ; User 2 CLOSED
+    mov byte [r15 + wm_state - kmain + 7], 0     ; User 3 CLOSED
+    mov dword [r15 + wm_user_has_event - kmain], 0
 
     mov dword [r15 + wm_x - kmain + 0*4], 120
     mov dword [r15 + wm_y - kmain + 0*4], 80
@@ -367,7 +384,7 @@ wm_render_window:
 
     ; 4. Window Title Text
     mov ecx, r8d
-    add ecx, 130
+    add ecx, 72                         ; Starts right after traffic lights (wx + 72)
     mov edx, r9d
     add edx, 8
 
@@ -385,6 +402,17 @@ wm_render_window:
     je .t_files
     cmp r13d, APP_SYS
     je .t_sys
+    cmp r13d, APP_SETTINGS
+    je .t_set
+
+    ; Dynamic User Window (r13d >= 4)
+    mov edx, r13d
+    sub edx, 4
+    shl edx, 6                         ; edx = slot * 64 (preserves EAX color!)
+    lea rsi, [r15 + wm_user_titles - kmain + rdx]
+    jmp .do_title_draw
+
+.t_set:
     lea rsi, [r15 + str_title_set - kmain]
     jmp .do_title_draw
 .t_term:
@@ -422,9 +450,26 @@ wm_render_window:
     je .call_files
     cmp r13d, APP_SYS
     je .call_sys
-    call app_settings_render
+    cmp r13d, APP_SETTINGS
+    je .call_settings
+
+    ; Dynamic User Window (r13d >= 4): Blit client canvas!
+    ; Client area: (wx, wy + 33, ww, wh - 33)
+    ; Input registers: ecx = wx, edx = wy, esi = ww, edi = wh
+    add edx, 33                       ; dst_y = wy + 33
+    sub edi, 33                       ; h = wh - 33
+    mov eax, r13d
+    sub eax, 4
+    mov r8, [r15 + wm_user_canvas - kmain + rax*8]
+    test r8, r8
+    jz .win_rendered
+
+    call r2d_blit_bitmap
     jmp .win_rendered
 
+.call_settings:
+    call app_settings_render
+    jmp .win_rendered
 .call_term:
     call app_term_render
     jmp .win_rendered
@@ -684,6 +729,22 @@ wm_handle_mouse:
     ja .not_close_btn
 
     ; Red close button CLICKED! Cleanly close app!
+    cmp bl, 4
+    jb .do_close_app
+    ; User application window (bl >= 4): post WIN_CLOSE event
+    movzx eax, bl
+    sub eax, 4
+    shl eax, 4                         ; slot * 16
+    lea rdi, [r15 + wm_user_events - kmain + rax]
+    mov dword [rdi + 0], 5             ; EVENT_WIN_CLOSE = 5
+    mov dword [rdi + 4], 0
+    mov dword [rdi + 8], 0
+    mov dword [rdi + 12], 0
+    movzx eax, bl
+    sub eax, 4
+    mov byte [r15 + wm_user_has_event - kmain + rax], 1
+
+.do_close_app:
     mov al, bl
     call wm_close_app
     jmp .mouse_ret
@@ -769,6 +830,35 @@ wm_handle_mouse:
     mov al, bl
     call wm_bring_to_front
 
+    cmp ebx, 4
+    jb .sys_body_click
+
+    ; User application window (ebx >= 4): post MOUSE_DOWN event
+    mov eax, ebx
+    sub eax, 4
+    shl eax, 4                         ; slot * 16
+    lea rdi, [r15 + wm_user_events - kmain + rax]
+    mov dword [rdi + 0], 2             ; EVENT_MOUSE_DOWN = 2
+
+    ; Compute client-relative coordinates
+    mov ecx, [r15 + md_mouse_x - kmain]
+    sub ecx, [r15 + wm_x - kmain + rbx*4]
+    mov [rdi + 4], ecx
+
+    mov edx, [r15 + md_mouse_y - kmain]
+    sub edx, [r15 + wm_y - kmain + rbx*4]
+    sub edx, 33                        ; Title bar height = 33
+    mov [rdi + 8], edx
+
+    mov dword [rdi + 12], 1            ; Button = 1 (LMB)
+
+    mov eax, ebx
+    sub eax, 4
+    mov byte [r15 + wm_user_has_event - kmain + rax], 1
+    mov byte [r15 + md_term_dirty - kmain], 1
+    jmp .mouse_ret
+
+.sys_body_click:
     cmp ebx, APP_FILES
     jne .mouse_ret
     ; Dispatch to File Explorer
@@ -1277,6 +1367,255 @@ wm_drag_flush_pending:
     pop rbx
     pop rax
     ret
+
+; ==============================================================================
+; wm_create_user_window: Allocate and show a dynamic user application window
+; RDI = title pointer (user or kernel memory)
+; ESI = x, EDX = y, R10D = w, R8D = h
+; Returns: RAX = (canvas_ptr << 32) | win_id (or -1 if no slots available)
+; ==============================================================================
+wm_create_user_window:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+
+    ; 1. Find free user window slot (0..3, corresponding to app_id 4..7)
+    mov ebx, 0
+.find_slot:
+    cmp ebx, 4
+    jae .no_slot
+    cmp byte [r15 + wm_state - kmain + 4 + rbx], WM_STATE_CLOSED
+    je .found_slot
+    inc ebx
+    jmp .find_slot
+
+.no_slot:
+    mov rax, -1
+    jmp .create_done
+
+.found_slot:
+    ; ebx = slot (0..3), app_id = ebx + 4
+    lea r12d, [ebx + 4]
+
+    ; 2. Validate and clamp dimensions
+    ; Width: clamp to [200, 1600], default 440
+    cmp r10d, 200
+    jge @f
+    mov r10d, 440
+@@:
+    cmp r10d, 1600
+    jle @f
+    mov r10d, 1600
+@@:
+
+    ; Height: clamp to [150, 900], default 320
+    cmp r8d, 150
+    jge @f
+    mov r8d, 320
+@@:
+    cmp r8d, 900
+    jle @f
+    mov r8d, 900
+@@:
+
+    ; Position X: clamp/default
+    cmp esi, 20
+    jge @f
+    ; Default X staggered by slot: 240 + slot * 40
+    mov esi, 240
+    mov eax, ebx
+    imul eax, 40
+    add esi, eax
+@@:
+    cmp esi, 1500
+    jle @f
+    mov esi, 1500
+@@:
+
+    ; Position Y: clamp/default
+    cmp edx, 32
+    jge @f
+    ; Default Y staggered by slot: 140 + slot * 40
+    mov edx, 140
+    mov eax, ebx
+    imul eax, 40
+    add edx, eax
+@@:
+    cmp edx, 800
+    jle @f
+    mov edx, 800
+@@:
+
+    ; Save window geometry
+    mov [r15 + wm_x - kmain + r12*4], esi
+    mov [r15 + wm_y - kmain + r12*4], edx
+    mov [r15 + wm_w - kmain + r12*4], r10d
+    mov [r15 + wm_h - kmain + r12*4], r8d
+
+    ; 3. Copy title string to wm_user_titles[slot * 64]
+    mov eax, ebx
+    shl eax, 6                         ; slot * 64
+    lea r13, [r15 + wm_user_titles - kmain + rax]
+
+    test rdi, rdi
+    jz .default_title
+
+    ; Copy from user string at rdi
+    mov rsi, rdi
+    mov rdi, r13
+    mov ecx, 63
+.copy_title:
+    lodsb
+    stosb
+    test al, al
+    jz .title_done
+    dec ecx
+    jnz .copy_title
+    mov byte [rdi], 0
+    jmp .title_done
+
+.default_title:
+    mov dword [r13 + 0], "User"
+    mov dword [r13 + 4], " App"
+    mov byte  [r13 + 8], 0
+
+.title_done:
+    ; 4. Clear client canvas buffer
+    ; Canvas ptr = wm_user_canvas[slot]
+    mov r9, [r15 + wm_user_canvas - kmain + rbx*8]
+    mov rdi, r9
+    mov ecx, r10d                     ; width
+    mov eax, r8d                      ; height
+    sub eax, 33                       ; client height = h - 33
+    imul ecx, eax                     ; total dwords
+    mov eax, 0xFF0F172A               ; Default Dark Slate background
+    cld
+    rep stosd
+
+    ; 5. Clear event state
+    mov byte [r15 + wm_user_has_event - kmain + rbx], 0
+    mov eax, ebx
+    shl eax, 4
+    lea rdi, [r15 + wm_user_events - kmain + rax]
+    xor eax, eax
+    mov qword [rdi], rax
+    mov qword [rdi + 8], rax
+
+    ; 6. Open window via WM
+    mov al, r12b                      ; app_id
+    call wm_open_app
+
+    ; 7. Return (canvas_ptr << 32) | app_id
+    mov rdx, [r15 + wm_user_canvas - kmain + rbx*8]
+    shl rdx, 32
+    mov eax, r12d                     ; app_id (4..7)
+    or rax, rdx
+
+.create_done:
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; ==============================================================================
+; wm_close_user_window: Close user application window
+; EDI = win_id (4..7)
+; Returns: RAX = 0 on success, -1 on error
+; ==============================================================================
+wm_close_user_window:
+    cmp edi, 4
+    jb .cuw_err
+    cmp edi, 8
+    jae .cuw_err
+
+    mov al, dil
+    call wm_close_app
+
+    mov eax, edi
+    sub eax, 4
+    mov byte [r15 + wm_user_has_event - kmain + rax], 0
+    xor eax, eax
+    ret
+
+.cuw_err:
+    mov rax, -1
+    ret
+
+; ==============================================================================
+; wm_poll_user_event: Poll for pending GUI events for window EDI
+; EDI = win_id (4..7), RSI = pointer to 16-byte user buffer
+; Returns: RAX = 1 if event retrieved, 0 if no event, -1 on invalid win_id
+; ==============================================================================
+wm_poll_user_event:
+    cmp edi, 4
+    jb .pue_err
+    cmp edi, 8
+    jae .pue_err
+    test rsi, rsi
+    jz .pue_err
+
+    mov eax, edi
+    sub eax, 4
+
+    cmp byte [r15 + wm_user_has_event - kmain + rax], 0
+    je .pue_none
+
+    ; Consume event
+    mov byte [r15 + wm_user_has_event - kmain + rax], 0
+    shl eax, 4
+    lea rdx, [r15 + wm_user_events - kmain + rax]
+
+    mov r8, [rdx]
+    mov [rsi], r8
+    mov r8, [rdx + 8]
+    mov [rsi + 8], r8
+
+    mov eax, 1
+    ret
+
+.pue_none:
+    xor eax, eax
+    ret
+
+.pue_err:
+    mov rax, -1
+    ret
+
+; ==============================================================================
+; wm_update_user_window: Request window redraw (triggers compositor)
+; EDI = win_id (4..7)
+; Returns: RAX = 0 on success, -1 on error
+; ==============================================================================
+wm_update_user_window:
+    cmp edi, 4
+    jb .uuw_err
+    cmp edi, 8
+    jae .uuw_err
+
+    mov byte [r15 + md_term_dirty - kmain], 1
+    xor eax, eax
+    ret
+
+.uuw_err:
+    mov rax, -1
+    ret
+
 
 
 

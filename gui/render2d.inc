@@ -251,6 +251,91 @@ r2d_blend_pixel:
     ret
 
 ; ==============================================================================
+; r2d_blit_bitmap: Copy w*h 32bpp pixels from src_buf to Backbuffer at (dst_x, dst_y)
+; ECX = dst_x, EDX = dst_y, ESI = w, EDI = h, R8 = src_buf
+; ==============================================================================
+r2d_blit_bitmap:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+
+    test esi, esi
+    jle .bb_done
+    test edi, edi
+    jle .bb_done
+    test r8, r8
+    jz .bb_done
+
+    mov r9d, ecx                      ; r9d = cur_x
+    mov r10d, edx                     ; r10d = cur_y
+    mov r11d, esi                     ; r11d = width
+    mov r12d, edi                     ; r12d = remaining height
+
+.bb_row_loop:
+    test r12d, r12d
+    jz .bb_done
+
+    cmp r10d, 0
+    jl .bb_skip_row
+    cmp r10d, R2D_SCREEN_H
+    jge .bb_done
+
+    ; Check if row is horizontally within screen
+    cmp r9d, 0
+    jl .bb_skip_row
+    mov eax, r9d
+    add eax, r11d
+    cmp eax, R2D_SCREEN_W
+    ja .bb_skip_row
+
+    ; Compute Backbuffer dest address: R2D_BACKBUFFER + y * R2D_PITCH + x * 4
+    mov eax, r10d
+    imul eax, R2D_PITCH
+    lea rdi, [R2D_BACKBUFFER + rax]
+    lea rdi, [rdi + r9*4]
+
+    ; Source pointer in r8
+    mov rsi, r8
+
+    ; Row copy: r11d dwords
+    push rcx
+    mov ecx, r11d
+    cld
+    rep movsd
+    pop rcx
+
+.bb_skip_row:
+    ; Next row in source buffer: src += w * 4
+    mov eax, r11d
+    shl eax, 2
+    add r8, rax
+    inc r10d
+    dec r12d
+    jmp .bb_row_loop
+
+.bb_done:
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; ==============================================================================
 ; r2d_draw_ambient_wallpaper: Blit pre-rendered wallpaper cache to Backbuffer (<0.3 ms)
 ; ==============================================================================
 r2d_draw_ambient_wallpaper:

@@ -76,7 +76,7 @@ if ($hasWall) {
     ExtentLeaf ($itable + 12 * 128) 26 $wallBlocks $wallBytes.Length 0x81A4
 }
 
-# ---- compile and add hello.elf ----
+# ---- compile and add hello.elf & gui_demo.elf ----
 $fasmPath = "C:\Users\ttt79\Downloads\fasmw17335\FASM.EXE"
 $helloAsm = Join-Path $PSScriptRoot "user\hello.asm"
 $helloElf = Join-Path $PSScriptRoot "build\hello.elf"
@@ -91,6 +91,21 @@ if ($hasElf) {
     $elfBlocks = [int][Math]::Ceiling($elfBytes.Length / 1024.0)
     # inode 14 = hello.elf -> blocks elfStartBlock..(elfStartBlock + elfBlocks - 1)
     ExtentLeaf ($itable + 13 * 128) $elfStartBlock $elfBlocks $elfBytes.Length 0x81ED
+}
+
+$guiAsm = Join-Path $PSScriptRoot "user\gui_demo.asm"
+$guiElf = Join-Path $PSScriptRoot "build\gui_demo.elf"
+if (Test-Path $guiAsm) {
+    & $fasmPath $guiAsm $guiElf | Out-Null
+}
+$hasGui = Test-Path $guiElf
+$guiBlocks = 0
+$guiStartBlock = $elfStartBlock + $elfBlocks
+if ($hasGui) {
+    $guiBytes = [IO.File]::ReadAllBytes($guiElf)
+    $guiBlocks = [int][Math]::Ceiling($guiBytes.Length / 1024.0)
+    # inode 15 = gui_demo.elf -> blocks guiStartBlock..(guiStartBlock + guiBlocks - 1)
+    ExtentLeaf ($itable + 14 * 128) $guiStartBlock $guiBlocks $guiBytes.Length 0x81ED
 }
 
 # ---- root dir data @ block 20 ----
@@ -109,16 +124,17 @@ DirEntry ($d + 24) 11 'hello.txt' 1 20
 DirEntry ($d + 44) 12 'big.txt'   1 20
 
 $curOff = $d + 64
-if ($hasWall -and $hasElf) {
+if ($hasWall) {
     DirEntry $curOff 13 'wallpaper.png' 1 24
     $curOff += 24
-    DirEntry $curOff 14 'hello.elf'     1 ($d + 1024 - $curOff)
-} elseif ($hasWall) {
-    DirEntry $curOff 13 'wallpaper.png' 1 ($d + 1024 - $curOff)
-} elseif ($hasElf) {
-    DirEntry $curOff 14 'hello.elf'     1 ($d + 1024 - $curOff)
-} else {
-    DirEntry ($d + 44) 12 'big.txt'     1 ($d + 1024 - ($d + 44))
+}
+if ($hasElf) {
+    $rec = if ($hasGui) { 20 } else { $d + 1024 - $curOff }
+    DirEntry $curOff 14 'hello.elf' 1 $rec
+    $curOff += 20
+}
+if ($hasGui) {
+    DirEntry $curOff 15 'gui_demo.elf' 1 ($d + 1024 - $curOff)
 }
 
 # ---- file data ----
@@ -135,6 +151,11 @@ if ($hasElf) {
     Put ($elfStartBlock * $BS) $elfBytes
     echo "Added hello.elf ($($elfBytes.Length) bytes, $elfBlocks blocks) to disk image"
 }
+if ($hasGui) {
+    Put ($guiStartBlock * $BS) $guiBytes
+    echo "Added gui_demo.elf ($($guiBytes.Length) bytes, $guiBlocks blocks) to disk image"
+}
 
 [IO.File]::WriteAllBytes('build\disk.img', $img)
 echo "Build OK: build\disk.img (minimal ext4, 1KB blocks)"
+
