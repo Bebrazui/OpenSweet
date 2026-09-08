@@ -668,10 +668,19 @@ r2d_draw_rounded_rect_aa:
     mov [rsp + 16], ebx                 ; r
     mov [rsp + 20], eax                 ; fill_color
 
-    ; r_sq = r * r
-    mov eax, ebx
+    ; r_outer_sq = (r + 1) * (r + 1)
+    lea eax, [ebx + 1]
     imul eax, eax
-    mov [rsp + 24], eax                 ; r_sq
+    mov [rsp + 24], eax                 ; r_outer_sq
+
+    ; span_4r = 4 * r
+    mov eax, ebx
+    shl eax, 2
+    test eax, eax
+    jnz @f
+    mov eax, 1
+@@:
+    mov [rsp + 36], eax                 ; span_4r
 
     mov dword [rsp + 28], 0             ; py = 0
 .rr_y_loop:
@@ -780,18 +789,23 @@ r2d_draw_rounded_rect_aa:
     imul esi, esi
     add ecx, esi                        ; ecx = dist_sq
 
-    cmp ecx, [rsp + 24]                 ; dist_sq > r_sq?
-    ja .skip_pixel                      ; outside corner circle
+    cmp ecx, [rsp + 24]                 ; dist_sq > r_outer_sq?
+    ja .skip_pixel                      ; outside corner circle entirely
 
-    ; Check if near edge for soft anti-aliased border
-    mov eax, [rsp + 24]                 ; r_sq
-    sub eax, ecx                        ; r_sq - dist_sq
-    cmp eax, 30
-    ja .inside_solid
+    ; delta = r_outer_sq - dist_sq
+    mov eax, [rsp + 24]
+    sub eax, ecx                        ; delta = 0..span_4r
+    cmp eax, [rsp + 36]                 ; delta >= span_4r?
+    jae .inside_solid                   ; 100% inside
 
-    ; Soft edge: halve alpha
-    mov eax, [rsp + 20]                 ; fill_color
-    shr eax, 25                         ; (alpha >> 24) >> 1
+    ; Smooth anti-aliased edge: coverage = (delta * base_alpha) / span_4r
+    mov edx, [rsp + 20]                 ; fill_color
+    shr edx, 24                         ; base_alpha
+    imul eax, edx                       ; delta * base_alpha
+    xor edx, edx
+    div dword [rsp + 36]                ; eax = coverage alpha
+
+    ; Form blended color
     shl eax, 24
     mov edi, [rsp + 20]
     and edi, 0x00FFFFFF
@@ -888,9 +902,19 @@ r2d_draw_shadow:
     mov ebx, 0x08000000
 .bot_alpha_ok:
     mov r10d, ecx
+    mov eax, [rsp + 72]                 ; saved radius EBX
+    cmp eax, 4
+    jbe .bot_no_indent
+    add r10d, eax                       ; indent past left corner
+    mov r11d, esi
+    shl eax, 1
+    sub r11d, eax                       ; shrink span past right corner
+    jmp .bot_bounds_ok
+.bot_no_indent:
     sub r10d, 3                         ; start x
     mov r11d, esi
     add r11d, 6                         ; span w
+.bot_bounds_ok:
     test r10d, r10d
     jns @f
     add r11d, r10d
@@ -941,6 +965,15 @@ r2d_draw_shadow:
     mov ebx, 0x1A000000
 .left_alpha_ok:
     mov r10d, edx
+    mov eax, [rsp + 72]                 ; saved radius EBX
+    cmp eax, 4
+    jbe .left_no_indent
+    add r10d, eax                       ; start y below top corner
+    mov r11d, edi
+    shl eax, 1
+    sub r11d, eax                       ; row count stops before bottom corner
+    jmp .left_pix_loop
+.left_no_indent:
     add r10d, 4                         ; start y
     mov r11d, edi
     sub r11d, 2                         ; row count
@@ -985,6 +1018,15 @@ r2d_draw_shadow:
     mov ebx, 0x10000000
 .right_alpha_ok:
     mov r10d, edx
+    mov eax, [rsp + 72]                 ; saved radius EBX
+    cmp eax, 4
+    jbe .right_no_indent
+    add r10d, eax                       ; start y below top corner
+    mov r11d, edi
+    shl eax, 1
+    sub r11d, eax                       ; row count stops before bottom corner
+    jmp .right_pix_loop
+.right_no_indent:
     add r10d, 4                         ; start y
     mov r11d, edi
     sub r11d, 2                         ; row count

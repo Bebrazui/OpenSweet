@@ -13,6 +13,8 @@ ATA_STATC  = 0x1F7              ; read = status, write = command
 
 ATA_CMD_IDENTIFY = 0xEC
 ATA_CMD_READ     = 0x20
+ATA_CMD_WRITE    = 0x30
+ATA_CMD_FLUSH    = 0xE7
 
 STA_BSY = 0x80
 STA_DRQ = 0x08
@@ -233,6 +235,116 @@ disk_read_blocks:
     jnz .dr_loop
 .ok:
     clc
+    ret
+
+; --- write one sector: RAX=LBA, RSI=buffer(512); CF=1 error ---
+ata_write_one:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    mov rbx, rax             ; lba
+
+    ; select drive | LBA bits 24-27
+    mov eax, ebx
+    shr eax, 24
+    and al, 0x0F
+    or al, [r15 + ata_drv - kmain]
+    mov dx, ATA_DRV
+    out dx, al
+    call ata_wait_ready
+    jc .err
+
+    mov dx, ATA_SCNT
+    mov al, 1
+    out dx, al
+
+    mov eax, ebx             ; LBA bits 0-7
+    mov dx, ATA_LBAL
+    out dx, al
+
+    mov eax, ebx
+    shr eax, 8               ; LBA bits 8-15
+    mov dx, ATA_LBAM
+    out dx, al
+
+    mov eax, ebx
+    shr eax, 16              ; LBA bits 16-23
+    mov dx, ATA_LBAH
+    out dx, al
+
+    mov dx, ATA_STATC
+    mov al, ATA_CMD_WRITE
+    out dx, al
+
+    call ata_wait_drq
+    jc .err
+
+    mov dx, ATA_DATA
+    mov ecx, 256
+    cld
+    rep outsw
+
+    ; 400ns delay then wait until ready
+    mov ecx, 4
+    mov dx, ATA_STATC
+.w_delay:
+    in al, dx
+    dec ecx
+    jnz .w_delay
+    call ata_wait_ready
+    jc .err
+
+    clc
+.pop:
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+.err:
+    stc
+    jmp .pop
+
+; --- public: RAX=LBA, RCX=count, RSI=buffer; CF=1 error ---
+disk_write_blocks:
+    test rcx, rcx
+    jz .ok
+.dw_loop:
+    push rcx
+    push rax
+    call ata_write_one
+    pop rax
+    pop rcx
+    jc .err
+    add rsi, 512
+    inc rax
+    dec rcx
+    jnz .dw_loop
+.ok:
+    clc
+    ret
+.err:
+    stc
+    ret
+
+; --- flush drive write cache: CF=1 error ---
+disk_flush_cache:
+    push rdx
+    mov al, [r15 + ata_drv - kmain]
+    call ata_select
+    jc .err
+    mov dx, ATA_STATC
+    mov al, ATA_CMD_FLUSH
+    out dx, al
+    call ata_wait_ready
+    jc .err
+    clc
+    pop rdx
+    ret
+.err:
+    stc
+    pop rdx
     ret
 
 align 16

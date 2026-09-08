@@ -17,12 +17,12 @@ $BS = 1024                                  # block size
 
 # ---- superblock @ byte 1024 ----
 $sb = 1024
-PutU32 ($sb + 0x00) 32                      # inodes_count
+PutU32 ($sb + 0x00) 64                      # inodes_count
 PutU32 ($sb + 0x04) 16384                   # blocks_count_lo
 PutU32 ($sb + 0x14) 1                       # first_data_block (1KB blocks)
 PutU32 ($sb + 0x18) 0                       # log_block_size = 0 -> 1024
 PutU32 ($sb + 0x20) 16384                   # blocks_per_group (one group)
-PutU32 ($sb + 0x28) 32                      # inodes_per_group
+PutU32 ($sb + 0x28) 64                      # inodes_per_group
 PutU16 ($sb + 0x36) 1                       # state = clean
 PutU16 ($sb + 0x38) 0xEF53                  # magic
 PutU32 ($sb + 0x4C) 1                       # rev_level = dynamic
@@ -217,6 +217,34 @@ if ($hasNote) {
     Put ($noteStartBlock * $BS) $noteBytes
     echo "Added notepad.elf ($($noteBytes.Length) bytes, $noteBlocks blocks) to disk image"
 }
+
+# ---- populate block and inode bitmaps and free counts ----
+$totalAllocatedBlocks = $noteStartBlock + $noteBlocks
+
+# Block bitmap at block 3 (mark blocks 0..totalAllocatedBlocks-1 as used)
+for ($b = 0; $b -lt $totalAllocatedBlocks; $b++) {
+    $byteIdx = $b -shr 3
+    $bitIdx  = $b -band 7
+    $img[(3 * $BS) + $byteIdx] = $img[(3 * $BS) + $byteIdx] -bor (1 -shl $bitIdx)
+}
+
+# Inode bitmap at block 4 (inodes 1..17 are used)
+for ($ino = 1; $ino -le 17; $ino++) {
+    $bit = $ino - 1
+    $byteIdx = $bit -shr 3
+    $bitIdx  = $bit -band 7
+    $img[(4 * $BS) + $byteIdx] = $img[(4 * $BS) + $byteIdx] -bor (1 -shl $bitIdx)
+}
+
+$freeBlocks = 16384 - $totalAllocatedBlocks
+$freeInodes = 64 - 17
+
+PutU32 ($sb + 0x0C) $freeBlocks             # s_free_blocks_count_lo
+PutU32 ($sb + 0x10) $freeInodes             # s_free_inodes_count
+
+PutU16 ($gdt + 0x0C) $freeBlocks            # bg_free_blocks_count_lo
+PutU16 ($gdt + 0x0E) $freeInodes            # bg_free_inodes_count_lo
+PutU16 ($gdt + 0x10) 1                      # bg_used_dirs_count_lo
 
 [IO.File]::WriteAllBytes('build\disk.img', $img)
 echo "Build OK: build\disk.img (minimal ext4, 1KB blocks)"

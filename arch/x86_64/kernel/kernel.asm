@@ -401,6 +401,32 @@ kmain:
     test al, al
     jnz .do_stat
 
+    ; touch: "touch" or "touch "
+    mov rsi, cmd_buf
+    lea rdi, [r15 + cmd_touch - kmain]
+    call streq
+    test al, al
+    jnz .do_touch_usage
+    mov rsi, cmd_buf
+    lea rdi, [r15 + str_touchsp - kmain]
+    mov ecx, 6
+    call strpref
+    test al, al
+    jnz .do_touch
+
+    ; write: "write" or "write "
+    mov rsi, cmd_buf
+    lea rdi, [r15 + cmd_write - kmain]
+    call streq
+    test al, al
+    jnz .do_write_usage
+    mov rsi, cmd_buf
+    lea rdi, [r15 + str_writesp - kmain]
+    mov ecx, 6
+    call strpref
+    test al, al
+    jnz .do_write
+
     ; wallpaper: "wallpaper" or "wallpaper <path>"
     mov rsi, cmd_buf
     lea rdi, [r15 + cmd_wallpaper - kmain]
@@ -672,6 +698,159 @@ kmain:
     je .fs_err
     lea rsi, [r15 + cmd_buf - kmain + 4]
     call ext4_stat_print
+    jmp .prompt
+
+.do_touch_usage:
+    mov eax, FB_CLR_LABEL
+    call fb_console_set_color
+    lea rsi, [r15 + str_touch_usage - kmain]
+    call puts
+    mov eax, FB_CLR_DEFAULT
+    call fb_console_set_color
+    jmp .prompt
+
+.do_touch:
+    cmp byte [r15 + ext4_ok - kmain], 0
+    je .fs_err
+    lea rsi, [r15 + cmd_buf - kmain + 5]
+.touch_sp:
+    cmp byte [rsi], ' '
+    jne .touch_sp_done
+    inc rsi
+    jmp .touch_sp
+.touch_sp_done:
+    cmp byte [rsi], 0
+    je .do_touch_usage
+
+    mov rdi, rsi
+.touch_find_end:
+    cmp byte [rdi], 0
+    je .touch_trim
+    inc rdi
+    jmp .touch_find_end
+.touch_trim:
+    cmp rdi, rsi
+    jbe .touch_trimmed
+    cmp byte [rdi - 1], ' '
+    jne .touch_trimmed
+    dec rdi
+    mov byte [rdi], 0
+    jmp .touch_trim
+.touch_trimmed:
+    call ext4_create_file
+    jc .touch_err
+    cmp rax, -1
+    je .touch_err
+
+    mov eax, FB_CLR_SUCCESS
+    call fb_console_set_color
+    lea rsi, [r15 + str_touch_ok - kmain]
+    call puts
+    mov eax, FB_CLR_DEFAULT
+    call fb_console_set_color
+    jmp .prompt
+
+.touch_err:
+    mov eax, FB_CLR_ERROR
+    call fb_console_set_color
+    lea rsi, [r15 + str_touch_err - kmain]
+    call puts
+    mov eax, FB_CLR_DEFAULT
+    call fb_console_set_color
+    jmp .prompt
+
+.do_write_usage:
+    mov eax, FB_CLR_LABEL
+    call fb_console_set_color
+    lea rsi, [r15 + str_write_usage - kmain]
+    call puts
+    mov eax, FB_CLR_DEFAULT
+    call fb_console_set_color
+    jmp .prompt
+
+.do_write:
+    cmp byte [r15 + ext4_ok - kmain], 0
+    je .fs_err
+    lea rsi, [r15 + cmd_buf - kmain + 5]
+.write_sp1:
+    cmp byte [rsi], ' '
+    jne .write_sp1_done
+    inc rsi
+    jmp .write_sp1
+.write_sp1_done:
+    cmp byte [rsi], 0
+    je .do_write_usage
+
+    mov rdi, rsi
+.write_find_sp:
+    cmp byte [rdi], 0
+    je .do_write_usage
+    cmp byte [rdi], ' '
+    je .write_found_delim
+    inc rdi
+    jmp .write_find_sp
+
+.write_found_delim:
+    mov byte [rdi], 0
+    lea rbx, [rdi + 1]
+.write_sp2:
+    cmp byte [rbx], ' '
+    jne .write_sp2_done
+    inc rbx
+    jmp .write_sp2
+.write_sp2_done:
+    cmp byte [rbx], '"'
+    jne .write_no_quote_start
+    inc rbx
+.write_no_quote_start:
+    mov rdx, rbx
+.write_find_end:
+    cmp byte [rdx], 0
+    je .write_end_found
+    inc rdx
+    jmp .write_find_end
+.write_end_found:
+    sub rdx, rbx
+    test rdx, rdx
+    jz .write_quote_done
+    cmp byte [rbx + rdx - 1], '"'
+    jne .write_quote_done
+    dec rdx
+    mov byte [rbx + rdx], 0
+.write_quote_done:
+    push rbx
+    push rdx
+    call ext4_create_file
+    pop rdx
+    pop rbx
+    jc .write_err
+    cmp rax, -1
+    je .write_err
+
+    mov rsi, rbx
+    call ext4_write_file
+    jc .write_err
+    cmp rax, -1
+    je .write_err
+
+    push rax
+    mov eax, FB_CLR_SUCCESS
+    call fb_console_set_color
+    pop rax
+    call putdec64
+    lea rsi, [r15 + str_write_ok - kmain]
+    call puts
+    mov eax, FB_CLR_DEFAULT
+    call fb_console_set_color
+    jmp .prompt
+
+.write_err:
+    mov eax, FB_CLR_ERROR
+    call fb_console_set_color
+    lea rsi, [r15 + str_write_err - kmain]
+    call puts
+    mov eax, FB_CLR_DEFAULT
+    call fb_console_set_color
     jmp .prompt
 
 .do_wallpaper_default:
@@ -2523,6 +2702,8 @@ db "  cd [path]       - Change current working directory", 10
 db "  pwd             - Print current working directory", 10
 db "  cat <file>      - Print file contents from ext4", 10
 db "  stat <file>     - Display inode and extent metadata", 10
+db "  touch <file>    - Create a new empty file on ext4", 10
+db "  write <file> <text> - Write text to a file on ext4", 10
 db "  wallpaper [path]- Load and apply PNG wallpaper from ext4", 10
 db "  mem             - Display physical memory (PMM) stats", 10
 db "  cpu             - Display CPU vendor, brand and features", 10
@@ -2535,7 +2716,7 @@ db "  poweroff        - Power off virtual machine", 10
 db 0
 
 str_os_title    db "Opensweet OS v0.0.2 [x86_64 Long Mode]", 10, 0
-str_os_subtitle db "SMP Kernel | ext4 Read-Only VFS | 1024x768 Framebuffer Console", 10, 0
+str_os_subtitle db "SMP Kernel | ext4 Read/Write VFS | 1024x768 Framebuffer Console", 10, 0
 str_os_ready    db "System initialized successfully. Type 'help' for available commands.", 10, 10, 0
 
 str_cat_usage   db "Usage: cat <file>", 10, 0
@@ -2590,6 +2771,17 @@ msg_mouse_x db "mouse: x=", 0
 msg_mouse_y db " y=", 0
 msg_mouse_btn db " btn=", 0
 str_catsp db "cat ", 0
+cmd_touch       db "touch", 0
+str_touchsp     db "touch ", 0
+str_touch_usage db "Usage: touch <filename>", 10, 0
+str_touch_ok    db "File created successfully", 10, 0
+str_touch_err   db "touch: failed to create file", 10, 0
+
+cmd_write       db "write", 0
+str_writesp     db "write ", 0
+str_write_usage db "Usage: write <filename> <text>", 10, 0
+str_write_ok    db " bytes written successfully", 10, 0
+str_write_err   db "write: failed to write to file", 10, 0
 msg_freepages db "free_pages=", 0
 msg_a     db " a=", 0
 msg_b     db " b=", 0
