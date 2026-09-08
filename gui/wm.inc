@@ -32,13 +32,6 @@ wm_drag_off_x      dd 0
 wm_drag_off_y      dd 0
 wm_drag_prev_x     dd 0
 wm_drag_prev_y     dd 0
-wm_drag_surf_x0    dd 0
-wm_drag_surf_y0    dd 0
-wm_drag_surf_w     dd 0
-wm_drag_surf_h     dd 0
-wm_drag_surf_off_x dd 0
-wm_drag_surf_off_y dd 0
-wm_drag_surf_valid db 0
 wm_prev_lmb        db 0
 wm_last_drag_tick  dd 0
 wm_drag_dirty_x    dd 0
@@ -565,12 +558,10 @@ wm_handle_mouse:
 
 .release_done:
     mov byte [r15 + wm_drag_app - kmain], 0xFF
-    mov byte [r15 + wm_drag_surf_valid - kmain], 0
     jmp .mouse_ret
 
 .release_no_drag:
     mov byte [r15 + wm_drag_app - kmain], 0xFF
-    mov byte [r15 + wm_drag_surf_valid - kmain], 0
     jmp .mouse_ret
 
 .just_hover:
@@ -732,19 +723,31 @@ wm_handle_mouse:
     mov [r15 + wm_drag_prev_x - kmain], r8d
     mov [r15 + wm_drag_prev_y - kmain], r9d
 
-    ; Pre-render active window into R2D_WIN_CACHE for zero-lag blitting
-    call wm_capture_drag_surface
+    ; Render focused window directly to backbuffer
+    mov eax, 1                                  ; is_focused = 1
+    call wm_render_window
     mov byte [r15 + md_term_dirty - kmain], 0   ; Avoid full-screen render stall on drag start!
 
-    ; Timestamp of drag start for 60 FPS pacing
+    ; Timestamp of drag start for frame pacing
     mov eax, [r15 + timer_ticks - kmain]
     mov [r15 + wm_last_drag_tick - kmain], eax
 
-    ; Flip freshly captured active window to screen immediately (<1 ms)
-    mov ecx, [r15 + wm_drag_surf_x0 - kmain]
-    mov edx, [r15 + wm_drag_surf_y0 - kmain]
-    mov esi, [r15 + wm_drag_surf_w - kmain]
-    mov edi, [r15 + wm_drag_surf_h - kmain]
+    ; Flip window bounds + shadow margin to screen immediately (<1 ms)
+    mov ecx, r8d
+    sub ecx, 18
+    jns @f
+    xor ecx, ecx
+@@:
+    and ecx, not 1
+    mov edx, r9d
+    sub edx, 18
+    jns @f
+    xor edx, edx
+@@:
+    mov esi, [r15 + wm_w - kmain + rbx*4]
+    add esi, 36
+    mov edi, [r15 + wm_h - kmain + rbx*4]
+    add edi, 36
     call r2d_flip_rect
 
     ; Draw cursor directly over window
@@ -1008,13 +1011,7 @@ wm_drag_step:
     mov r9d, [r15 + wm_drag_dirty_y - kmain]
     mov r10d, [r15 + wm_drag_dirty_w - kmain]
     mov r11d, [r15 + wm_drag_dirty_h - kmain]
-    cmp byte [r15 + wm_drag_surf_valid - kmain], 1
-    je .paste_surface_mode
     call wm_render_intersecting
-    jmp .render_done
-.paste_surface_mode:
-    call wm_render_intersecting_under
-    call wm_paste_drag_surface
 .render_done:
 
     ; Step 5: Flip only dirty rect to VRAM LFB (~3-5 ms)
@@ -1180,358 +1177,6 @@ wm_render_intersecting:
 .intersect_done:
     add rsp, 32
     pop r13
-    pop r12
-    pop r11
-    pop r10
-    pop r9
-    pop r8
-    pop rdi
-    pop rsi
-    pop rdx
-    pop rcx
-    pop rbx
-    pop rax
-    ret
-
-; ==============================================================================
-; wm_render_intersecting_under: Render open windows beneath wm_drag_app
-; ==============================================================================
-wm_render_intersecting_under:
-    push rax
-    push rbx
-    push rcx
-    push rdx
-    push rsi
-    push rdi
-    push r8
-    push r9
-    push r10
-    push r11
-    push r12
-    push r13
-    sub rsp, 32                       ; local variables frame
-
-    mov [rsp + 0], r8d
-    mov [rsp + 4], r9d
-    mov eax, r8d
-    add eax, r10d
-    mov [rsp + 8], eax                ; X_max
-    mov edx, r9d
-    add edx, r11d
-    mov [rsp + 12], edx               ; Y_max
-
-    xor r12d, r12d                    ; z index 0..open_count-1
-.u_check_win_loop:
-    cmp r12b, [r15 + wm_open_count - kmain]
-    jae .u_intersect_done
-
-    movzx ebx, byte [r15 + wm_z_order - kmain + r12] ; app_id
-
-    ; Skip the dragging window itself (it will be pasted on top from cache)
-    cmp bl, [r15 + wm_drag_app - kmain]
-    je .u_skip_this_win
-
-    ; Load window bounds + shadow margin 18
-    mov eax, [r15 + wm_x - kmain + rbx*4]
-    sub eax, 18                       ; wx1
-    jns .u_wx1_pos
-    xor eax, eax
-.u_wx1_pos:
-    mov ecx, [r15 + wm_x - kmain + rbx*4]
-    add ecx, [r15 + wm_w - kmain + rbx*4]
-    add ecx, 18                       ; wx2
-
-    mov edx, [r15 + wm_y - kmain + rbx*4]
-    sub edx, 18                       ; wy1
-    jns .u_wy1_pos
-    xor edx, edx
-.u_wy1_pos:
-    mov esi, [r15 + wm_y - kmain + rbx*4]
-    add esi, [r15 + wm_h - kmain + rbx*4]
-    add esi, 18                       ; wy2
-
-    ; Intersection test:
-    cmp ecx, [rsp + 0]                ; wx2 <= X_min ?
-    jbe .u_skip_this_win
-    cmp eax, [rsp + 8]                ; wx1 >= X_max ?
-    jae .u_skip_this_win
-    cmp esi, [rsp + 4]                ; wy2 <= Y_min ?
-    jbe .u_skip_this_win
-    cmp edx, [rsp + 12]               ; wy1 >= Y_max ?
-    jae .u_skip_this_win
-
-    ; Window intersects! Render it.
-    xor eax, eax                      ; unfocused
-    call wm_render_window
-
-.u_skip_this_win:
-    inc r12d
-    jmp .u_check_win_loop
-
-.u_intersect_done:
-    add rsp, 32
-    pop r13
-    pop r12
-    pop r11
-    pop r10
-    pop r9
-    pop r8
-    pop rdi
-    pop rsi
-    pop rdx
-    pop rcx
-    pop rbx
-    pop rax
-    ret
-
-; ==============================================================================
-; wm_capture_drag_surface: Pre-render active window into R2D_WIN_CACHE (0x03000000)
-; ==============================================================================
-wm_capture_drag_surface:
-    push rax
-    push rbx
-    push rcx
-    push rdx
-    push rsi
-    push rdi
-    push r8
-    push r9
-    push r10
-    push r11
-    push r12
-
-    movzx ebx, byte [r15 + wm_drag_app - kmain]
-    cmp ebx, APP_COUNT
-    jae .cap_done
-
-    ; Load window geometry
-    mov r8d, [r15 + wm_x - kmain + rbx*4]       ; wx
-    mov r9d, [r15 + wm_y - kmain + rbx*4]       ; wy
-    mov r10d, [r15 + wm_w - kmain + rbx*4]      ; ww
-    mov r11d, [r15 + wm_h - kmain + rbx*4]      ; wh
-
-    ; Surface origin: x0 = wx - 18, y0 = wy - 18
-    mov ecx, r8d
-    sub ecx, 18
-    jns @f
-    xor ecx, ecx
-@@:
-    mov edx, r9d
-    sub edx, 18
-    jns @f
-    xor edx, edx
-@@:
-    and ecx, not 1                              ; align even
-
-    mov esi, r10d
-    add esi, 36
-    test esi, 1
-    jz @f
-    inc esi
-@@:
-    mov edi, r11d
-    add edi, 36
-
-    ; Clamp to screen
-    cmp ecx, R2D_SCREEN_W
-    jae .cap_done
-    cmp edx, R2D_SCREEN_H
-    jae .cap_done
-
-    mov eax, ecx
-    add eax, esi
-    cmp eax, R2D_SCREEN_W
-    jbe @f
-    mov esi, R2D_SCREEN_W
-    sub esi, ecx
-@@:
-    mov eax, edx
-    add eax, edi
-    cmp eax, R2D_SCREEN_H
-    jbe @f
-    mov edi, R2D_SCREEN_H
-    sub edi, edx
-@@:
-
-    test esi, esi
-    jle .cap_done
-    test edi, edi
-    jle .cap_done
-
-    ; Store surface geometry and origins cleanly in memory
-    mov [r15 + wm_drag_surf_x0 - kmain], ecx
-    mov [r15 + wm_drag_surf_y0 - kmain], edx
-    mov [r15 + wm_drag_surf_w - kmain], esi
-    mov [r15 + wm_drag_surf_h - kmain], edi
-
-    ; Offsets from wx, wy to surface top-left
-    mov eax, r8d
-    sub eax, ecx
-    mov [r15 + wm_drag_surf_off_x - kmain], eax
-    mov eax, r9d
-    sub eax, edx
-    mov [r15 + wm_drag_surf_off_y - kmain], eax
-
-    ; Render window cleanly once to backbuffer
-    mov eax, 1                                  ; is_focused = 1
-    call wm_render_window
-
-    ; Reload surface geometry explicitly from memory
-    mov ecx, [r15 + wm_drag_surf_x0 - kmain]
-    mov edx, [r15 + wm_drag_surf_y0 - kmain]
-    mov esi, [r15 + wm_drag_surf_w - kmain]
-    mov r11d, [r15 + wm_drag_surf_h - kmain]
-
-    test esi, esi
-    jle .cap_done
-    test r11d, r11d
-    jle .cap_done
-
-    mov r12d, esi
-    shr r12d, 1                                 ; qwords per row
-    test r12d, r12d
-    jz .cap_done
-
-    xor ebx, ebx                                ; row = 0..r11d-1
-.cap_row:
-    cmp ebx, r11d
-    jge .cap_finish
-
-    mov eax, edx
-    add eax, ebx
-    imul eax, R2D_PITCH
-    lea rsi, [rax + R2D_BACKBUFFER]
-    mov ecx, [r15 + wm_drag_surf_x0 - kmain]
-    lea rsi, [rsi + rcx*4]                      ; src backbuffer ptr
-
-    mov eax, [r15 + wm_drag_surf_w - kmain]
-    imul eax, ebx
-    shl rax, 2
-    lea rdi, [rax + R2D_WIN_CACHE]              ; dst win_cache ptr
-
-    mov ecx, r12d
-    cld
-    rep movsq
-
-    inc ebx
-    jmp .cap_row
-
-.cap_finish:
-    mov byte [r15 + wm_drag_surf_valid - kmain], 1
-
-.cap_done:
-    pop r12
-    pop r11
-    pop r10
-    pop r9
-    pop r8
-    pop rdi
-    pop rsi
-    pop rdx
-    pop rcx
-    pop rbx
-    pop rax
-    ret
-
-; ==============================================================================
-; wm_paste_drag_surface: Ultra-fast 40-microsecond blit from R2D_WIN_CACHE
-; ==============================================================================
-wm_paste_drag_surface:
-    push rax
-    push rbx
-    push rcx
-    push rdx
-    push rsi
-    push rdi
-    push r8
-    push r9
-    push r10
-    push r11
-    push r12
-
-    cmp byte [r15 + wm_drag_surf_valid - kmain], 1
-    jne .paste_done
-
-    movzx ebx, byte [r15 + wm_drag_app - kmain]
-    cmp ebx, APP_COUNT
-    jae .paste_done
-
-    ; Target surface origin on backbuffer:
-    ; x_dst = wm_x - off_x
-    ; y_dst = wm_y - off_y
-    mov r8d, [r15 + wm_x - kmain + rbx*4]
-    sub r8d, [r15 + wm_drag_surf_off_x - kmain]
-    test r8d, r8d
-    jns @f
-    xor r8d, r8d
-@@:
-    and r8d, not 1                              ; align even
-
-    mov r9d, [r15 + wm_y - kmain + rbx*4]
-    sub r9d, [r15 + wm_drag_surf_off_y - kmain]
-    test r9d, r9d
-    jns @f
-    xor r9d, r9d
-@@:
-
-    mov r10d, [r15 + wm_drag_surf_w - kmain]
-    mov r11d, [r15 + wm_drag_surf_h - kmain]
-
-    ; Check bounds
-    cmp r8d, R2D_SCREEN_W
-    jae .paste_done
-    cmp r9d, R2D_SCREEN_H
-    jae .paste_done
-
-    mov eax, r8d
-    add eax, r10d
-    cmp eax, R2D_SCREEN_W
-    jbe @f
-    mov r10d, R2D_SCREEN_W
-    sub r10d, r8d
-@@:
-    mov eax, r9d
-    add eax, r11d
-    cmp eax, R2D_SCREEN_H
-    jbe @f
-    mov r11d, R2D_SCREEN_H
-    sub r11d, r9d
-@@:
-
-    test r10d, r10d
-    jle .paste_done
-    test r11d, r11d
-    jle .paste_done
-
-    mov r12d, r10d
-    shr r12d, 1                                 ; qwords per row
-    test r12d, r12d
-    jz .paste_done
-
-    xor ebx, ebx                                ; row = 0..r11d-1
-.p_row:
-    cmp ebx, r11d
-    jae .paste_done
-
-    mov eax, r9d
-    add eax, ebx
-    imul eax, R2D_PITCH
-    lea rdi, [rax + R2D_BACKBUFFER]
-    lea rdi, [rdi + r8*4]                       ; dest backbuffer ptr
-
-    mov eax, [r15 + wm_drag_surf_w - kmain]
-    imul eax, ebx
-    shl rax, 2
-    lea rsi, [rax + R2D_WIN_CACHE]              ; src win_cache ptr
-
-    mov ecx, r12d
-    cld
-    rep movsq
-
-    inc ebx
-    jmp .p_row
-
-.paste_done:
     pop r12
     pop r11
     pop r10

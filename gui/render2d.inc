@@ -6,7 +6,6 @@
 
 R2D_BACKBUFFER       = 0x02000000       ; 8 MB backbuffer (identity-mapped, reserved in PMM)
 R2D_WALLPAPER_CACHE  = 0x02800000       ; 8 MB cached TrueColor wallpaper
-R2D_WIN_CACHE        = 0x03000000       ; 8 MB cached active window drag surface
 R2D_SCREEN_W         = 1920
 R2D_SCREEN_H         = 1080
 R2D_PITCH            = 7680             ; 1920 dwords per scanline
