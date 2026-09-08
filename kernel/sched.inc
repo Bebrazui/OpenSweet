@@ -550,6 +550,7 @@ isr_yield:
     push r13
     push r14
     push r15
+    mov r15, 0xFFFF800000010000 ; Establish kernel image base in R15
 
     ; Save current task RSP and FPU/SSE state
     mov eax, [r15 + sched_curr_task - kmain]

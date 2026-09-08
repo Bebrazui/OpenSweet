@@ -45,13 +45,21 @@ syscall_init:
 
     ; 2. Configure IA32_STAR (0xC0000081):
     ; [47:32] = Kernel CS selector for SYSCALL (0x08). Kernel SS will be 0x08 + 8 = 0x10.
-    ; [63:48] = User CS/SS base for SYSRET (0x18).
-    ; In 64-bit mode (sysretq):
-    ; User SS = (0x18 + 8)  | 3 = 0x23 (USER_DATA_SEL)
-    ; User CS = (0x18 + 16) | 3 = 0x2B (USER_CODE_SEL)
+    ; [63:48] = User CS/SS base for SYSRET (0x1B).
+    ; NOTE: AMD and Intel handle STAR[63:48] differently on SYSRET:
+    ; Intel forces RPL=3 into CS and SS:
+    ;   CS = (STAR[63:48] + 16) | 3
+    ;   SS = (STAR[63:48] + 8)  | 3
+    ; But AMD does NOT force RPL=3 into SS! It computes:
+    ;   CS = (STAR[63:48] + 16) with RPL forced to 3
+    ;   SS = STAR[63:48] + 8    (NO RPL force! Exact addition!)
+    ; Therefore, STAR[63:48] MUST be set to 0x001B (0x18 | 3)!
+    ; With 0x001B:
+    ;   SS = 0x001B + 8  = 0x0023 (USER_DATA_SEL | 3) - valid RPL=3 on AMD and Intel!
+    ;   CS = 0x001B + 16 = 0x002B (USER_CODE_SEL | 3) - valid RPL=3 on AMD and Intel!
     mov ecx, 0xC0000081
     xor eax, eax
-    mov edx, (0x0018 shl 16) or 0x0008
+    mov edx, (0x001B shl 16) or 0x0008
     wrmsr
 
     ; 3. Configure IA32_LSTAR (0xC0000082):

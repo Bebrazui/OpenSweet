@@ -1609,6 +1609,7 @@ common_irq:
     push r13
     push r14
     push r15                  ; all 15 GPRs now on stack
+    mov r15, 0xFFFF800000010000 ; Establish kernel image base in R15
     mov r12, rax              ; save vector in r12
 
     ; always ack BOTH controllers - covers PIC, LAPIC-EXTINT and LAPIC paths
@@ -2077,6 +2078,7 @@ common_ex:
     push r13
     push r14
     push r15
+    mov r15, 0xFFFF800000010000 ; Establish kernel image base in R15
 
     mov rsi, exc_msg
     call puts
