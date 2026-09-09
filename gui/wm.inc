@@ -1468,7 +1468,15 @@ wm_create_user_window:
     test rdi, rdi
     jz .default_title
 
+    ; Validate user title pointer (< 0x0000800000000000)
+    push rdi
+    mov rsi, 64
+    call sys_validate_user_ptr
+    pop rdi
+    jc .default_title
+
     ; Copy from user string at rdi
+
     mov rsi, rdi
     mov rdi, r13
     mov ecx, 63
@@ -1569,6 +1577,16 @@ wm_poll_user_event:
     jae .pue_err
     test rsi, rsi
     jz .pue_err
+
+    ; Validate 16-byte user buffer
+    push rdi
+    push rsi
+    mov rdi, rsi
+    mov esi, 16
+    call sys_validate_user_ptr
+    pop rsi
+    pop rdi
+    jc .pue_err
 
     mov eax, edi
     sub eax, 4

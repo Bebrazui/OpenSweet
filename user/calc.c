@@ -225,8 +225,8 @@ static void handle_button_action(int btn_id) {
 int main(void) {
     os_print("[calc.elf] Launching C Desktop Calculator in Ring 3...\n");
 
-    /* Create 320x420 desktop window centered */
-    os_window_t win = os_create_window("Calculator", 400, 180, WIN_W, WIN_H);
+    /* Create 320x420 desktop window */
+    os_window_t win = os_create_window("Calculator", 820, 140, WIN_W, WIN_H);
     if (win.win_id < 0) {
         os_print("[calc.elf] Failed to create calculator window!\n");
         return 1;

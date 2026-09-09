@@ -25,7 +25,7 @@ PMM_BITMAP   = 0x98000            ; 8KB bitmap @ 0x98000..0x99FFF (safe from ker
 BITMAP_BITS  = 65536              ; 256MB / 4KB
 BITMAP_DWORDS = BITMAP_BITS / 32
 BITMAP_BYTES = BITMAP_BITS / 8
-RESERVE_PAGES = 0x100             ; first 1MB (BIOS, kernel image, page tables, stacks)
+RESERVE_PAGES = 0x8000             ; 128MB permanently reserved (kernel, stacks, task page tables, canvases, GUI backbuffer, 7 tasks)
 
 ; --- VMM test target ---
 TEST_VIRT    = 0x6000000000
@@ -560,19 +560,37 @@ kmain:
     lea rsi, [r15 + str_launch_ring3 - kmain]
     call puts
 
-    ; 1. Copy user binary to 0x400000 (User space memory)
+    ; 1. Allocate a free user task slot with private page tables
+    call task_alloc_user_slot
+    cmp eax, -1
+    je .ring3_failed
+
+    mov ebx, eax                      ; ebx = slot ID (1..7)
+    ; r9 = phys_code, r10 = phys_stack
+
+    ; Zero out private physical code (2MB) and stack (2MB)
+    push rdi
+    mov rdi, r9
+    mov ecx, (2 * 1024 * 1024) / 8
+    xor eax, eax
+    rep stosq
+    mov rdi, r10
+    mov ecx, (2 * 1024 * 1024) / 8
+    xor eax, eax
+    rep stosq
+    pop rdi
+
+    ; Copy user binary to task's private physical code page
     lea rsi, [r15 + user_app_bin - kmain]
-    mov rdi, 0x400000
+    mov rdi, r9
     mov ecx, (USER_APP_BIN_SIZE + 7) / 8
     rep movsq
 
-    ; 2. Create and launch Ring 3 user task
+    ; 2. Finalize and launch Ring 3 user task
     lea rsi, [r15 + str_name_user - kmain]
     mov rdx, 0x400000                 ; User RIP entry
     mov r8,  0x7FFF00                 ; User RSP stack
-    call task_create_user
-    cmp eax, -1
-    je .ring3_failed
+    call task_finalize_user
 
     lea rsi, [r15 + str_ring3_ok - kmain]
     call puts
@@ -1930,7 +1948,7 @@ pmm_init:
     jnz .range
 
 .head:
-    ; re-reserve low pages [0, RESERVE_PAGES)
+    ; re-reserve low + page tables + GUI + user tasks [0, RESERVE_PAGES) (128MB)
     mov ecx, RESERVE_PAGES
 .setr:
     lea eax, [ecx-1]
@@ -1939,21 +1957,11 @@ pmm_init:
     and eax, 31
     bts dword [r14 + PMM_BITMAP + r8*4], eax
     loop .setr
-
-    ; re-reserve GUI/wallpaper/PNG pages [0x2000, 0x5000) (48MB @ 0x02000000)
-    mov ecx, 12288
-.set_bb:
-    lea eax, [ecx + 0x1FFF]
-    mov r8, rax
-    shr r8, 5
-    and eax, 31
-    bts dword [r14 + PMM_BITMAP + r8*4], eax
-    loop .set_bb
     ret
 
 ; RAX = phys addr of free page (0 = OOM)
 pmm_alloc:
-    xor ebx, ebx
+    mov ebx, RESERVE_PAGES / 32
 .dw:
     mov eax, [r14 + PMM_BITMAP + rbx*4]
     not eax                   ; free bits set

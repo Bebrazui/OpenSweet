@@ -329,19 +329,67 @@ elf_load_exec:
     jmp .exec_fail
 
 .phdrs_bounds_ok:
-    ; 7. Iterate program headers and load PT_LOAD segments
-    xor ebx, ebx                      ; ebx = phdr index (0..r11d-1)
+    ; Preserve phdr info on stack across task slot allocation
+    push r9                           ; [rsp + 16] = phoff
+    push r10                          ; [rsp + 8]  = phentsize
+    push r11                          ; [rsp + 0]  = phnum
+
+    ; 7. Allocate user task slot with private page tables and memory
+    call task_alloc_user_slot
+    cmp eax, -1
+    jne .slot_ok
+
+    add rsp, 24
+    lea rsi, [r15 + str_elf_err_spawn - kmain]
+    call puts
+    mov eax, ELF_ERR_SPAWN_FAIL
+    jmp .exec_fail
+
+.slot_ok:
+    ; EBX = slot ID (1..MAX_TASKS-1)
+    ; R8  = pml4_phys
+    ; R9  = phys_code
+    ; R10 = phys_stack
+    ; Current stack has: [rsp+0]=phnum, [rsp+8]=phentsize, [rsp+16]=phoff
+    ; Push task slot info:
+    push rbx                          ; [rsp + 24] = slot ID
+    push r9                           ; [rsp + 16] = phys_code
+    push r10                          ; [rsp + 8]  = phys_stack
+    push qword [r12 + EHDR_OFF_ENTRY] ; [rsp + 0]  = saved entry point RIP
+
+    ; Stack layout:
+    ; [rsp + 0]  = entry RIP
+    ; [rsp + 8]  = phys_stack
+    ; [rsp + 16] = phys_code
+    ; [rsp + 24] = slot ID
+    ; [rsp + 32] = phnum
+    ; [rsp + 40] = phentsize
+    ; [rsp + 48] = phoff
+
+    ; Zero out private physical code (2MB) and stack (2MB)
+    mov rdi, [rsp + 16]               ; phys_code
+    mov ecx, (2 * 1024 * 1024) / 8
+    xor eax, eax
+    cld
+    rep stosq
+
+    mov rdi, [rsp + 8]                ; phys_stack
+    mov ecx, (2 * 1024 * 1024) / 8
+    xor eax, eax
+    rep stosq
+
+    ; 8. Iterate program headers and load PT_LOAD segments
+    xor ebx, ebx                      ; ebx = phdr index (0..phnum-1)
     xor ecx, ecx                      ; ecx = loaded segments counter
-    push r8                           ; [rsp] = saved entry point
 
 .phdr_loop:
-    cmp ebx, r11d
+    cmp ebx, [rsp + 32]               ; compare with phnum
     jae .phdrs_done
 
-    ; Calculate pointer to current phdr: r12 + r9 + ebx * r10
+    ; Calculate pointer to current phdr: r12 + phoff + ebx * phentsize
     mov rax, rbx
-    imul rax, r10
-    add rax, r9
+    imul rax, [rsp + 40]              ; phentsize
+    add rax, [rsp + 48]               ; phoff
     lea rdx, [r12 + rax]              ; rdx = phdr ptr
 
     ; Check if PT_LOAD (type == 1)
@@ -359,7 +407,11 @@ elf_load_exec:
     cmp rbp, r13
     ja .next_phdr
 
-    ; Copy segment data from file buffer to destination virtual address
+    ; Map virtual address (0x400000..) to slot's private physical code memory
+    sub rdi, 0x400000
+    add rdi, [rsp + 16]               ; [rsp + 16] = phys_code
+
+    ; Copy segment data from file buffer to destination physical address
     test rax, rax
     jz .check_bss
 
@@ -380,7 +432,7 @@ elf_load_exec:
 
     push rcx
     push rdi
-    lea rdi, [rdi + rax]              ; start of BSS
+    lea rdi, [rdi + rax]              ; start of BSS in destination
     mov rcx, r8
     sub rcx, rax                      ; BSS size
     xor eax, eax
@@ -389,16 +441,19 @@ elf_load_exec:
     pop rcx
 
 .seg_loaded:
-    pop r8                            ; restore entry point
     inc ecx                           ; loaded_count++
-    push r8
 
 .next_phdr:
     inc ebx
     jmp .phdr_loop
 
 .phdrs_done:
-    pop r8                            ; r8 = entry point
+    pop r8                            ; r8  = saved entry point RIP
+    pop r10                           ; r10 = phys_stack
+    pop r9                            ; r9  = phys_code
+    pop rbx                           ; rbx = slot ID
+    add rsp, 24                       ; discard phnum, phentsize, phoff
+
     test ecx, ecx
     jnz @f
     mov eax, ELF_ERR_NO_LOAD
@@ -406,26 +461,33 @@ elf_load_exec:
     call puts
     jmp .exec_fail
 @@:
-    mov ebx, ecx                      ; ebx = loaded count
+    mov edx, ecx                      ; edx = loaded count
 
     ; Print diagnostic info
+    push rbx
+    push r8
+    push r10
     lea rsi, [r15 + str_elf_entry_log - kmain]
     call puts
-    mov rax, r8
+    mov rax, [rsp + 8]                ; r8 = entry point
     call puthex64
     lea rsi, [r15 + str_elf_segs_log - kmain]
     call puts
-    mov eax, ebx
+    mov eax, edx
     call putdec64
     lea rsi, [r15 + str_elf_nl - kmain]
     call puts
+    pop r10
+    pop r8
+    pop rbx
 
-    ; 8. Setup AMD64 System V ABI User Stack at 0x7FFF00
-    ; 0x7FFF80: Store process name string
+    ; 9. Setup AMD64 System V ABI User Stack at virtual 0x7FFF00
+    ; Physical address = phys_stack + 0x1FFF00
+    ; Store process name string at physical phys_stack + 0x1FFF80 (virtual 0x7FFF80)
     push rdi
     push rsi
     mov rsi, r14                      ; process name
-    mov rdi, 0x7FFF80
+    lea rdi, [r10 + 0x1FFF80]
     xor ecx, ecx
 .copy_arg_name:
     lodsb
@@ -440,25 +502,26 @@ elf_load_exec:
     pop rsi
     pop rdi
 
-    ; Stack layout at 0x7FFF00:
-    ; [0x7FFF00] = 1 (argc)
-    ; [0x7FFF08] = 0x7FFF80 (argv[0])
-    ; [0x7FFF10] = 0 (argv[1] = NULL)
-    ; [0x7FFF18] = 0 (envp[0] = NULL)
-    mov rdi, 0x7FFF00
+    ; Stack layout at phys_stack + 0x1FFF00 (virtual 0x7FFF00):
+    ; [0x00] = 1 (argc)
+    ; [0x08] = 0x7FFF80 (argv[0] - user virtual address)
+    ; [0x10] = 0 (argv[1] = NULL)
+    ; [0x18] = 0 (envp[0] = NULL)
+    lea rdi, [r10 + 0x1FFF00]
     mov qword [rdi + 0x00], 1
     mov qword [rdi + 0x08], 0x7FFF80
     mov qword [rdi + 0x10], 0
     mov qword [rdi + 0x18], 0
 
-    ; 9. Spawn Ring 3 User Task!
+    ; 10. Finalize Ring 3 User Task!
+    ; EBX = slot ID
     ; RSI = process name (r14)
     ; RDX = entry point (r8)
     ; R8  = user stack top (0x7FFF00)
     mov rsi, r14
     mov rdx, r8                       ; entry RIP
     mov r8,  0x7FFF00                 ; user RSP
-    call task_create_user
+    call task_finalize_user
     cmp eax, -1
     jne .spawn_ok
 
@@ -466,6 +529,7 @@ elf_load_exec:
     call puts
     mov eax, ELF_ERR_SPAWN_FAIL
     jmp .exec_fail
+
 
 .spawn_ok:
     ; Print success

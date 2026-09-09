@@ -225,9 +225,32 @@ syscall_entry:
     sysretq
 
 ; ==============================================================================
+; sys_validate_user_ptr: Validate user pointer and range
+; RDI = user buffer address
+; RSI = buffer size in bytes
+; Returns: CF = 0 if valid user space (< 0x0000800000000000), CF = 1 if invalid
+; Preserves all registers except RAX
+; ==============================================================================
+sys_validate_user_ptr:
+    test rdi, rdi
+    jz .invalid
+    test rsi, rsi
+    jz .invalid
+    mov rax, rdi
+    add rax, rsi
+    jc .invalid                       ; 64-bit integer overflow
+    shr rax, 47
+    jnz .invalid                      ; address >= 0x0000800000000000
+    clc
+    ret
+.invalid:
+    stc
+    ret
+
+; ==============================================================================
 ; sys_handler_write: Write bytes from user buffer to console & terminal
 ; RSI = buffer, RDX = count
-; Returns: RAX = count written
+; Returns: RAX = count written (or -1 on invalid pointer)
 ; ==============================================================================
 sys_handler_write:
     push rbx
@@ -242,7 +265,17 @@ sys_handler_write:
     jbe @f
     mov rdx, 65536
 @@:
-    mov rbx, rdx                      ; count
+    ; Validate user pointer
+    mov rdi, rsi
+    mov rsi, rdx
+    call sys_validate_user_ptr
+    jc .sw_err
+
+    mov rsi, rdi                      ; restore rsi = user buffer
+    mov rbx, [rsp + 16]               ; restore rbx = original count from saved rdx on stack
+    cmp rbx, 65536
+    jbe .sw_loop
+    mov rbx, 65536
 .sw_loop:
     test rbx, rbx
     jz .sw_done
@@ -260,10 +293,19 @@ sys_handler_write:
     pop rbx
     ret
 
+.sw_err:
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    mov rax, -1
+    ret
+
 ; ==============================================================================
 ; sys_handler_read: Read available keyboard characters into user buffer
 ; RSI = buffer, RDX = max count
-; Returns: RAX = count read
+; Returns: RAX = count read (or -1 on invalid pointer)
 ; ==============================================================================
 sys_handler_read:
     push rbx
@@ -271,9 +313,24 @@ sys_handler_read:
     push rdx
     push rdi
 
-    mov rbx, rdx
-    xor ecx, ecx
+    test rdx, rdx
+    jz .sr_done
+    cmp rdx, 65536
+    jbe @f
+    mov rdx, 65536
+@@:
+    ; Validate user pointer
     mov rdi, rsi
+    mov rsi, rdx
+    call sys_validate_user_ptr
+    jc .sr_err
+
+    mov rbx, [rsp + 8]                ; restore rbx = max count from saved rdx on stack
+    cmp rbx, 65536
+    jbe @f
+    mov rbx, 65536
+@@:
+    xor ecx, ecx
 .sr_loop:
     cmp rcx, rbx
     jae .sr_done
@@ -291,3 +348,12 @@ sys_handler_read:
     pop rcx
     pop rbx
     ret
+
+.sr_err:
+    pop rdi
+    pop rdx
+    pop rcx
+    pop rbx
+    mov rax, -1
+    ret
+

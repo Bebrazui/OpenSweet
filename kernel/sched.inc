@@ -13,7 +13,11 @@ TASK_RUNNING    = 2
 TASK_SLEEPING   = 3
 TASK_DEAD       = 4
 
-; TCB offsets (576 bytes per TCB)
+USER_PAGE_TABLES_BASE = 0x00200000    ; 2MB: Physical base for per-process page tables (96KB for 8 slots)
+USER_PHYS_BASE        = 0x05000000    ; 80MB: Physical base for per-process code/stack (28MB for 7 slots)
+USER_MEM_STRIDE       = 0x00400000    ; 4MB physical stride per task slot (2MB code + 2MB stack)
+
+; TCB offsets (592 bytes per TCB, 16-byte aligned)
 TCB_RSP         = 0x00                ; uint64: Saved stack pointer
 TCB_STATE       = 0x08                ; uint32: TASK_* state
 TCB_ID          = 0x0C                ; uint32: Task ID
@@ -23,10 +27,11 @@ TCB_TICKS       = 0x18                ; uint64: Total CPU ticks accumulated
 TCB_STACK_BASE  = 0x20                ; uint64: Bottom of stack memory
 TCB_STACK_TOP   = 0x28                ; uint64: Top of stack memory
 TCB_NAME        = 0x30                ; 8 bytes: ASCIIZ task name
-TCB_USER_RSP    = 0x38                ; uint64: Saved user RSP for Ring 3 task
-TCB_IS_USER     = 0x3C                ; uint32: 1 if Ring 3 user task, 0 if kernel
-TCB_FXSAVE      = 0x40                ; 512 bytes: 16-byte aligned FXSAVE/FXRSTOR area (FPU/MMX/SSE XMM0..15)
-TCB_SIZE        = 576                 ; 0x40 + 512 = 576 bytes (multiple of 16, aligns each task)
+TCB_CR3         = 0x38                ; uint64: CR3 page directory base (phys)
+TCB_USER_RSP    = 0x40                ; uint64: Saved user RSP for Ring 3 task
+TCB_IS_USER     = 0x48                ; uint32: 1 if Ring 3 user task, 0 if kernel
+TCB_FXSAVE      = 0x50                ; 512 bytes: 16-byte aligned FXSAVE/FXRSTOR area
+TCB_SIZE        = 592                 ; 0x50 + 512 = 592 bytes (multiple of 16)
 
 TASK_STACK_SIZE = 8192                ; 8 KB stack per task
 
@@ -79,10 +84,16 @@ sched_init:
     mov dword [rbx + TCB_SLEEP], 0
     mov dword [rbx + TCB_SLICE], SCHED_QUANTUM
     mov qword [rbx + TCB_TICKS], 0
+    mov qword [rbx + TCB_CR3], 0x1000  ; Task 0 uses boot kernel PML4
+    mov dword [rbx + TCB_IS_USER], 0
 
     ; Stack 0 uses initial boot stack 0x90000
     mov qword [rbx + TCB_STACK_BASE], 0x80000
     mov qword [rbx + TCB_STACK_TOP],  0x90000
+
+    ; Initialize syscall stack to Task 0's stack top
+    mov rax, 0x90000
+    mov [r15 + sys_kernel_stack - kmain], rax
 
     ; Initialize FPU/SSE state for Task 0
     fxsave [rbx + TCB_FXSAVE]
@@ -243,17 +254,186 @@ task_create:
     ret
 
 ; ==============================================================================
-; task_create_user: Create a new Ring 3 user task
-; RSI = name string (ASCIIZ)
-; RDX = user RIP entry point (e.g. 0x400000)
-; R8  = user RSP initial stack top (e.g. 0x7FFF00)
-; Returns: EAX = task ID (or -1 on error)
+; task_setup_pagetables: Initialize dedicated 4-level PML4/PDPT/PD for task slot EBX
+; EBX = slot ID (1..MAX_TASKS-1)
+; Returns: RAX = PML4 physical address
 ; ==============================================================================
-task_create_user:
+task_setup_pagetables:
     push rbx
     push rcx
     push rdi
     push rsi
+    push r8
+    push r9
+    push r10
+
+    ; Physical addresses:
+    ; PML4 = USER_PAGE_TABLES_BASE + EBX * 12288
+    ; PDPT = PML4 + 4096
+    ; PD   = PDPT + 4096
+    mov eax, ebx
+    imul eax, 12288
+    add eax, USER_PAGE_TABLES_BASE
+    mov r8d, eax                      ; r8d = pml4_phys
+    lea r9d, [r8d + 4096]             ; r9d = pdpt_phys
+    lea r10d, [r9d + 4096]            ; r10d = pd_phys
+
+    ; Zero all 3 tables (12288 bytes = 3072 dwords)
+    mov edi, r8d
+    mov ecx, 12288 / 4
+    xor eax, eax
+    cld
+    rep stosd
+
+    ; 1. PML4:
+    ; PML4[0] -> PDPT (flags 0x07 = Present | Writable | User)
+    mov eax, r9d
+    or eax, 0x07
+    mov [r8], rax
+
+    ; PML4[256] -> higher-half kernel PDPT (0x4001: PDPT_B @ 0x4000)
+    mov dword [r8 + 0x800], 0x4001
+
+    ; 2. PDPT:
+    ; PDPT[0] -> PD (flags 0x07 = Present | Writable | User)
+    mov eax, r10d
+    or eax, 0x07
+    mov [r9], rax
+
+    ; PDPT[1..3] -> identity maps for 1..4GB (LAPIC/VBE LFB)
+    mov dword [r9 + 0x08], 0x40000087
+    mov dword [r9 + 0x10], 0x80000087
+    mov dword [r9 + 0x18], 0xC0000087
+
+    ; 3. PD:
+    ; Fill all 512 entries with 2MB identity mapping (supervisor 0x83)
+    ; Ensures kernel in Ring 0 has full identity access to 0..1GB physical memory
+    mov edi, r10d
+    mov eax, 0x83                     ; phys 0, Present | Writable | Supervisor | Huge
+    xor ecx, ecx
+.fill_pd_loop:
+    mov [rdi + rcx*8], eax
+    mov dword [rdi + rcx*8 + 4], 0
+    add eax, 0x00200000
+    inc ecx
+    cmp ecx, 512
+    jb .fill_pd_loop
+
+    ; Customize user-accessible entries in PD:
+    ; Entry 2 (virtual 0x00400000..0x005FFFFF): User Code/Data/BSS
+    ; Map to slot's private physical code: USER_PHYS_BASE + (ebx - 1) * USER_MEM_STRIDE
+    lea eax, [ebx - 1]
+    imul eax, USER_MEM_STRIDE
+    add eax, USER_PHYS_BASE
+    or eax, 0x87                      ; Present | Writable | User | Huge
+    mov [r10 + 2*8], eax
+    mov dword [r10 + 2*8 + 4], 0
+
+    ; Entry 3 (virtual 0x00600000..0x007FFFFF): User Stack (0x7FFF00)
+    ; Map to slot's private physical stack: USER_PHYS_BASE + (ebx - 1) * USER_MEM_STRIDE + 0x00200000
+    lea eax, [ebx - 1]
+    imul eax, USER_MEM_STRIDE
+    add eax, USER_PHYS_BASE + 0x00200000
+    or eax, 0x87                      ; Present | Writable | User | Huge
+    mov [r10 + 3*8], eax
+    mov dword [r10 + 3*8 + 4], 0
+
+    ; Entries 4..7 (virtual 0x00800000..0x00E00000): Window Canvases (8MB..16MB)
+    ; Give user access (0x87) so user app can render to canvas
+    mov eax, 0x00800087
+    mov ecx, 4
+.map_canvas_loop:
+    mov [r10 + rcx*8], eax
+    mov dword [r10 + rcx*8 + 4], 0
+    add eax, 0x00200000
+    inc ecx
+    cmp ecx, 8
+    jb .map_canvas_loop
+
+    ; Return PML4 physical address in RAX
+    mov rax, r8
+
+    pop r10
+    pop r9
+    pop r8
+    pop rsi
+    pop rdi
+    pop rcx
+    pop rbx
+    ret
+
+; ==============================================================================
+; task_alloc_user_slot: Allocate an unused task slot and initialize its page tables
+; Returns:
+;   EAX = slot ID (1..MAX_TASKS-1), or -1 if no free slot
+;   RDI = pointer to TCB for this slot
+;   R8  = PML4 physical address (CR3)
+;   R9  = physical code base (2MB)
+;   R10 = physical stack base (2MB)
+; ==============================================================================
+task_alloc_user_slot:
+    push rcx
+    push rdx
+    push rsi
+
+    ; Find free slot (1..MAX_TASKS-1)
+    mov ebx, 1
+.find_slot:
+    cmp ebx, MAX_TASKS
+    jae .no_slot
+
+    imul eax, ebx, TCB_SIZE
+    lea rdi, [r15 + task_table - kmain + rax]
+    cmp dword [rdi + TCB_STATE], TASK_UNUSED
+    je .found
+    cmp dword [rdi + TCB_STATE], TASK_DEAD
+    je .found
+    inc ebx
+    jmp .find_slot
+
+.no_slot:
+    pop rsi
+    pop rdx
+    pop rcx
+    mov eax, -1
+    mov ebx, -1
+    ret
+
+.found:
+    ; Setup page tables for slot ebx
+    call task_setup_pagetables
+    ; RAX = PML4 physical address
+    mov r8, rax
+    mov [rdi + TCB_CR3], rax
+
+    ; Compute physical code and stack bases
+    lea eax, [ebx - 1]
+    imul eax, USER_MEM_STRIDE
+    add eax, USER_PHYS_BASE
+    mov r9d, eax                      ; r9  = phys_code
+    lea r10d, [r9d + 0x00200000]      ; r10 = phys_stack
+
+    mov eax, ebx                      ; return slot ID in EAX and EBX
+
+    pop rsi
+    pop rdx
+    pop rcx
+    ret
+
+; ==============================================================================
+; task_finalize_user: Finish setting up TCB and kernel stack for a Ring 3 user task
+; EBX = slot ID (1..MAX_TASKS-1)
+; RSI = name string (ASCIIZ)
+; RDX = user RIP entry point (e.g. 0x400000)
+; R8  = user RSP initial stack top (e.g. 0x7FFF00)
+; Returns: EAX = task ID
+; ==============================================================================
+task_finalize_user:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
     push r8
     push r9
     push r10
@@ -263,27 +443,9 @@ task_create_user:
     mov r10, rdx                      ; user RIP
     mov r11, r8                       ; user RSP
 
-    ; Find free TCB slot (1..MAX_TASKS-1)
-    mov ebx, 1
-.find_user_slot:
-    cmp ebx, MAX_TASKS
-    jae .create_user_fail
-
     imul eax, ebx, TCB_SIZE
     lea rdi, [r15 + task_table - kmain + rax]
-    cmp dword [rdi + TCB_STATE], TASK_UNUSED
-    je .user_slot_found
-    cmp dword [rdi + TCB_STATE], TASK_DEAD
-    je .user_slot_found
-    inc ebx
-    jmp .find_user_slot
 
-.create_user_fail:
-    mov eax, -1
-    jmp .create_user_done
-
-.user_slot_found:
-    ; RDI points to TCB for slot ebx
     mov dword [rdi + TCB_ID], ebx
     mov dword [rdi + TCB_SLEEP], 0
     mov dword [rdi + TCB_SLICE], SCHED_QUANTUM
@@ -296,27 +458,27 @@ task_create_user:
     push rdi
     lea rdi, [rdi + TCB_NAME]
     xor ecx, ecx
-.copy_user_name:
+.copy_name:
     lodsb
     stosb
     test al, al
-    jz .user_name_done
+    jz .name_done
     inc ecx
     cmp ecx, 7
-    jb .copy_user_name
+    jb .copy_name
     mov byte [rdi], 0
-.user_name_done:
+.name_done:
     pop rdi
     pop rsi
 
-    ; Setup private kernel stack for task ebx (for IRQs & TSS.RSP0)
+    ; Setup private kernel stack for task ebx (for IRQs, TSS.RSP0, and SYSCALL)
     imul eax, ebx, TASK_STACK_SIZE
     lea r8, [r15 + task_stacks - kmain + rax]
     mov [rdi + TCB_STACK_BASE], r8
     add r8, TASK_STACK_SIZE
     mov [rdi + TCB_STACK_TOP], r8
 
-    ; Initialize kernel stack frame for iretq transition to Ring 3!
+    ; Initialize kernel stack frame for iretq transition to Ring 3
     mov r9, r8
 
     ; Push SS (USER_DATA_SEL | 3 = 0x23)
@@ -344,11 +506,11 @@ task_create_user:
     push rdi
     lea rdi, [r9]
     xor eax, eax
-    mov ecx, 30                       ; 15 qwords = 30 dwords
+    mov ecx, 30
     rep stosd
     pop rdi
 
-    ; Saved RSP in TCB points to the top of the GPR frame
+    ; Saved RSP in TCB points to top of GPR frame
     mov [rdi + TCB_RSP], r9
 
     ; Initialize task FPU/SSE state from clean Task 0 state
@@ -367,17 +529,51 @@ task_create_user:
     mov dword [rdi + TCB_STATE], TASK_READY
     inc dword [r15 + sched_task_cnt - kmain]
 
-    mov eax, ebx
+    mov eax, ebx                      ; return TID
 
-.create_user_done:
     pop r12
     pop r11
     pop r10
     pop r9
     pop r8
-    pop rsi
     pop rdi
+    pop rsi
+    pop rdx
     pop rcx
+    pop rbx
+    ret
+
+; ==============================================================================
+; task_create_user: Legacy wrapper to create a Ring 3 user task
+; RSI = name string (ASCIIZ)
+; RDX = user RIP entry point (e.g. 0x400000)
+; R8  = user RSP initial stack top (e.g. 0x7FFF00)
+; Returns: EAX = task ID (or -1 on error)
+; ==============================================================================
+task_create_user:
+    push rbx
+    push r12
+    push r13
+    push r8
+    push r9
+    push r10
+
+    call task_alloc_user_slot
+    cmp eax, -1
+    je .tcu_fail
+
+    mov ebx, eax
+    call task_finalize_user
+    jmp .tcu_done
+
+.tcu_fail:
+    mov eax, -1
+.tcu_done:
+    pop r10
+    pop r9
+    pop r8
+    pop r13
+    pop r12
     pop rbx
     ret
 
@@ -517,9 +713,22 @@ sched_tick:
     mov dword [rdi + TCB_STATE], TASK_RUNNING
     mov dword [rdi + TCB_SLICE], SCHED_QUANTUM
 
-    ; Update TSS RSP0 to incoming task's kernel stack top
+    ; Update TSS RSP0 and sys_kernel_stack to incoming task's kernel stack top
     mov rax, [rdi + TCB_STACK_TOP]
     mov [r15 + tss64 + 4 - kmain], rax
+    mov [r15 + sys_kernel_stack - kmain], rax
+
+    ; Switch address space (CR3) if task has private page tables
+    mov rax, [rdi + TCB_CR3]
+    test rax, rax
+    jnz .tick_has_cr3
+    mov rax, 0x1000
+.tick_has_cr3:
+    mov rdx, cr3
+    cmp rax, rdx
+    je .tick_cr3_done
+    mov cr3, rax
+.tick_cr3_done:
 
     ; Restore incoming task's FPU/SSE context
     fxrstor [rdi + TCB_FXSAVE]
@@ -592,9 +801,22 @@ isr_yield:
     mov dword [rdi + TCB_STATE], TASK_RUNNING
     mov dword [rdi + TCB_SLICE], SCHED_QUANTUM
 
-    ; Update TSS RSP0 to incoming task's kernel stack top
+    ; Update TSS RSP0 and sys_kernel_stack to incoming task's kernel stack top
     mov rax, [rdi + TCB_STACK_TOP]
     mov [r15 + tss64 + 4 - kmain], rax
+    mov [r15 + sys_kernel_stack - kmain], rax
+
+    ; Switch address space (CR3) if task has private page tables
+    mov rax, [rdi + TCB_CR3]
+    test rax, rax
+    jnz .yield_has_cr3
+    mov rax, 0x1000
+.yield_has_cr3:
+    mov rdx, cr3
+    cmp rax, rdx
+    je .yield_cr3_done
+    mov cr3, rax
+.yield_cr3_done:
 
     ; Restore incoming task's FPU/SSE context
     fxrstor [rdi + TCB_FXSAVE]
