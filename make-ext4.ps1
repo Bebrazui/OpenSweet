@@ -154,6 +154,46 @@ if ($hasNote) {
     ExtentLeaf ($itable + 16 * 128) $noteStartBlock $noteBlocks $noteBytes.Length 0x81ED
 }
 
+$termSrc = Join-Path $PSScriptRoot "user\terminal.c"
+$termExe = Join-Path $PSScriptRoot "build\terminal.exe"
+$termElf = Join-Path $PSScriptRoot "build\terminal.elf"
+if (Test-Path $termSrc) {
+    & $gccPath "-B$(Split-Path $gccPath)" "-I$incDir" -mabi=sysv -nostdlib "-Wl,--image-base=0x400000" -O2 $crt0 $termSrc -o $termExe
+    if (Test-Path $termExe) {
+        & $objcopyPath -O elf64-x86-64 $termExe $termElf
+        Remove-Item $termExe -ErrorAction SilentlyContinue
+    }
+}
+$hasTerm = Test-Path $termElf
+$termBlocks = 0
+$termStartBlock = $noteStartBlock + $noteBlocks
+if ($hasTerm) {
+    $termBytes = [IO.File]::ReadAllBytes($termElf)
+    $termBlocks = [int][Math]::Ceiling($termBytes.Length / 1024.0)
+    # inode 18 = terminal.elf
+    ExtentLeaf ($itable + 17 * 128) $termStartBlock $termBlocks $termBytes.Length 0x81ED
+}
+
+$filesSrc = Join-Path $PSScriptRoot "user\files.c"
+$filesExe = Join-Path $PSScriptRoot "build\files.exe"
+$filesElf = Join-Path $PSScriptRoot "build\files.elf"
+if (Test-Path $filesSrc) {
+    & $gccPath "-B$(Split-Path $gccPath)" "-I$incDir" -mabi=sysv -nostdlib "-Wl,--image-base=0x400000" -O2 $crt0 $filesSrc -o $filesExe
+    if (Test-Path $filesExe) {
+        & $objcopyPath -O elf64-x86-64 $filesExe $filesElf
+        Remove-Item $filesExe -ErrorAction SilentlyContinue
+    }
+}
+$hasFiles = Test-Path $filesElf
+$filesBlocks = 0
+$filesStartBlock = $termStartBlock + $termBlocks
+if ($hasFiles) {
+    $filesBytes = [IO.File]::ReadAllBytes($filesElf)
+    $filesBlocks = [int][Math]::Ceiling($filesBytes.Length / 1024.0)
+    # inode 19 = files.elf
+    ExtentLeaf ($itable + 18 * 128) $filesStartBlock $filesBlocks $filesBytes.Length 0x81ED
+}
+
 # ---- root dir data @ block 20 ----
 $d = 20 * $BS
 function DirEntry([long]$off, [int]$ino, [string]$name, [byte]$type, [int]$reclen) {
@@ -183,12 +223,19 @@ if ($hasGui) {
     $curOff += 20
 }
 if ($hasCalc) {
-    $rec = if ($hasNote) { 20 } else { $d + 1024 - $curOff }
-    DirEntry $curOff 16 'calc.elf' 1 $rec
+    DirEntry $curOff 16 'calc.elf' 1 20
     $curOff += 20
 }
 if ($hasNote) {
-    DirEntry $curOff 17 'notepad.elf' 1 ($d + 1024 - $curOff)
+    DirEntry $curOff 17 'notepad.elf' 1 24
+    $curOff += 24
+}
+if ($hasTerm) {
+    DirEntry $curOff 18 'terminal.elf' 1 24
+    $curOff += 24
+}
+if ($hasFiles) {
+    DirEntry $curOff 19 'files.elf' 1 ($d + 1024 - $curOff)
 }
 
 # ---- file data ----
@@ -217,9 +264,17 @@ if ($hasNote) {
     Put ($noteStartBlock * $BS) $noteBytes
     echo "Added notepad.elf ($($noteBytes.Length) bytes, $noteBlocks blocks) to disk image"
 }
+if ($hasTerm) {
+    Put ($termStartBlock * $BS) $termBytes
+    echo "Added terminal.elf ($($termBytes.Length) bytes, $termBlocks blocks) to disk image"
+}
+if ($hasFiles) {
+    Put ($filesStartBlock * $BS) $filesBytes
+    echo "Added files.elf ($($filesBytes.Length) bytes, $filesBlocks blocks) to disk image"
+}
 
 # ---- populate block and inode bitmaps and free counts ----
-$totalAllocatedBlocks = $noteStartBlock + $noteBlocks
+$totalAllocatedBlocks = $filesStartBlock + $filesBlocks
 
 # Block bitmap at block 3 (mark blocks 0..totalAllocatedBlocks-1 as used)
 for ($b = 0; $b -lt $totalAllocatedBlocks; $b++) {
@@ -228,8 +283,8 @@ for ($b = 0; $b -lt $totalAllocatedBlocks; $b++) {
     $img[(3 * $BS) + $byteIdx] = $img[(3 * $BS) + $byteIdx] -bor (1 -shl $bitIdx)
 }
 
-# Inode bitmap at block 4 (inodes 1..17 are used)
-for ($ino = 1; $ino -le 17; $ino++) {
+# Inode bitmap at block 4 (inodes 1..19 are used)
+for ($ino = 1; $ino -le 19; $ino++) {
     $bit = $ino - 1
     $byteIdx = $bit -shr 3
     $bitIdx  = $bit -band 7
@@ -237,7 +292,7 @@ for ($ino = 1; $ino -le 17; $ino++) {
 }
 
 $freeBlocks = 16384 - $totalAllocatedBlocks
-$freeInodes = 64 - 17
+$freeInodes = 64 - 19
 
 PutU32 ($sb + 0x0C) $freeBlocks             # s_free_blocks_count_lo
 PutU32 ($sb + 0x10) $freeInodes             # s_free_inodes_count

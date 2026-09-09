@@ -151,7 +151,11 @@ kmain:
 
     mov eax, FB_CLR_DEFAULT
     call fb_console_set_color
-    jmp .prompt
+
+    ; Launch Native C Terminal in Ring 3 as the default desktop shell
+    lea rsi, [r15 + str_reg_term_path - kmain]
+    call elf_load_from_ext4
+    jmp .shell
 
 .shell:
     call md_handle_mouse

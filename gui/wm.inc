@@ -72,8 +72,8 @@ str_wm_rel_log    db "[WM] lmb_release", 10, 0
 wm_init:
     push rax
 
-    ; Set initial states
-    mov byte [r15 + wm_state - kmain + 0], 1     ; Term OPEN
+    ; Set initial states (all closed initially, terminal.elf launched dynamically)
+    mov byte [r15 + wm_state - kmain + 0], 0     ; Term CLOSED
     mov byte [r15 + wm_state - kmain + 1], 0     ; Files CLOSED
     mov byte [r15 + wm_state - kmain + 2], 0     ; Sys CLOSED
     mov byte [r15 + wm_state - kmain + 3], 0     ; Settings CLOSED
@@ -103,9 +103,8 @@ wm_init:
     mov dword [r15 + wm_w - kmain + 3*4], 560
     mov dword [r15 + wm_h - kmain + 3*4], 440
 
-    mov byte [r15 + wm_z_order - kmain + 0], APP_TERM
-    mov byte [r15 + wm_open_count - kmain], 1
-    mov byte [r15 + wm_focus_app - kmain], APP_TERM
+    mov byte [r15 + wm_open_count - kmain], 0
+    mov byte [r15 + wm_focus_app - kmain], 0xFF
     mov byte [r15 + wm_drag_app - kmain], 0xFF
     mov byte [r15 + wm_prev_lmb - kmain], 0
 

@@ -8,5 +8,6 @@ build/
 build/_kolibri_ext.inc
 
 # Local toolchain
-tools/
+tools/w64devkit/
+tools/*.exe
 

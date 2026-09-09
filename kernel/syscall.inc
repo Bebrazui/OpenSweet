@@ -15,6 +15,8 @@ SYS_GUI_POLL_EVENT = 12
 SYS_GUI_CLOSE_WIN  = 13
 SYS_APP_REGISTER   = 14
 SYS_APP_INFO       = 15
+SYS_LISTDIR        = 16
+SYS_SPAWN          = 17
 
 align 16
 sys_user_rsp       dq 0
@@ -145,6 +147,10 @@ syscall_entry:
     je .do_gui_close_win
     cmp eax, SYS_APP_REGISTER
     je .do_app_register
+    cmp eax, SYS_LISTDIR
+    je .do_listdir
+    cmp eax, SYS_SPAWN
+    je .do_spawn
 
     ; Unimplemented syscall
     mov rax, -1
@@ -208,6 +214,16 @@ syscall_entry:
 .do_app_register:
     ; RDI = user pointer to os_app_info_t, RSI = size
     call app_reg_install_from_user
+    jmp .syscall_ret
+
+.do_listdir:
+    ; RDI = user buffer (os_dirent_t*), RSI = max_entries
+    call sys_handler_listdir
+    jmp .syscall_ret
+
+.do_spawn:
+    ; RDI = user path pointer
+    call sys_handler_spawn
     jmp .syscall_ret
 
 .syscall_ret:
@@ -360,6 +376,270 @@ sys_handler_read:
 
 .sr_err:
     pop rdi
+    pop rdx
+    pop rcx
+    pop rbx
+    mov rax, -1
+    ret
+
+; ==============================================================================
+; sys_handler_listdir: Read ext4 root directory entries into user buffer
+; RDI = user buffer (os_dirent_t *), RSI = max_entries
+; Returns: RAX = number of entries read, or -1 on error
+; os_dirent_t layout (48 bytes):
+;   +0:  inode (uint32_t)
+;   +4:  type  (uint32_t) (1=file, 2=dir)
+;   +8:  size  (uint64_t)
+;   +16: name  (char[32])
+; ==============================================================================
+sys_handler_listdir:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+    push rbp
+    sub rsp, 32
+
+    mov r14, rdi                      ; r14 = user buffer
+    mov r13d, esi                     ; r13d = max_entries
+
+    test r14, r14
+    jz .ld_err
+    test r13d, r13d
+    jle .ld_err
+    cmp r13d, 64
+    jbe @f
+    mov r13d, 64
+@@:
+
+    ; Validate user buffer
+    mov rdi, r14
+    imul rsi, r13, 48
+    call sys_validate_user_ptr
+    jc .ld_err
+
+    ; Check if ext4 is mounted
+    cmp byte [r15 + ext4_ok - kmain], 1
+    jne .ld_err
+
+    ; Load root directory inode (2)
+    mov eax, 2
+    call ext4_inode_load
+    jc .ld_err
+
+    mov r12, qword [r15 + ext4_inode - kmain + IN_OFF_SIZE] ; dir size
+    xor ebp, ebp                      ; ebp = entries count returned
+    mov dword [r15 + e4t_lb - kmain], 0
+
+.ld_next_block:
+    mov eax, dword [r15 + e4t_lb - kmain]
+    mov ecx, dword [r15 + ext4_lbs - kmain]
+    add ecx, 10
+    shl rax, cl                       ; byte offset
+    cmp rax, r12
+    jae .ld_done
+
+    mov eax, dword [r15 + e4t_lb - kmain]
+    call ext4_map
+    cmp rax, -1
+    je .ld_done
+
+    ; Read directory block into ext4_bbuf
+    lea rsi, [r15 + ext4_bbuf - kmain]
+    call ext4_blk_read
+    jc .ld_done
+
+    lea r8, [r15 + ext4_bbuf - kmain]
+    mov ecx, dword [r15 + ext4_lbs - kmain]
+    mov edx, 1024
+    shl edx, cl
+    mov r9, r8
+    add r9, rdx                       ; block end
+
+.ld_parse_ent:
+    cmp r8, r9
+    jae .ld_block_done
+
+    mov eax, [r8]                     ; entry inode
+    test eax, eax
+    jz .ld_skip
+
+    movzx ecx, byte [r8 + 6]          ; name length
+    test ecx, ecx
+    jz .ld_skip
+
+    movzx ebx, byte [r8 + 7]          ; type: 1=file, 2=dir
+
+    ; Skip "."
+    cmp ecx, 1
+    jne @f
+    cmp byte [r8 + 8], '.'
+    je .ld_skip
+@@:
+    ; Skip ".."
+    cmp ecx, 2
+    jne @f
+    cmp word [r8 + 8], '..'
+    je .ld_skip
+@@:
+
+    ; Store entry into user buffer at r14
+    mov [r14 + 0], eax                ; inode
+    mov [r14 + 4], ebx                ; type
+
+    ; Copy name (up to 31 chars)
+    lea rsi, [r8 + 8]
+    lea rdi, [r14 + 16]
+    cmp ecx, 31
+    jbe @f
+    mov ecx, 31
+@@:
+    push rcx
+    rep movsb
+    mov byte [rdi], 0
+    pop rcx
+
+    ; Load file size for entry
+    mov eax, [r14 + 0]                ; file inode
+    push r8
+    push r9
+    call ext4_inode_load
+    jc .ld_sz_zero
+    mov rax, qword [r15 + ext4_inode - kmain + IN_OFF_SIZE]
+    mov [r14 + 8], rax
+    jmp .ld_sz_ok
+.ld_sz_zero:
+    mov qword [r14 + 8], 0
+.ld_sz_ok:
+    pop r9
+    pop r8
+
+    add r14, 48                       ; next dirent slot
+    inc ebp
+    cmp ebp, r13d
+    jae .ld_done
+
+.ld_skip:
+    movzx eax, word [r8 + 4]          ; rec_len
+    test eax, eax
+    jz .ld_block_done
+    add r8, rax
+    jmp .ld_parse_ent
+
+.ld_block_done:
+    inc dword [r15 + e4t_lb - kmain]
+    jmp .ld_next_block
+
+.ld_done:
+    mov eax, ebp
+    add rsp, 32
+    pop rbp
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+.ld_err:
+    add rsp, 32
+    pop rbp
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    mov rax, -1
+    ret
+
+; ==============================================================================
+; sys_handler_spawn: Spawn an ELF executable from ext4 storage in Ring 3
+; RDI = user path pointer (ASCIIZ, e.g. "/notepad.elf")
+; Returns: RAX = Task ID (or negative error code)
+; ==============================================================================
+sys_handler_spawn:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r12
+    push r13
+    push r14
+    push r15
+    sub rsp, 64
+
+    test rdi, rdi
+    jz .sp_err
+
+    ; Validate user pointer
+    mov rsi, 64
+    call sys_validate_user_ptr
+    jc .sp_err
+
+    ; Copy string into local kernel buffer on stack
+    mov rsi, rdi
+    lea rdi, [rsp]
+    mov ecx, 63
+.sp_cp:
+    lodsb
+    stosb
+    test al, al
+    jz .sp_cp_done
+    dec ecx
+    jnz .sp_cp
+    mov byte [rdi], 0
+.sp_cp_done:
+
+    ; Launch ELF executable into Ring 3
+    lea rsi, [rsp]
+    call elf_load_from_ext4
+
+    add rsp, 64
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+.sp_err:
+    add rsp, 64
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rdi
+    pop rsi
     pop rdx
     pop rcx
     pop rbx

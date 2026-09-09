@@ -36,11 +36,13 @@ str_reg_term_name db "Terminal", 0
 str_reg_term_ver  db "1.0.0", 0
 str_reg_term_auth db "OpenSweet Core", 0
 str_reg_term_desc db "Interactive Shell Terminal", 0
+str_reg_term_path db "/terminal.elf", 0
 
 str_reg_file_name db "Files", 0
 str_reg_file_ver  db "1.0.0", 0
 str_reg_file_auth db "OpenSweet Core", 0
 str_reg_file_desc db "ext4 File Explorer", 0
+str_reg_file_path db "/files.elf", 0
 
 str_reg_sys_name  db "Activity", 0
 str_reg_sys_ver   db "1.0.0", 0
@@ -93,6 +95,9 @@ app_reg_init:
     lea rsi, [r15 + str_reg_term_desc - kmain]
     lea rdx, [rdi + REG_APP_DESC]
     call .copy_str48
+    lea rsi, [r15 + str_reg_term_path - kmain]
+    lea rdx, [rdi + REG_APP_PATH]
+    call .copy_str32
     mov word [rdi + REG_APP_ICON_ID], 0
     lea rax, [r15 + icon_terminal_44x44 - kmain]
     mov [rdi + REG_APP_ICON_PTR], rax
@@ -113,6 +118,9 @@ app_reg_init:
     lea rsi, [r15 + str_reg_file_desc - kmain]
     lea rdx, [rdi + REG_APP_DESC]
     call .copy_str48
+    lea rsi, [r15 + str_reg_file_path - kmain]
+    lea rdx, [rdi + REG_APP_PATH]
+    call .copy_str32
     mov word [rdi + REG_APP_ICON_ID], 1
     lea rax, [r15 + icon_files_44x44 - kmain]
     mov [rdi + REG_APP_ICON_PTR], rax

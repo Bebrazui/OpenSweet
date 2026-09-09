@@ -47,6 +47,16 @@ typedef _Bool bool;
 #define SYS_GUI_CLOSE_WIN  13
 #define SYS_APP_REGISTER   14
 #define SYS_APP_INFO       15
+#define SYS_LISTDIR        16
+#define SYS_SPAWN          17
+
+/* File System Directory Entry Structure */
+typedef struct {
+    uint32_t inode;
+    uint32_t type;     /* 1 = file, 2 = dir */
+    uint64_t size;     /* size in bytes */
+    char     name[32]; /* null-terminated filename */
+} os_dirent_t;
 
 /* Application Package Magic ("OS_APP\0\0") */
 #define OS_APP_MAGIC 0x00005050415F534FULL
@@ -78,6 +88,9 @@ typedef os_app_package_t os_app_info_t;
 #define OS_ARGB(a, r, g, b) (((uint32_t)(a) << 24) | ((uint32_t)(r) << 16) | ((uint32_t)(g) << 8) | (uint32_t)(b))
 #define OS_RGB(r, g, b)     OS_ARGB(0xFF, r, g, b)
 
+#define OS_COLOR_OBSIDIAN  0xFF0A0E17
+#define OS_COLOR_SURFACE   0xFF141C2B
+#define OS_COLOR_CARD      0xFF1E293B
 #define OS_COLOR_SLATE_950 0xFF020617
 #define OS_COLOR_SLATE_900 0xFF0F172A
 #define OS_COLOR_SLATE_850 0xFF172033
@@ -95,11 +108,14 @@ typedef os_app_package_t os_app_info_t;
 #define OS_COLOR_INDIGO    0xFF4F46E5
 #define OS_COLOR_INDIGO_LT 0xFF6366F1
 #define OS_COLOR_INDIGO_DK 0xFF3730A3
+#define OS_COLOR_VIOLET    0xFF8B5CF6
 #define OS_COLOR_EMERALD   0xFF10B981
+#define OS_COLOR_EMERALD_LT 0xFF34D399
 #define OS_COLOR_EMERALD_DK 0xFF065F46
 #define OS_COLOR_AMBER     0xFFF59E0B
 #define OS_COLOR_ROSE      0xFFF43F5E
 #define OS_COLOR_CYAN      0xFF06B6D4
+#define OS_COLOR_CYAN_NEON 0xFF22D3EE
 #define OS_COLOR_SKY       0xFF0EA5E9
 
 /* Window and Event Structures */
@@ -250,6 +266,18 @@ static inline void os_close_window(os_window_t *win) {
 static inline int os_register_app(const os_app_info_t *info) {
     if (!info) return -1;
     return (int)os_syscall2(SYS_APP_REGISTER, (int64_t)info, sizeof(os_app_info_t));
+}
+
+/* Directory listing from ext4 filesystem */
+static inline int os_read_dir(os_dirent_t *entries, int max_entries) {
+    if (!entries || max_entries <= 0) return -1;
+    return (int)os_syscall2(SYS_LISTDIR, (int64_t)entries, max_entries);
+}
+
+/* Spawn an ELF application from ext4 storage */
+static inline int os_spawn(const char *path) {
+    if (!path) return -1;
+    return (int)os_syscall1(SYS_SPAWN, (int64_t)path);
 }
 
 /* =============================================================================
@@ -553,6 +581,188 @@ static inline void os_draw_button(os_window_t *win, int x, int y, int w, int h, 
         int ty = y + (h - 8) / 2;
         os_draw_text(win, tx, ty, text, fg);
     }
+}
+
+/* =============================================================================
+ * Advanced Modern UI Engine: Gradients, Rounded Rects, Glass Cards & Widgets
+ * ============================================================================= */
+
+static inline uint32_t os_alpha_blend(uint32_t src, uint32_t dst) {
+    uint32_t a = (src >> 24) & 0xFF;
+    if (a == 0) return dst;
+    if (a == 255) return src;
+    uint32_t inv_a = 255 - a;
+
+    uint32_t sr = (src >> 16) & 0xFF;
+    uint32_t sg = (src >> 8) & 0xFF;
+    uint32_t sb = src & 0xFF;
+
+    uint32_t dr = (dst >> 16) & 0xFF;
+    uint32_t dg = (dst >> 8) & 0xFF;
+    uint32_t db = dst & 0xFF;
+
+    uint32_t rr = (sr * a + dr * inv_a) / 255;
+    uint32_t rg = (sg * a + dg * inv_a) / 255;
+    uint32_t rb = (sb * a + db * inv_a) / 255;
+
+    return 0xFF000000 | (rr << 16) | (rg << 8) | rb;
+}
+
+static inline void os_put_pixel_blend(os_window_t *win, int x, int y, uint32_t color) {
+    if (!win || !win->canvas) return;
+    if (x < 0 || x >= win->client_w || y < 0 || y >= win->client_h) return;
+    uint32_t *p = win->canvas + y * win->client_w + x;
+    *p = os_alpha_blend(color, *p);
+}
+
+/* Vertical gradient fill */
+static inline void os_fill_gradient_v(os_window_t *win, int x, int y, int w, int h, uint32_t c1, uint32_t c2) {
+    if (!win || !win->canvas || w <= 0 || h <= 0) return;
+    int cw = win->client_w;
+    int ch = win->client_h;
+
+    int x1 = x < 0 ? 0 : x;
+    int y1 = y < 0 ? 0 : y;
+    int x2 = x + w > cw ? cw : x + w;
+    int y2 = y + h > ch ? ch : y + h;
+    if (x1 >= x2 || y1 >= y2) return;
+
+    int r1 = (c1 >> 16) & 0xFF, g1 = (c1 >> 8) & 0xFF, b1 = c1 & 0xFF, a1 = (c1 >> 24) & 0xFF;
+    int r2 = (c2 >> 16) & 0xFF, g2 = (c2 >> 8) & 0xFF, b2 = c2 & 0xFF, a2 = (c2 >> 24) & 0xFF;
+
+    for (int cy = y1; cy < y2; cy++) {
+        int t = ((cy - y) * 255) / (h > 1 ? h - 1 : 1);
+        uint32_t r = r1 + ((r2 - r1) * t) / 255;
+        uint32_t g = g1 + ((g2 - g1) * t) / 255;
+        uint32_t b = b1 + ((b2 - b1) * t) / 255;
+        uint32_t a = a1 + ((a2 - a1) * t) / 255;
+        uint32_t col = OS_ARGB(a, r, g, b);
+
+        uint32_t *row = win->canvas + cy * cw + x1;
+        for (int cx = x1; cx < x2; cx++) {
+            *row++ = col;
+        }
+    }
+}
+
+/* Smooth Rounded Rectangle Fill */
+static inline void os_fill_rounded_rect(os_window_t *win, int x, int y, int w, int h, int r, uint32_t color) {
+    if (!win || !win->canvas || w <= 0 || h <= 0) return;
+    if (r <= 0) {
+        os_fill_rect(win, x, y, w, h, color);
+        return;
+    }
+    if (r * 2 > w) r = w / 2;
+    if (r * 2 > h) r = h / 2;
+
+    int cw = win->client_w;
+    int ch = win->client_h;
+    int r2 = r * r;
+
+    int x1 = x < 0 ? 0 : x;
+    int y1 = y < 0 ? 0 : y;
+    int x2 = x + w > cw ? cw : x + w;
+    int y2 = y + h > ch ? ch : y + h;
+    if (x1 >= x2 || y1 >= y2) return;
+
+    for (int cy = y1; cy < y2; cy++) {
+        uint32_t *row = win->canvas + cy * cw + x1;
+        for (int cx = x1; cx < x2; cx++) {
+            int dx = 0, dy = 0;
+            if (cx < x + r && cy < y + r) {
+                dx = (x + r) - cx; dy = (y + r) - cy;
+            } else if (cx >= x + w - r && cy < y + r) {
+                dx = cx - (x + w - r - 1); dy = (y + r) - cy;
+            } else if (cx < x + r && cy >= y + h - r) {
+                dx = (x + r) - cx; dy = cy - (y + h - r - 1);
+            } else if (cx >= x + w - r && cy >= y + h - r) {
+                dx = cx - (x + w - r - 1); dy = cy - (y + h - r - 1);
+            }
+            if (dx > 0 && dy > 0) {
+                int dist2 = dx * dx + dy * dy;
+                if (dist2 > r2) {
+                    row++;
+                    continue;
+                }
+            }
+            if ((color >> 24) == 0xFF) {
+                *row++ = color;
+            } else {
+                *row = os_alpha_blend(color, *row);
+                row++;
+            }
+        }
+    }
+}
+
+/* Smooth Rounded Rectangle Outline */
+static inline void os_draw_rounded_rect(os_window_t *win, int x, int y, int w, int h, int r, uint32_t color) {
+    if (!win || !win->canvas || w <= 0 || h <= 0) return;
+    if (r <= 0) {
+        os_draw_rect(win, x, y, w, h, color);
+        return;
+    }
+    if (r * 2 > w) r = w / 2;
+    if (r * 2 > h) r = h / 2;
+
+    os_fill_rect(win, x + r, y, w - 2 * r, 1, color);
+    os_fill_rect(win, x + r, y + h - 1, w - 2 * r, 1, color);
+    os_fill_rect(win, x, y + r, 1, h - 2 * r, color);
+    os_fill_rect(win, x + w - 1, y + r, 1, h - 2 * r, color);
+
+    for (int dy = 0; dy <= r; dy++) {
+        for (int dx = 0; dx <= r; dx++) {
+            int d = dx * dx + dy * dy;
+            if (d >= (r - 1) * (r - 1) && d <= r * r) {
+                os_put_pixel_blend(win, x + r - dx, y + r - dy, color);
+                os_put_pixel_blend(win, x + w - 1 - r + dx, y + r - dy, color);
+                os_put_pixel_blend(win, x + r - dx, y + h - 1 - r + dy, color);
+                os_put_pixel_blend(win, x + w - 1 - r + dx, y + h - 1 - r + dy, color);
+            }
+        }
+    }
+}
+
+/* Elevated Acrylic Glass Card with specular rim */
+static inline void os_draw_card(os_window_t *win, int x, int y, int w, int h, uint32_t bg, uint32_t border, int r) {
+    os_fill_rounded_rect(win, x, y, w, h, r, bg);
+    os_draw_rounded_rect(win, x, y, w, h, r, border);
+    if (w > 2 * r + 4) {
+        os_fill_rect(win, x + r + 2, y + 1, w - 2 * r - 4, 1, OS_ARGB(0x35, 0xFF, 0xFF, 0xFF));
+    }
+}
+
+/* Modern pill or card button with interactive hover/pressed states */
+static inline void os_draw_button_modern(os_window_t *win, int x, int y, int w, int h, const char *text, uint32_t accent, int is_hovered, int is_pressed) {
+    uint32_t bg = is_pressed ? OS_COLOR_SLATE_950 : (is_hovered ? OS_COLOR_SLATE_700 : OS_COLOR_SLATE_800);
+    uint32_t border = is_hovered ? accent : OS_COLOR_SLATE_600;
+    os_draw_card(win, x, y, w, h, bg, border, 6);
+    int tlen = (int)os_strlen(text);
+    int tx = x + (w - tlen * 8) / 2 + (is_pressed ? 1 : 0);
+    int ty = y + (h - 8) / 2 + (is_pressed ? 1 : 0);
+    uint32_t fg = is_pressed ? OS_COLOR_SLATE_400 : (is_hovered ? OS_COLOR_WHITE : OS_COLOR_SLATE_200);
+    os_draw_text(win, tx, ty, text, fg);
+}
+
+/* Category or Type Badge */
+static inline void os_draw_badge(os_window_t *win, int x, int y, const char *text, uint32_t bg, uint32_t fg) {
+    int tlen = (int)os_strlen(text);
+    int bw = tlen * 8 + 12;
+    int bh = 18;
+    os_fill_rounded_rect(win, x, y, bw, bh, 4, bg);
+    os_draw_rounded_rect(win, x, y, bw, bh, 4, OS_ARGB(0x40, 0xFF, 0xFF, 0xFF));
+    os_draw_text(win, x + 6, y + 5, text, fg);
+}
+
+/* Modern Minimalist Scrollbar */
+static inline void os_draw_scrollbar(os_window_t *win, int x, int y, int h, int total, int visible, int offset) {
+    if (total <= visible || total <= 0) return;
+    os_fill_rounded_rect(win, x, y, 6, h, 3, OS_COLOR_SLATE_950);
+    int thumb_h = (visible * h) / total;
+    if (thumb_h < 16) thumb_h = 16;
+    int max_scroll = total - visible;
+    int thumb_y = y + (offset * (h - thumb_h)) / (max_scroll > 0 ? max_scroll : 1);
+    os_fill_rounded_rect(win, x + 1, thumb_y, 4, thumb_h, 2, OS_COLOR_SLATE_500);
 }
 
 #endif /* OPENSWEET_H */
