@@ -22,6 +22,8 @@ FB_CLR_SUCCESS  = 0x0022C55E   ; Green 500
 FB_CLR_ERROR    = 0x00EF4444   ; Red 500
 FB_CLR_NUMBER   = 0x00EAB308   ; Yellow 500
 FB_CLR_MUTED    = 0x0064748B   ; Slate 500
+FB_CLR_CMD      = 0x0038BDF8   ; Sky Blue 400
+FB_CLR_DIM      = 0x0064748B   ; Slate 500
 
 ; ==============================================================================
 ; fb_console_init: Read VBE parameters from BIOS table & clear screen

@@ -212,6 +212,18 @@ static void render_notepad(os_window_t *win) {
 int main(void) {
     os_print("[notepad.elf] Launching C Desktop Notepad in Ring 3...\n");
 
+    /* Register application package metadata with OpenSweet OS */
+    static const os_app_info_t notepad_meta = {
+        .name = "Notepad",
+        .version = "1.0.0",
+        .author = "OpenSweet Team [Verified]",
+        .description = "Modern GUI Text Editor",
+        .exec_path = "/notepad.elf",
+        .icon_id = OS_ICON_NOTEPAD,
+        .icon_data = NULL
+    };
+    os_register_app(&notepad_meta);
+
     /* Create 540x420 window */
     os_window_t win = os_create_window("Notepad - Document 1", 280, 140, WIN_W, WIN_H);
     if (win.win_id < 0) {

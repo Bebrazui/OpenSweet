@@ -10,6 +10,7 @@ include 'D:\Opensweet\gui\app_files.inc'
 include 'D:\Opensweet\gui\app_sysmon.inc'
 include 'D:\Opensweet\gui\app_settings.inc'
 include 'D:\Opensweet\gui\wm.inc'
+include 'D:\Opensweet\kernel\app_registry.inc'
 
 MD_TERM_ROWS = 24
 MD_TERM_COLS = 64
@@ -21,6 +22,14 @@ md_mouse_y      dd 384
 md_mouse_prev_x dd 0
 md_mouse_prev_y dd 0
 md_term_dirty   db 1
+
+md_dock_x       dd 800
+md_dock_y       dd 996
+md_dock_w       dd 320
+md_dock_h       dd 68
+md_dock_count   dd 4
+align 16
+str_tip_buf     rb 64
 
 ; Terminal line buffers (24 rows x 72 bytes: 4 bytes color + 64 chars + 4 pad)
 align 16
@@ -53,6 +62,7 @@ modern_desktop_init:
 
     call r2d_init
     call wm_init
+    call app_reg_init
 
     ; Clear terminal line buffers
     lea rdi, [r15 + md_term_lines - kmain]
@@ -398,7 +408,9 @@ md_render_menubar:
     ret
 
 ; ==============================================================================
-; md_render_dock: Floating Bottom Dock (w=320, h=68, x=800, y=996)
+; md_render_dock: Dynamic Floating Bottom Dock with Hover Tooltip
+; Automatically sizes width to N installed apps (N * 80), centers on screen,
+; renders 44x44 icons, active dot indicators, and floating signature tooltips.
 ; ==============================================================================
 md_render_dock:
     push rax
@@ -407,102 +419,245 @@ md_render_dock:
     push rdx
     push rsi
     push rdi
+    push rbp
     push r8
     push r9
     push r10
     push r11
     push r12
+    push r13
+    push r14
 
-    mov ecx, 800
+    ; 1. Calculate installed applications count
+    call app_reg_count_installed      ; EAX = N
+    cmp eax, 1
+    jge @f
+    mov eax, 1
+@@:
+    cmp eax, 8
+    jle @f
+    mov eax, 8
+@@:
+    mov [r15 + md_dock_count - kmain], eax
+    mov r12d, eax                     ; r12d = N
+
+    ; 2. Compute dynamic geometry
+    imul eax, 80                      ; W = N * 80
+    mov [r15 + md_dock_w - kmain], eax
+    mov r14d, eax                     ; r14d = W
+
+    mov ecx, 1920
+    sub ecx, eax
+    shr ecx, 1                        ; X = (1920 - W) / 2
+    mov [r15 + md_dock_x - kmain], ecx
+    mov r13d, ecx                     ; r13d = X
+
+    ; 3. Draw Dock drop shadow
+    mov ecx, r13d
     mov edx, 996
-    mov esi, 320
+    mov esi, r14d
     mov edi, 68
     mov ebx, 18
     call r2d_draw_shadow
 
-    mov ecx, 800
+    ; 4. Draw Dock frosted glass rounded container
+    mov ecx, r13d
     mov edx, 996
-    mov esi, 320
+    mov esi, r14d
     mov edi, 68
     mov ebx, 18
     mov eax, 0xD80F172A               ; Translucent glass
     call r2d_draw_rounded_rect_aa
 
-    ; Dock top rim frosted glass highlight
-    mov ecx, 800 + 18
+    ; 5. Dock top rim frosted glass highlight
+    mov ecx, r13d
+    add ecx, 18
     mov edx, 996
-    mov esi, 320 - 36
+    mov esi, r14d
+    sub esi, 36
     mov edi, 1
     mov eax, 0x38FFFFFF
     call r2d_fill_rect_alpha
 
-    ; 4 Icons in Dock (44x44 Modern Anti-Aliased Squircle Tiles)
-    mov ecx, 800 + 18                 ; 818
-    mov edx, 996 + 12                 ; 1008
-    lea rsi, [r15 + icon_terminal_44x44 - kmain]
+    ; 6. Render installed icons and active dot indicators
+    xor ebp, ebp                      ; ebp = index (0..N-1)
+.dock_icon_loop:
+    cmp ebp, r12d
+    jae .dock_icons_done
+
+    mov ebx, ebp
+    call app_reg_get_nth_installed    ; RDI = reg entry, EAX = app_id
+    test rdi, rdi
+    jz .next_dock_icon
+
+    ; Draw 44x44 icon
+    mov ecx, ebp
+    imul ecx, 80
+    add ecx, r13d
+    add ecx, 18                       ; icon_x = X + 18 + k*80
+    mov edx, 996 + 12                 ; icon_y = 1008
+    mov rsi, [rdi + REG_APP_ICON_PTR]
+    test rsi, rsi
+    jz .check_dot
     call r2d_draw_icon_44
 
-    mov ecx, 800 + 98                 ; 898
-    mov edx, 996 + 12
-    lea rsi, [r15 + icon_files_44x44 - kmain]
-    call r2d_draw_icon_44
+.check_dot:
+    ; Active dot indicator if app window is open
+    movzx eax, byte [rdi + REG_APP_ID]
+    cmp eax, APP_COUNT
+    jae .next_dock_icon
+    cmp byte [r15 + wm_state - kmain + rax], WM_STATE_OPEN
+    jne .next_dock_icon
 
-    mov ecx, 800 + 178                ; 978
-    mov edx, 996 + 12
-    lea rsi, [r15 + icon_sys_44x44 - kmain]
-    call r2d_draw_icon_44
-
-    mov ecx, 800 + 258                ; 1058
-    mov edx, 996 + 12
-    lea rsi, [r15 + icon_settings_44x44 - kmain]
-    call r2d_draw_icon_44
-
-    ; Active dot indicators under open apps
-    cmp byte [r15 + wm_state - kmain + 0], WM_STATE_OPEN
-    jne @f
-    mov ecx, 800 + 38                 ; 838
-    mov edx, 996 + 58                 ; 1054
+    mov ecx, ebp
+    imul ecx, 80
+    add ecx, r13d
+    add ecx, 38                       ; dot_x = X + 38 + k*80
+    mov edx, 996 + 58                 ; dot_y = 1054
     mov esi, 4
     mov edi, 4
     mov ebx, 2
-    mov eax, 0xFFF8FAFC
+    mov eax, 0xFFF8FAFC               ; Pure white dot
     call r2d_draw_rounded_rect_aa
+
+.next_dock_icon:
+    inc ebp
+    jmp .dock_icon_loop
+
+.dock_icons_done:
+    ; 7. Floating Hover Tooltip (App Name, Version, Digital Signature/Author)
+    mov eax, [r15 + md_mouse_x - kmain]
+    mov edx, [r15 + md_mouse_y - kmain]
+
+    cmp edx, 996
+    jb .dock_done
+    cmp edx, 1064
+    ja .dock_done
+    cmp eax, r13d
+    jb .dock_done
+    mov ecx, r13d
+    add ecx, r14d
+    cmp eax, ecx
+    jae .dock_done
+
+    ; Mouse is hovering inside the dock! Calculate hovered slot index
+    sub eax, r13d
+    xor edx, edx
+    mov ecx, 80
+    div ecx                           ; EAX = hovered slot (0..N-1)
+    cmp eax, r12d
+    jae .dock_done
+
+    mov ebx, eax                      ; EBX = slot
+    call app_reg_get_nth_installed    ; RDI = reg entry
+    test rdi, rdi
+    jz .dock_done
+
+    push rdi                          ; [rsp] = save valid registry entry pointer!
+
+    ; Compute tooltip coordinates
+    ; Center tooltip above hovered icon:
+    mov ecx, ebx
+    imul ecx, 80
+    add ecx, r13d
+    add ecx, 40                       ; icon center X
+    sub ecx, 120                      ; tip_x = center - (240 / 2)
+
+    ; Clamp tooltip within screen bounds
+    cmp ecx, 20
+    jge @f
+    mov ecx, 20
 @@:
-    cmp byte [r15 + wm_state - kmain + 1], WM_STATE_OPEN
-    jne @f
-    mov ecx, 800 + 118                ; 918
-    mov edx, 996 + 58
-    mov esi, 4
-    mov edi, 4
-    mov ebx, 2
-    mov eax, 0xFFF8FAFC
+    cmp ecx, 1920 - 240 - 20
+    jle @f
+    mov ecx, 1920 - 240 - 20
+@@:
+    mov edx, 996 - 42 - 8             ; tip_y = 946
+    mov r8d, ecx                      ; r8d = tip_x
+    mov r9d, edx                      ; r9d = tip_y
+
+    ; Tooltip Shadow
+    mov esi, 240
+    mov edi, 42
+    mov ebx, 8
+    call r2d_draw_shadow
+
+    ; Tooltip Frosted Glass Body
+    mov ecx, r8d
+    mov edx, r9d
+    mov esi, 240
+    mov edi, 42
+    mov ebx, 8
+    mov eax, 0xEB0F172A               ; Acrylic Dark Glass
     call r2d_draw_rounded_rect_aa
-@@:
-    cmp byte [r15 + wm_state - kmain + 2], WM_STATE_OPEN
-    jne @f
-    mov ecx, 800 + 198                ; 998
-    mov edx, 996 + 58
-    mov esi, 4
-    mov edi, 4
-    mov ebx, 2
-    mov eax, 0xFFF8FAFC
-    call r2d_draw_rounded_rect_aa
-@@:
-    cmp byte [r15 + wm_state - kmain + 3], WM_STATE_OPEN
-    jne @f
-    mov ecx, 800 + 278                ; 1078
-    mov edx, 996 + 58
-    mov esi, 4
-    mov edi, 4
-    mov ebx, 2
-    mov eax, 0xFFF8FAFC
-    call r2d_draw_rounded_rect_aa
-@@:
+
+    ; Tooltip Top Rim Highlight
+    mov ecx, r8d
+    add ecx, 8
+    mov edx, r9d
+    mov esi, 240 - 16
+    mov edi, 1
+    mov eax, 0x38FFFFFF
+    call r2d_fill_rect_alpha
+
+    ; Restore registry entry pointer from stack
+    pop rdi
+
+    ; Build Line 1: "<Name> v<Version>"
+    push rdi
+    lea rsi, [rdi + REG_APP_NAME]
+    lea rdi, [r15 + str_tip_buf - kmain]
+    cld
+.copy_tip_name:
+    lodsb
+    stosb
+    test al, al
+    jz .tip_append_v
+    jmp .copy_tip_name
+.tip_append_v:
+    dec rdi                           ; overwrite null
+    mov byte [rdi], ' '
+    inc rdi
+    mov byte [rdi], 'v'
+    inc rdi
+    mov rdx, [rsp]                    ; rdx = reg entry
+    lea rsi, [rdx + REG_APP_VER]
+.copy_tip_ver:
+    lodsb
+    stosb
+    test al, al
+    jz .tip_l1_done
+    jmp .copy_tip_ver
+.tip_l1_done:
+    pop rdi
+
+    ; Draw Line 1 (Name & Version)
+    mov ecx, r8d
+    add ecx, 12
+    mov edx, r9d
+    add edx, 6
+    mov eax, 0xFFF8FAFC               ; Bright White
+    lea rsi, [r15 + str_tip_buf - kmain]
+    call r2d_draw_text_ui_aa
+
+    ; Draw Line 2 (Author / Signature)
+    mov ecx, r8d
+    add ecx, 12
+    mov edx, r9d
+    add edx, 23
+    mov eax, 0xFF38BDF8               ; Sky Blue Accent
+    lea rsi, [rdi + REG_APP_AUTH]
+    call r2d_draw_text_ui_aa
+
+.dock_done:
+    pop r14
+    pop r13
     pop r12
     pop r11
     pop r10
     pop r9
     pop r8
+    pop rbp
     pop rdi
     pop rsi
     pop rdx

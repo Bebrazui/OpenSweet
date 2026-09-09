@@ -290,6 +290,7 @@ wm_bring_to_front:
 wm_toggle_dock:
     push rax
     push rbx
+    push rsi
 
     movzx ebx, al
     cmp ebx, APP_COUNT
@@ -304,10 +305,22 @@ wm_toggle_dock:
     jmp .td_ret
 
 .td_open:
+    ; Check if this app has an executable path on disk (e.g. "/notepad.elf")
+    imul eax, ebx, APP_ENTRY_SIZE
+    lea rsi, [r15 + app_registry_data - kmain + rax + REG_APP_PATH]
+    cmp byte [rsi], 0
+    je .td_open_sys
+
+    ; Launch ELF executable into Ring 3!
+    call elf_load_from_ext4
+    jmp .td_ret
+
+.td_open_sys:
     mov al, bl
     call wm_open_app
 
 .td_ret:
+    pop rsi
     pop rbx
     pop rax
     ret
@@ -613,11 +626,24 @@ wm_handle_mouse:
     ; Cursor move only: ultra-fast microsecond LFB blit (<1 us)
     mov eax, [r15 + md_mouse_x - kmain]
     cmp eax, [r15 + md_mouse_prev_x - kmain]
-    jne .do_fast_cursor
+    jne @f
     mov edx, [r15 + md_mouse_y - kmain]
     cmp edx, [r15 + md_mouse_prev_y - kmain]
-    jne .do_fast_cursor
+    jne @f
     jmp .mouse_ret
+@@:
+    ; If mouse is in or near dock area (Y >= 940), trigger desktop dirty so tooltip tracks smoothly
+    mov edx, [r15 + md_mouse_y - kmain]
+    cmp edx, 940
+    jae .dock_hover_refresh
+    mov edx, [r15 + md_mouse_prev_y - kmain]
+    cmp edx, 940
+    jae .dock_hover_refresh
+    jmp .do_fast_cursor
+
+.dock_hover_refresh:
+    mov byte [r15 + md_term_dirty - kmain], 1
+    jmp .do_fast_cursor
 
 .do_fast_cursor:
     ; Restore previous 18x18 cursor area from backbuffer to VRAM LFB
@@ -641,7 +667,7 @@ wm_handle_mouse:
     jnz .lmb_is_held
 
     ; --- TRANSITION: LMB CLICK DOWN ---
-    ; Test Dock Region: y in [996, 1064], x in [800, 1120]
+    ; Test Dock Region: y in [996, 1064], x in [md_dock_x, md_dock_x + md_dock_w]
     mov eax, [r15 + md_mouse_x - kmain]
     mov edx, [r15 + md_mouse_y - kmain]
 
@@ -649,31 +675,26 @@ wm_handle_mouse:
     jb .test_windows
     cmp edx, 1064
     ja .test_windows
-    cmp eax, 800
+    cmp eax, [r15 + md_dock_x - kmain]
     jb .test_windows
-    cmp eax, 1120
-    ja .test_windows
+    mov ecx, [r15 + md_dock_x - kmain]
+    add ecx, [r15 + md_dock_w - kmain]
+    cmp eax, ecx
+    jae .test_windows
 
-    ; Click is inside Dock! Determine icon:
-    cmp eax, 880
-    jae @f
-    mov al, APP_TERM
-    call wm_toggle_dock
-    jmp .mouse_ret
-@@:
-    cmp eax, 960
-    jae @f
-    mov al, APP_FILES
-    call wm_toggle_dock
-    jmp .mouse_ret
-@@:
-    cmp eax, 1040
-    jae @f
-    mov al, APP_SYS
-    call wm_toggle_dock
-    jmp .mouse_ret
-@@:
-    mov al, APP_SETTINGS
+    ; Click is inside Dock! Determine icon slot:
+    sub eax, [r15 + md_dock_x - kmain]
+    xor edx, edx
+    mov ecx, 80
+    div ecx                           ; EAX = clicked slot index (0..dock_count-1)
+    cmp eax, [r15 + md_dock_count - kmain]
+    jae .mouse_ret
+
+    mov ebx, eax
+    call app_reg_get_nth_installed    ; EAX = app_id (0..7)
+    cmp eax, -1
+    je .mouse_ret
+
     call wm_toggle_dock
     jmp .mouse_ret
 

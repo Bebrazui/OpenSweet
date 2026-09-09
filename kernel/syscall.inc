@@ -13,6 +13,8 @@ SYS_GUI_CREATE_WIN = 10
 SYS_GUI_UPDATE_WIN = 11
 SYS_GUI_POLL_EVENT = 12
 SYS_GUI_CLOSE_WIN  = 13
+SYS_APP_REGISTER   = 14
+SYS_APP_INFO       = 15
 
 align 16
 sys_user_rsp       dq 0
@@ -141,6 +143,8 @@ syscall_entry:
     je .do_gui_poll_event
     cmp eax, SYS_GUI_CLOSE_WIN
     je .do_gui_close_win
+    cmp eax, SYS_APP_REGISTER
+    je .do_app_register
 
     ; Unimplemented syscall
     mov rax, -1
@@ -199,6 +203,11 @@ syscall_entry:
 .do_gui_close_win:
     ; RDI = win_id
     call wm_close_user_window
+    jmp .syscall_ret
+
+.do_app_register:
+    ; RDI = user pointer to os_app_info_t, RSI = size
+    call app_reg_install_from_user
     jmp .syscall_ret
 
 .syscall_ret:

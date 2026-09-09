@@ -478,6 +478,26 @@ kmain:
     test al, al
     jnz .do_ring3
 
+    ; apps
+    mov rsi, cmd_buf
+    lea rdi, [r15 + cmd_apps - kmain]
+    call streq
+    test al, al
+    jnz .do_apps
+
+    ; install: starts with "install " or exact "install"
+    mov rsi, cmd_buf
+    lea rdi, [r15 + cmd_install - kmain]
+    call streq
+    test al, al
+    jnz .do_install_noarg
+    mov rsi, cmd_buf
+    lea rdi, [r15 + str_installsp - kmain]
+    mov ecx, 8
+    call strpref
+    test al, al
+    jnz .do_install
+
     ; exec: starts with "exec " or exact "exec"
     mov rsi, cmd_buf
     lea rdi, [r15 + cmd_exec - kmain]
@@ -554,6 +574,197 @@ kmain:
     cmp byte [rsi], 0
     je .do_exec_noarg
     call elf_load_from_ext4
+    jmp .prompt
+
+.do_apps:
+    mov eax, FB_CLR_HEADER
+    call fb_console_set_color
+    lea rsi, [r15 + str_apps_hdr - kmain]
+    call puts
+
+    xor ecx, ecx
+.apps_loop:
+    cmp ecx, MAX_REG_APPS
+    jae .apps_done
+
+    push rcx
+    imul eax, ecx, APP_ENTRY_SIZE
+    lea rdi, [r15 + app_registry_data - kmain + rax]
+
+    cmp byte [rdi + REG_APP_NAME], 0
+    je .apps_next
+
+    ; Print [slot]
+    lea rsi, [r15 + str_apps_bracket_l - kmain]
+    call puts
+    pop rcx
+    push rcx
+    mov eax, ecx
+    call putdec64
+    lea rsi, [r15 + str_apps_bracket_r - kmain]
+    call puts
+
+    ; Print name
+    mov eax, FB_CLR_LABEL
+    call fb_console_set_color
+    lea rsi, [rdi + REG_APP_NAME]
+    call puts
+    lea rsi, [r15 + str_apps_sp - kmain]
+    call puts
+
+    ; Print "v" + version
+    mov eax, FB_CLR_DEFAULT
+    call fb_console_set_color
+    lea rsi, [r15 + str_apps_v - kmain]
+    call puts
+    lea rsi, [rdi + REG_APP_VER]
+    call puts
+    lea rsi, [r15 + str_apps_by - kmain]
+    call puts
+
+    ; Print author / signature
+    mov eax, FB_CLR_CMD
+    call fb_console_set_color
+    lea rsi, [rdi + REG_APP_AUTH]
+    call puts
+
+    ; Print dock status
+    cmp byte [rdi + REG_APP_INSTALLED], 1
+    jne .apps_not_dock
+    mov eax, FB_CLR_SUCCESS
+    call fb_console_set_color
+    lea rsi, [r15 + str_apps_dock - kmain]
+    call puts
+    jmp .apps_running_check
+
+.apps_not_dock:
+    mov eax, FB_CLR_DIM
+    call fb_console_set_color
+    lea rsi, [r15 + str_apps_nodock - kmain]
+    call puts
+
+.apps_running_check:
+    movzx eax, byte [rdi + REG_APP_ID]
+    cmp eax, APP_COUNT
+    jae .apps_end_line
+    cmp byte [r15 + wm_state - kmain + rax], WM_STATE_OPEN
+    jne .apps_end_line
+
+    mov eax, FB_CLR_PROMPT
+    call fb_console_set_color
+    lea rsi, [r15 + str_apps_running - kmain]
+    call puts
+
+.apps_end_line:
+    mov eax, FB_CLR_DEFAULT
+    call fb_console_set_color
+    lea rsi, [r15 + str_nl - kmain]
+    call puts
+
+.apps_next:
+    pop rcx
+    inc ecx
+    jmp .apps_loop
+
+.apps_done:
+    mov eax, FB_CLR_DEFAULT
+    call fb_console_set_color
+    jmp .prompt
+
+.do_install_noarg:
+    mov eax, FB_CLR_LABEL
+    call fb_console_set_color
+    lea rsi, [r15 + str_install_usage - kmain]
+    call puts
+    mov eax, FB_CLR_DEFAULT
+    call fb_console_set_color
+    jmp .prompt
+
+.do_install:
+    lea rsi, [r15 + cmd_buf - kmain + 8]
+.skip_inst_sp:
+    cmp byte [rsi], ' '
+    jne @f
+    inc rsi
+    jmp .skip_inst_sp
+@@:
+    cmp byte [rsi], 0
+    je .do_install_noarg
+
+    mov r12, rsi
+
+    mov eax, FB_CLR_LABEL
+    call fb_console_set_color
+    lea rsi, [r15 + str_install_start - kmain]
+    call puts
+    mov rsi, r12
+    call puts
+    lea rsi, [r15 + str_nl - kmain]
+    call puts
+
+    mov rsi, r12
+    call app_reg_install_by_path
+    cmp eax, -1
+    je .install_failed
+
+    mov ebx, eax
+    imul eax, ebx, APP_ENTRY_SIZE
+    lea rdi, [r15 + app_registry_data - kmain + rax]
+
+    mov eax, FB_CLR_SUCCESS
+    call fb_console_set_color
+    lea rsi, [r15 + str_install_ok - kmain]
+    call puts
+
+    mov eax, FB_CLR_LABEL
+    call fb_console_set_color
+    lea rsi, [r15 + str_inst_meta_name - kmain]
+    call puts
+    lea rsi, [rdi + REG_APP_NAME]
+    call puts
+    lea rsi, [r15 + str_inst_meta_ver - kmain]
+    call puts
+    lea rsi, [rdi + REG_APP_VER]
+    call puts
+    lea rsi, [r15 + str_nl - kmain]
+    call puts
+
+    lea rsi, [r15 + str_inst_meta_auth - kmain]
+    call puts
+    mov eax, FB_CLR_CMD
+    call fb_console_set_color
+    lea rsi, [rdi + REG_APP_AUTH]
+    call puts
+    lea rsi, [r15 + str_nl - kmain]
+    call puts
+
+    mov eax, FB_CLR_LABEL
+    call fb_console_set_color
+    lea rsi, [r15 + str_inst_meta_desc - kmain]
+    call puts
+    lea rsi, [rdi + REG_APP_DESC]
+    call puts
+    lea rsi, [r15 + str_nl - kmain]
+    call puts
+
+    mov eax, FB_CLR_SUCCESS
+    call fb_console_set_color
+    lea rsi, [r15 + str_install_dock_added - kmain]
+    call puts
+    mov eax, FB_CLR_DEFAULT
+    call fb_console_set_color
+
+    mov byte [r15 + md_term_dirty - kmain], 1
+    call modern_desktop_render
+    jmp .prompt
+
+.install_failed:
+    mov eax, FB_CLR_ERROR
+    call fb_console_set_color
+    lea rsi, [r15 + str_install_err - kmain]
+    call puts
+    mov eax, FB_CLR_DEFAULT
+    call fb_console_set_color
     jmp .prompt
 
 .do_ring3:
@@ -2667,6 +2878,30 @@ cmd_ring3    db "ring3", 0
 cmd_user     db "user", 0
 cmd_exec     db "exec", 0
 cmd_run      db "run", 0
+cmd_apps     db "apps", 0
+cmd_install  db "install", 0
+str_installsp db "install ", 0
+str_nl        db 10, 0
+
+str_apps_hdr       db "=== Installed Applications & Dock Registry ===", 10, 0
+str_apps_bracket_l db " [", 0
+str_apps_bracket_r db "] ", 0
+str_apps_sp        db "  ", 0
+str_apps_v         db "v", 0
+str_apps_by        db "  by ", 0
+str_apps_dock      db "  [In Dock]", 0
+str_apps_nodock    db "  [Available]", 0
+str_apps_running   db "  (Running)", 0
+
+str_install_usage  db "Usage: install <app_name | /path.elf>", 10, 0
+str_install_start  db "[INSTALL] Installing application package: ", 0
+str_install_ok     db "[INSTALL] Package verified and registered successfully!", 10, 0
+str_inst_meta_name db "  Name:         ", 0
+str_inst_meta_ver  db "  Version:      ", 0
+str_inst_meta_auth db "  Signature:    ", 0
+str_inst_meta_desc db "  Description:  ", 0
+str_install_dock_added db "[INSTALL] Application added to Floating Dock at bottom of screen.", 10, 0
+str_install_err    db "[INSTALL] Failed: application not found in package repository.", 10, 0
 
 str_name_user    db "user3", 0
 str_launch_ring3 db "[Kernel] Deploying 64-bit user binary to 0x400000...", 10, 0
@@ -2699,6 +2934,8 @@ str_cmd_notfound2 db "' (type 'help' for available commands)", 10, 0
 
 str_help_hdr db "=== Opensweet OS Available Commands ===", 10, 0
 str_help_body:
+db "  apps            - List installed applications and dock status", 10
+db "  install <path>  - Install application package and add to Dock", 10
 db "  exec <path>     - Load and execute 64-bit ELF binary from ext4", 10
 db "  ring3 / user    - Spawn isolated Ring 3 user process (CPL=3, Syscalls)", 10
 db "  heap            - Display kernel dynamic heap allocator stats", 10

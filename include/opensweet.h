@@ -45,6 +45,28 @@ typedef _Bool bool;
 #define SYS_GUI_UPDATE_WIN 11
 #define SYS_GUI_POLL_EVENT 12
 #define SYS_GUI_CLOSE_WIN  13
+#define SYS_APP_REGISTER   14
+#define SYS_APP_INFO       15
+
+/* Application Preset Icons */
+#define OS_ICON_TERMINAL   0
+#define OS_ICON_FILES      1
+#define OS_ICON_SYS        2
+#define OS_ICON_SETTINGS   3
+#define OS_ICON_NOTEPAD    4
+#define OS_ICON_CALC       5
+#define OS_ICON_CUSTOM     0xFF
+
+/* Application Metadata Structure */
+typedef struct {
+    char     name[24];         /* Application display name: "Notepad" */
+    char     version[12];      /* Version string: "1.0.0" */
+    char     author[32];       /* Signature / Author: "OpenSweet Team [Verified]" */
+    char     description[48];  /* Short description: "Modern GUI Text Editor" */
+    char     exec_path[32];    /* Path to ELF binary on ext4: "/notepad.elf" */
+    uint32_t icon_id;          /* OS_ICON_* */
+    uint32_t *icon_data;       /* Optional pointer to 44x44 custom ARGB pixel array */
+} os_app_info_t;
 
 /* GUI Event Types */
 #define OS_EVENT_NONE       0
@@ -222,6 +244,14 @@ static inline void os_close_window(os_window_t *win) {
     os_syscall1(SYS_GUI_CLOSE_WIN, win->win_id);
     win->win_id = -1;
     win->canvas = NULL;
+}
+
+/* =============================================================================
+ * Application Lifecycle & Package Registration API
+ * ============================================================================= */
+static inline int os_register_app(const os_app_info_t *info) {
+    if (!info) return -1;
+    return (int)os_syscall2(SYS_APP_REGISTER, (int64_t)info, sizeof(os_app_info_t));
 }
 
 /* =============================================================================

@@ -225,6 +225,18 @@ static void handle_button_action(int btn_id) {
 int main(void) {
     os_print("[calc.elf] Launching C Desktop Calculator in Ring 3...\n");
 
+    /* Register application package metadata with OpenSweet OS */
+    static const os_app_info_t calc_meta = {
+        .name = "Calculator",
+        .version = "1.0.0",
+        .author = "OpenSweet Team [Verified]",
+        .description = "GUI Desktop Calculator",
+        .exec_path = "/calc.elf",
+        .icon_id = OS_ICON_CALC,
+        .icon_data = NULL
+    };
+    os_register_app(&calc_meta);
+
     /* Create 320x420 desktop window */
     os_window_t win = os_create_window("Calculator", 820, 140, WIN_W, WIN_H);
     if (win.win_id < 0) {
