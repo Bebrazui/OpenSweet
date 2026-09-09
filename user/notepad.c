@@ -209,20 +209,29 @@ static void render_notepad(os_window_t *win) {
     os_draw_text(win, 12, ch - BOT_BAR_H + 6, stats_str, OS_COLOR_SLATE_400);
 }
 
+#include "notepad_icon.h"
+
+/* Application Package Metadata embedded in ELF section .os_app */
+__attribute__((section(".os_app"), used))
+static const os_app_package_t notepad_pkg = {
+    .magic = OS_APP_MAGIC,
+    .name = "Notepad",
+    .version = "1.0.0",
+    .author = "OpenSweet Team [Verified]",
+    .description = "Modern GUI Text Editor",
+    .exec_path = "/notepad.elf",
+    .icon_width = 44,
+    .icon_height = 44,
+    .icon_pixels = {
+        NOTEPAD_ICON_PIXELS_INIT
+    }
+};
+
 int main(void) {
     os_print("[notepad.elf] Launching C Desktop Notepad in Ring 3...\n");
 
     /* Register application package metadata with OpenSweet OS */
-    static const os_app_info_t notepad_meta = {
-        .name = "Notepad",
-        .version = "1.0.0",
-        .author = "OpenSweet Team [Verified]",
-        .description = "Modern GUI Text Editor",
-        .exec_path = "/notepad.elf",
-        .icon_id = OS_ICON_NOTEPAD,
-        .icon_data = NULL
-    };
-    os_register_app(&notepad_meta);
+    os_register_app(&notepad_pkg);
 
     /* Create 540x420 window */
     os_window_t win = os_create_window("Notepad - Document 1", 280, 140, WIN_W, WIN_H);

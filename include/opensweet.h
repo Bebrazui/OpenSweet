@@ -48,25 +48,23 @@ typedef _Bool bool;
 #define SYS_APP_REGISTER   14
 #define SYS_APP_INFO       15
 
-/* Application Preset Icons */
-#define OS_ICON_TERMINAL   0
-#define OS_ICON_FILES      1
-#define OS_ICON_SYS        2
-#define OS_ICON_SETTINGS   3
-#define OS_ICON_NOTEPAD    4
-#define OS_ICON_CALC       5
-#define OS_ICON_CUSTOM     0xFF
+/* Application Package Magic ("OS_APP\0\0") */
+#define OS_APP_MAGIC 0x00005050415F534FULL
 
-/* Application Metadata Structure */
+/* Application Package Metadata Structure (embedded directly into ELF binary) */
 typedef struct {
-    char     name[24];         /* Application display name: "Notepad" */
-    char     version[12];      /* Version string: "1.0.0" */
-    char     author[32];       /* Signature / Author: "OpenSweet Team [Verified]" */
-    char     description[48];  /* Short description: "Modern GUI Text Editor" */
-    char     exec_path[32];    /* Path to ELF binary on ext4: "/notepad.elf" */
-    uint32_t icon_id;          /* OS_ICON_* */
-    uint32_t *icon_data;       /* Optional pointer to 44x44 custom ARGB pixel array */
-} os_app_info_t;
+    uint64_t magic;                    /* OS_APP_MAGIC */
+    char     name[24];                 /* Application display name: "Notepad" */
+    char     version[12];              /* Version string: "1.0.0" */
+    char     author[32];               /* Signature / Author: "OpenSweet Team [Verified]" */
+    char     description[48];          /* Short description: "Modern GUI Text Editor" */
+    char     exec_path[32];            /* Path to ELF binary on ext4: "/notepad.elf" */
+    uint32_t icon_width;               /* Icon width (44) */
+    uint32_t icon_height;              /* Icon height (44) */
+    uint32_t icon_pixels[44 * 44];     /* Embedded 44x44 32bpp ARGB pixel array */
+} os_app_package_t;
+
+typedef os_app_package_t os_app_info_t;
 
 /* GUI Event Types */
 #define OS_EVENT_NONE       0

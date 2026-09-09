@@ -222,20 +222,29 @@ static void handle_button_action(int btn_id) {
     }
 }
 
+#include "calc_icon.h"
+
+/* Application Package Metadata embedded in ELF section .os_app */
+__attribute__((section(".os_app"), used))
+static const os_app_package_t calc_pkg = {
+    .magic = OS_APP_MAGIC,
+    .name = "Calculator",
+    .version = "1.0.0",
+    .author = "OpenSweet Team [Verified]",
+    .description = "GUI Desktop Calculator",
+    .exec_path = "/calc.elf",
+    .icon_width = 44,
+    .icon_height = 44,
+    .icon_pixels = {
+        CALC_ICON_PIXELS_INIT
+    }
+};
+
 int main(void) {
     os_print("[calc.elf] Launching C Desktop Calculator in Ring 3...\n");
 
     /* Register application package metadata with OpenSweet OS */
-    static const os_app_info_t calc_meta = {
-        .name = "Calculator",
-        .version = "1.0.0",
-        .author = "OpenSweet Team [Verified]",
-        .description = "GUI Desktop Calculator",
-        .exec_path = "/calc.elf",
-        .icon_id = OS_ICON_CALC,
-        .icon_data = NULL
-    };
-    os_register_app(&calc_meta);
+    os_register_app(&calc_pkg);
 
     /* Create 320x420 desktop window */
     os_window_t win = os_create_window("Calculator", 820, 140, WIN_W, WIN_H);
