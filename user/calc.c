@@ -71,52 +71,15 @@ static bool reset_input = false;
 static bool has_error = false;
 static int active_pressed_btn = -1;
 
-/* Scaled text renderer for large display digits (2x) */
-static void draw_scaled_char(os_window_t *win, int x, int y, char c, uint32_t color, int scale) {
-    if (!win || !win->canvas) return;
-    if (c < 32 || c > 126) c = ' ';
-    const uint8_t *glyph = os_font8x8[c - 32];
-    int cw = win->client_w;
-    int ch = win->client_h;
-
-    for (int row = 0; row < 8; row++) {
-        uint8_t bits = glyph[row];
-        for (int col = 0; col < 8; col++) {
-            if (bits & (0x80 >> col)) {
-                for (int sy = 0; sy < scale; sy++) {
-                    int py = y + row * scale + sy;
-                    if (py < 0 || py >= ch) continue;
-                    uint32_t *prow = win->canvas + py * cw;
-                    for (int sx = 0; sx < scale; sx++) {
-                        int px = x + col * scale + sx;
-                        if (px >= 0 && px < cw) {
-                            prow[px] = color;
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-static void draw_scaled_text(os_window_t *win, int x, int y, const char *str, uint32_t color, int scale) {
-    if (!win || !str) return;
-    int cur_x = x;
-    while (*str) {
-        draw_scaled_char(win, cur_x, y, *str, color, scale);
-        cur_x += 8 * scale;
-        str++;
-    }
-}
-
 /* Redraw display screen and buttons */
 static void render_calc(os_window_t *win) {
-    /* 1. Background Card */
+    /* 1. Background */
     os_fill_rect(win, 0, 0, win->client_w, win->client_h, OS_COLOR_SLATE_900);
 
-    /* 2. Top Display Bezel */
-    os_fill_rect(win, 16, 16, 286, 68, OS_COLOR_SLATE_950);
-    os_draw_rect(win, 16, 16, 286, 68, OS_COLOR_SLATE_700);
+    /* 2. Top Display Bezel (Smooth Rounded Glass Card) */
+    os_fill_rounded_rect(win, 16, 16, 286, 72, 8, OS_COLOR_SLATE_950);
+    os_draw_rounded_rect(win, 16, 16, 286, 72, 8, OS_COLOR_SLATE_700);
+    os_fill_rect(win, 24, 17, 270, 1, OS_ARGB(0x25, 0xFF, 0xFF, 0xFF));
 
     /* 2b. Secondary Expression History line */
     char hist_str[32];
@@ -131,10 +94,12 @@ static void render_calc(os_window_t *win) {
     } else {
         hist_str[0] = '\0';
     }
-    int hist_x = 290 - (int)os_strlen(hist_str) * 8;
-    os_draw_text(win, hist_x, 24, hist_str, OS_COLOR_SLATE_400);
+    int hist_w = os_text_width_ui_aa(hist_str);
+    int hist_x = 290 - hist_w;
+    if (hist_x < 24) hist_x = 24;
+    os_draw_text_ui_aa(win, hist_x, 24, hist_str, OS_COLOR_SLATE_400);
 
-    /* 2c. Main Big Readout (scale 2x) */
+    /* 2c. Main Big Readout (Smooth Anti-Aliased 2x Typography) */
     char main_str[32];
     if (has_error) {
         os_strcpy(main_str, "ERROR");
@@ -144,13 +109,26 @@ static void render_calc(os_window_t *win) {
     int main_len = (int)os_strlen(main_str);
     int readout_x = 290 - main_len * 16;
     if (readout_x < 24) readout_x = 24;
-    draw_scaled_text(win, readout_x, 46, main_str, has_error ? OS_COLOR_ROSE : OS_COLOR_WHITE, 2);
+    os_draw_text_mono_aa_2x(win, readout_x, 48, main_str, has_error ? OS_COLOR_ROSE : OS_COLOR_WHITE);
 
-    /* 3. Render Buttons */
+    /* 3. Render Smooth Rounded Buttons */
     for (size_t i = 0; i < BUTTON_COUNT; i++) {
         button_t *b = &buttons[i];
         int is_pressed = (active_pressed_btn == (int)i);
-        os_draw_button(win, b->x, b->y, b->w, b->h, b->label, b->bg_color, b->fg_color, is_pressed);
+        uint32_t bg = is_pressed ? OS_COLOR_SLATE_950 : b->bg_color;
+        uint32_t border = is_pressed ? OS_COLOR_SLATE_600 : OS_COLOR_SLATE_700;
+
+        os_fill_rounded_rect(win, b->x, b->y, b->w, b->h, 8, bg);
+        os_draw_rounded_rect(win, b->x, b->y, b->w, b->h, 8, border);
+
+        if (!is_pressed) {
+            os_fill_rect(win, b->x + 8, b->y + 1, b->w - 16, 1, OS_ARGB(0x35, 0xFF, 0xFF, 0xFF));
+        }
+
+        int tw = os_text_width_ui_aa(b->label);
+        int tx = b->x + (b->w - tw) / 2 + (is_pressed ? 1 : 0);
+        int ty = b->y + (b->h - OS_FONT_UI_H) / 2 + (is_pressed ? 1 : 0);
+        os_draw_text_ui_aa(win, tx, ty, b->label, b->fg_color);
     }
 }
 
@@ -247,7 +225,7 @@ int main(void) {
     os_register_app(&calc_pkg);
 
     /* Create 320x420 desktop window */
-    os_window_t win = os_create_window("Calculator", 820, 140, WIN_W, WIN_H);
+    os_window_t win = os_create_window("Calculator", 1280, 100, WIN_W, WIN_H);
     if (win.win_id < 0) {
         os_print("[calc.elf] Failed to create calculator window!\n");
         return 1;

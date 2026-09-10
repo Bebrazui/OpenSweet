@@ -15,9 +15,9 @@
 #define WIN_H 420
 #define MAX_TEXT 4096
 
-#define GUTTER_W 42
-#define TOP_BAR_H 34
-#define BOT_BAR_H 22
+#define GUTTER_W 46
+#define TOP_BAR_H 38
+#define BOT_BAR_H 26
 
 static char text_buf[MAX_TEXT];
 static int  text_len = 0;
@@ -27,18 +27,19 @@ static int  blink_cnt = 0;
 /* Toolbar buttons */
 #define BTN_CLEAR_X 450
 #define BTN_CLEAR_Y 6
-#define BTN_CLEAR_W 72
-#define BTN_CLEAR_H 22
+#define BTN_CLEAR_W 76
+#define BTN_CLEAR_H 26
 
-#define BTN_SAMPLE_X 370
+#define BTN_SAMPLE_X 366
 #define BTN_SAMPLE_Y 6
-#define BTN_SAMPLE_W 72
-#define BTN_SAMPLE_H 22
+#define BTN_SAMPLE_W 76
+#define BTN_SAMPLE_H 26
 
 static void insert_sample(void) {
     const char *sample = 
         "Welcome to OpenSweet Notepad!\n"
         "Written in pure C using OpenSweet SDK.\n"
+        "Anti-Aliased Consolas 15px typography.\n"
         "Running in Ring 3 (CPL=3) user mode.\n"
         "Zero-copy 32bpp canvas blitting at 60 FPS.\n"
         "Type anywhere to edit this text!";
@@ -105,16 +106,16 @@ static void render_notepad(os_window_t *win) {
     os_fill_rect(win, 0, 0, cw, ch, OS_COLOR_SLATE_950);
 
     /* 2. Top Toolbar */
-    os_fill_rect(win, 0, 0, cw, TOP_BAR_H, OS_COLOR_SLATE_900);
+    os_fill_gradient_v(win, 0, 0, cw, TOP_BAR_H, OS_COLOR_SLATE_900, OS_COLOR_SLATE_950);
     os_fill_rect(win, 0, TOP_BAR_H - 1, cw, 1, OS_COLOR_SLATE_700);
 
-    /* App icon / Document title */
-    os_draw_text(win, 12, 12, "NOTEPAD", OS_COLOR_INDIGO_LT);
-    os_draw_text(win, 80, 12, "Document 1.txt", OS_COLOR_SLATE_300);
+    /* App badge / Document title */
+    os_draw_badge(win, 12, 9, "NOTEPAD", OS_COLOR_INDIGO, OS_COLOR_WHITE);
+    os_draw_text_ui_aa(win, 112, 11, "Document 1.txt", OS_COLOR_SLATE_200);
 
     /* Toolbar buttons */
-    os_draw_button(win, BTN_SAMPLE_X, BTN_SAMPLE_Y, BTN_SAMPLE_W, BTN_SAMPLE_H, "Sample", OS_COLOR_SLATE_800, OS_COLOR_SLATE_200, 0);
-    os_draw_button(win, BTN_CLEAR_X,  BTN_CLEAR_Y,  BTN_CLEAR_W,  BTN_CLEAR_H,  "Clear",  OS_COLOR_SLATE_800, OS_COLOR_SLATE_200, 0);
+    os_draw_button_modern(win, BTN_SAMPLE_X, BTN_SAMPLE_Y, BTN_SAMPLE_W, BTN_SAMPLE_H, "Sample", OS_COLOR_CYAN_NEON, 0, 0);
+    os_draw_button_modern(win, BTN_CLEAR_X,  BTN_CLEAR_Y,  BTN_CLEAR_W,  BTN_CLEAR_H,  "Clear",  OS_COLOR_ROSE, 0, 0);
 
     /* 3. Line Number Gutter */
     int editor_top = TOP_BAR_H;
@@ -127,14 +128,15 @@ static void render_notepad(os_window_t *win) {
     /* 4. Render Text Lines & Line Numbers */
     int cur_line = 1;
     int line_y = editor_top + 8;
-    int text_x = GUTTER_W + 10;
+    int text_x = GUTTER_W + 12;
     int cur_x  = text_x;
 
     /* Draw first line number */
     char lnum_str[8];
     os_itoa(cur_line, lnum_str);
-    int num_x = GUTTER_W - 12 - (int)os_strlen(lnum_str) * 8;
-    os_draw_text(win, num_x > 4 ? num_x : 4, line_y, lnum_str, OS_COLOR_SLATE_500);
+    int num_w = (int)os_strlen(lnum_str) * OS_FONT_MONO_W;
+    int num_x = GUTTER_W - 12 - num_w;
+    os_draw_text_mono_aa(win, num_x > 4 ? num_x : 4, line_y, lnum_str, OS_COLOR_SLATE_500);
 
     int cursor_draw_x = cur_x;
     int cursor_draw_y = line_y;
@@ -150,32 +152,33 @@ static void render_notepad(os_window_t *win) {
         char c = text_buf[i];
         if (c == '\n') {
             cur_line++;
-            line_y += 14;
+            line_y += 20;
             cur_x = text_x;
 
-            if (line_y + 14 < editor_bot) {
+            if (line_y + 20 < editor_bot) {
                 os_itoa(cur_line, lnum_str);
-                int nx = GUTTER_W - 12 - (int)os_strlen(lnum_str) * 8;
-                os_draw_text(win, nx > 4 ? nx : 4, line_y, lnum_str, OS_COLOR_SLATE_500);
+                int nw = (int)os_strlen(lnum_str) * OS_FONT_MONO_W;
+                int nx = GUTTER_W - 12 - nw;
+                os_draw_text_mono_aa(win, nx > 4 ? nx : 4, line_y, lnum_str, OS_COLOR_SLATE_500);
             }
         } else {
             /* Word wrap if exceeds line width */
-            if (cur_x + 10 >= cw - 12) {
+            if (cur_x + 12 >= cw - 12) {
                 cur_line++;
-                line_y += 14;
+                line_y += 20;
                 cur_x = text_x;
             }
-            if (line_y + 14 < editor_bot) {
-                os_draw_char(win, cur_x, line_y, c, OS_COLOR_SLATE_100);
+            if (line_y + 20 < editor_bot) {
+                os_draw_char_mono_aa(win, cur_x, line_y, c, OS_COLOR_SLATE_100);
             }
-            cur_x += 8;
+            cur_x += OS_FONT_MONO_W;
         }
     }
 
-    /* 5. Draw Blinking Text Cursor */
+    /* 5. Draw Smooth Blinking Text Cursor */
     if ((blink_cnt % 30) < 18) {
-        if (cursor_draw_y + 12 < editor_bot) {
-            os_fill_rect(win, cursor_draw_x, cursor_draw_y, 2, 10, OS_COLOR_CYAN);
+        if (cursor_draw_y + 16 < editor_bot) {
+            os_fill_rounded_rect(win, cursor_draw_x, cursor_draw_y, 2, 16, 1, OS_COLOR_CYAN_NEON);
         }
     }
 
@@ -206,7 +209,7 @@ static void render_notepad(os_window_t *win) {
     pos = os_strlen(stats_str);
     os_strcpy(stats_str + pos, " chars | Ring 3 C App");
 
-    os_draw_text(win, 12, ch - BOT_BAR_H + 6, stats_str, OS_COLOR_SLATE_400);
+    os_draw_text_ui_aa(win, 14, ch - BOT_BAR_H + 5, stats_str, OS_COLOR_SLATE_400);
 }
 
 #include "notepad_icon.h"
@@ -234,7 +237,7 @@ int main(void) {
     os_register_app(&notepad_pkg);
 
     /* Create 540x420 window */
-    os_window_t win = os_create_window("Notepad - Document 1", 280, 140, WIN_W, WIN_H);
+    os_window_t win = os_create_window("Notepad - Document 1", 720, 260, WIN_W, WIN_H);
     if (win.win_id < 0) {
         os_print("[notepad.elf] Failed to create notepad window!\n");
         return 1;

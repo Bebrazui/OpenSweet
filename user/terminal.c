@@ -13,14 +13,14 @@
 #include "opensweet.h"
 #include "terminal_icon.h"
 
-#define WIN_W 680
-#define WIN_H 460
+#define WIN_W 700
+#define WIN_H 480
 
-#define TERM_ROWS 24
-#define TERM_COLS 76
-#define LINE_H    16
-#define TOP_H     30
-#define BOT_H     24
+#define TERM_ROWS 20
+#define TERM_COLS 82
+#define LINE_H    20
+#define TOP_H     34
+#define BOT_H     26
 
 __attribute__((section(".os_app"), used))
 static const os_app_package_t terminal_pkg = {
@@ -172,15 +172,15 @@ static void render_terminal(os_window_t *win) {
     os_fill_gradient_v(win, 0, 0, cw, TOP_H, OS_COLOR_SLATE_900, OS_COLOR_SLATE_950);
     os_fill_rect(win, 0, TOP_H - 1, cw, 1, OS_COLOR_SLATE_700);
 
-    /* Session Tab Chip */
-    os_draw_badge(win, 12, 6, "SHELL", OS_COLOR_INDIGO_DK, OS_COLOR_WHITE);
-    os_draw_text(win, 80, 10, "opensweet@localhost: ~ [x86_64]", OS_COLOR_SLATE_300);
+    /* Session Tab Chip with Segoe UI text */
+    os_draw_badge(win, 12, 7, "SHELL", OS_COLOR_INDIGO, OS_COLOR_WHITE);
+    os_draw_text_ui_aa(win, 84, 9, "opensweet@localhost: ~ [x86_64 SMP]", OS_COLOR_SLATE_300);
 
-    /* 3. Output lines */
+    /* 3. Output lines with Consolas 15px Anti-Aliased Typography */
     int y = TOP_H + 8;
     for (int r = 0; r < cur_row; r++) {
         if (lines[r].text[0] != '\0') {
-            os_draw_text(win, 14, y, lines[r].text, lines[r].color);
+            os_draw_text_mono_aa(win, 16, y, lines[r].text, lines[r].color);
         }
         y += LINE_H;
         if (y + LINE_H > ch - BOT_H) break;
@@ -189,14 +189,14 @@ static void render_terminal(os_window_t *win) {
     /* 4. Current Prompt Line */
     if (y + LINE_H <= ch - BOT_H) {
         const char *prompt = "opensweet:~$ ";
-        os_draw_text(win, 14, y, prompt, OS_COLOR_EMERALD_LT);
-        int prompt_w = (int)os_strlen(prompt) * 8;
-        os_draw_text(win, 14 + prompt_w, y, input_buf, OS_COLOR_WHITE);
+        os_draw_text_mono_aa(win, 16, y, prompt, OS_COLOR_EMERALD_LT);
+        int prompt_w = (int)os_strlen(prompt) * OS_FONT_MONO_W;
+        os_draw_text_mono_aa(win, 16 + prompt_w, y, input_buf, OS_COLOR_WHITE);
 
-        /* Blinking Block Cursor */
+        /* Smooth Blinking Block Cursor */
         if ((blink_cnt % 30) < 18) {
-            int cx = 14 + prompt_w + input_len * 8;
-            os_fill_rounded_rect(win, cx, y, 8, 12, 2, OS_COLOR_CYAN_NEON);
+            int cx = 16 + prompt_w + input_len * OS_FONT_MONO_W;
+            os_fill_rounded_rect(win, cx, y + 1, 8, 14, 2, OS_COLOR_CYAN_NEON);
         }
     }
 
@@ -205,14 +205,14 @@ static void render_terminal(os_window_t *win) {
     os_fill_rect(win, 0, bot_y, cw, BOT_H, OS_COLOR_SLATE_900);
     os_fill_rect(win, 0, bot_y, cw, 1, OS_COLOR_SLATE_700);
 
-    os_draw_text(win, 14, bot_y + 8, "UTF-8  |  Ring 3 CPL=3  |  Type 'help' for commands", OS_COLOR_SLATE_500);
+    os_draw_text_ui_aa(win, 16, bot_y + 5, "UTF-8  |  Ring 3 CPL=3  |  Type 'help' for commands", OS_COLOR_SLATE_400);
 
     char up_str[32], up_num[16];
     os_itoa(os_uptime() / 100, up_num);
     os_strcpy(up_str, "Uptime: ");
     os_strcpy(up_str + os_strlen(up_str), up_num);
     os_strcpy(up_str + os_strlen(up_str), "s");
-    os_draw_text(win, cw - (int)os_strlen(up_str) * 8 - 14, bot_y + 8, up_str, OS_COLOR_CYAN_NEON);
+    os_draw_text_ui_aa(win, cw - os_text_width_ui_aa(up_str) - 16, bot_y + 5, up_str, OS_COLOR_CYAN_NEON);
 }
 
 int main(void) {

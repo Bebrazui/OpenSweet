@@ -87,27 +87,27 @@ static void render_explorer(os_window_t *win) {
     os_fill_rect(win, 0, TOP_H - 1, cw, 1, OS_COLOR_SLATE_700);
 
     /* Breadcrumb Card */
-    os_draw_card(win, 12, 8, 220, 32, OS_COLOR_SLATE_800, OS_COLOR_SLATE_600, 6);
-    os_draw_badge(win, 18, 15, "ROOT", OS_COLOR_AMBER, OS_COLOR_BLACK);
-    os_draw_text(win, 74, 18, "/ rootfs (ext4)", OS_COLOR_WHITE);
+    os_draw_card(win, 12, 8, 240, 32, OS_COLOR_SLATE_800, OS_COLOR_SLATE_600, 6);
+    os_draw_badge(win, 16, 14, "ROOT", OS_COLOR_AMBER, OS_COLOR_BLACK);
+    os_draw_text_ui_aa(win, 82, 16, "/ rootfs (ext4)", OS_COLOR_WHITE);
 
     /* Storage Status Badge */
-    os_draw_badge(win, 242, 15, "ext4 | ATA Drive 1", OS_COLOR_EMERALD_DK, OS_COLOR_WHITE);
+    os_draw_badge(win, 260, 14, "ext4 | Primary ATA", OS_COLOR_EMERALD_DK, OS_COLOR_WHITE);
 
     /* Refresh Button */
-    os_draw_button_modern(win, cw - 88, 10, 76, 28, "Refresh", OS_COLOR_CYAN_NEON, 0, 0);
+    os_draw_button_modern(win, cw - 96, 9, 84, 30, "Refresh", OS_COLOR_CYAN_NEON, 0, 0);
 
     /* 3. Table Column Header Bar */
     int table_top = TOP_H;
     os_fill_rect(win, 0, table_top, cw, TABLE_HDR, OS_COLOR_SLATE_900);
     os_fill_rect(win, 0, table_top + TABLE_HDR - 1, cw, 1, OS_COLOR_SLATE_700);
 
-    os_draw_text(win, 20,  table_top + 10, "TYPE",  OS_COLOR_SLATE_400);
-    os_draw_text(win, 90,  table_top + 10, "NAME",  OS_COLOR_SLATE_400);
-    os_draw_text(win, 360, table_top + 10, "SIZE",  OS_COLOR_SLATE_400);
-    os_draw_text(win, 490, table_top + 10, "INODE", OS_COLOR_SLATE_400);
+    os_draw_text_ui_aa(win, 20,  table_top + 6, "TYPE",  OS_COLOR_SLATE_400);
+    os_draw_text_ui_aa(win, 114, table_top + 6, "NAME",  OS_COLOR_SLATE_400);
+    os_draw_text_ui_aa(win, 370, table_top + 6, "SIZE",  OS_COLOR_SLATE_400);
+    os_draw_text_ui_aa(win, 500, table_top + 6, "INODE", OS_COLOR_SLATE_400);
 
-    /* 4. Table Rows */
+    /* 4. Table Rows with Vector Icons & Anti-Aliased Typography */
     int y = table_top + TABLE_HDR + 4;
     for (int i = 0; i < entry_count; i++) {
         if (y + ROW_H > ch - BOT_H) break;
@@ -121,37 +121,42 @@ static void render_explorer(os_window_t *win) {
             os_draw_card(win, 8, y, cw - 16, ROW_H - 2, OS_COLOR_SLATE_850, OS_COLOR_SLATE_700, 6);
         }
 
-        /* Type Badge */
+        /* Type Detection */
         int is_dir = (entries[i].type == 2);
         int nlen = (int)os_strlen(entries[i].name);
         int is_elf = (nlen >= 4 && entries[i].name[nlen-4] == '.' && entries[i].name[nlen-3] == 'e');
         int is_png = (nlen >= 4 && entries[i].name[nlen-4] == '.' && entries[i].name[nlen-3] == 'p');
 
+        /* Vector Icon & Pill Badge */
         if (is_dir) {
-            os_draw_badge(win, 18, y + 6, "DIR", OS_COLOR_AMBER, OS_COLOR_BLACK);
+            os_draw_icon_folder(win, 18, y + 8);
+            os_draw_badge(win, 48, y + 7, "DIR", OS_COLOR_AMBER, OS_COLOR_BLACK);
         } else if (is_elf) {
-            os_draw_badge(win, 18, y + 6, "ELF", OS_COLOR_INDIGO_LT, OS_COLOR_WHITE);
+            os_draw_icon_file(win, 20, y + 7, 1);
+            os_draw_badge(win, 48, y + 7, "APP", OS_COLOR_INDIGO_LT, OS_COLOR_WHITE);
         } else if (is_png) {
-            os_draw_badge(win, 18, y + 6, "PNG", OS_COLOR_SKY, OS_COLOR_WHITE);
+            os_draw_icon_file(win, 20, y + 7, 0);
+            os_draw_badge(win, 48, y + 7, "IMG", OS_COLOR_SKY, OS_COLOR_WHITE);
         } else {
-            os_draw_badge(win, 18, y + 6, "TXT", OS_COLOR_EMERALD, OS_COLOR_WHITE);
+            os_draw_icon_file(win, 20, y + 7, 0);
+            os_draw_badge(win, 48, y + 7, "TXT", OS_COLOR_EMERALD, OS_COLOR_WHITE);
         }
 
         /* Name */
         uint32_t name_col = is_dir ? OS_COLOR_AMBER : (is_elf ? OS_COLOR_CYAN_NEON : OS_COLOR_WHITE);
-        os_draw_text(win, 90, y + 11, entries[i].name, name_col);
+        os_draw_text_ui_aa(win, 114, y + 9, entries[i].name, name_col);
 
         /* Size */
         char sz_str[32];
         format_size(entries[i].size, sz_str);
-        os_draw_text(win, 360, y + 11, sz_str, OS_COLOR_SLATE_300);
+        os_draw_text_ui_aa(win, 370, y + 9, sz_str, OS_COLOR_SLATE_300);
 
         /* Inode */
         char in_str[32], in_num[16];
         os_itoa(entries[i].inode, in_num);
         os_strcpy(in_str, "#");
         os_strcpy(in_str + os_strlen(in_str), in_num);
-        os_draw_text(win, 490, y + 11, in_str, OS_COLOR_SLATE_400);
+        os_draw_text_ui_aa(win, 500, y + 9, in_str, OS_COLOR_SLATE_400);
 
         y += ROW_H;
     }
@@ -171,18 +176,18 @@ static void render_explorer(os_window_t *win) {
         format_size(entries[selected_idx].size, sz);
         os_strcpy(sel_info + os_strlen(sel_info), sz);
         os_strcpy(sel_info + os_strlen(sel_info), ")");
-        os_draw_text(win, 18, bot_y + 22, sel_info, OS_COLOR_SLATE_200);
+        os_draw_text_ui_aa(win, 18, bot_y + 19, sel_info, OS_COLOR_SLATE_200);
 
         /* Action button on bottom right */
         int is_elf = (os_strlen(entries[selected_idx].name) > 4 && 
                       entries[selected_idx].name[os_strlen(entries[selected_idx].name)-1] == 'f');
         if (is_elf) {
-            os_draw_button_modern(win, cw - 150, bot_y + 12, 136, 32, "Run App", OS_COLOR_CYAN_NEON, 0, 0);
+            os_draw_button_modern(win, cw - 150, bot_y + 11, 136, 34, "Run App", OS_COLOR_CYAN_NEON, 0, 0);
         } else {
-            os_draw_button_modern(win, cw - 150, bot_y + 12, 136, 32, "Open Note", OS_COLOR_EMERALD, 0, 0);
+            os_draw_button_modern(win, cw - 150, bot_y + 11, 136, 34, "Open Note", OS_COLOR_EMERALD, 0, 0);
         }
     } else {
-        os_draw_text(win, 18, bot_y + 22, "ext4 storage mounted and healthy. 0 items selected.", OS_COLOR_SLATE_400);
+        os_draw_text_ui_aa(win, 18, bot_y + 19, "ext4 storage mounted and healthy. 0 items selected.", OS_COLOR_SLATE_400);
     }
 }
 

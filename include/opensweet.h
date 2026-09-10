@@ -34,6 +34,8 @@ typedef _Bool bool;
 #define false 0
 #endif
 
+#include "opensweet_font_aa.h"
+
 /* System Call Numbers */
 #define SYS_EXIT           0
 #define SYS_WRITE          1
@@ -645,7 +647,23 @@ static inline void os_fill_gradient_v(os_window_t *win, int x, int y, int w, int
     }
 }
 
-/* Smooth Rounded Rectangle Fill */
+/* Fast integer square root for subpixel circle / rounded rect distance */
+static inline uint32_t os_isqrt(uint32_t n) {
+    uint32_t root = 0, bit = 1U << 30;
+    while (bit > n) bit >>= 2;
+    while (bit != 0) {
+        if (n >= root + bit) {
+            n -= root + bit;
+            root = (root >> 1) + bit;
+        } else {
+            root >>= 1;
+        }
+        bit >>= 2;
+    }
+    return root;
+}
+
+/* Smooth Rounded Rectangle Fill with Subpixel Anti-Aliasing */
 static inline void os_fill_rounded_rect(os_window_t *win, int x, int y, int w, int h, int r, uint32_t color) {
     if (!win || !win->canvas || w <= 0 || h <= 0) return;
     if (r <= 0) {
@@ -657,13 +675,17 @@ static inline void os_fill_rounded_rect(os_window_t *win, int x, int y, int w, i
 
     int cw = win->client_w;
     int ch = win->client_h;
-    int r2 = r * r;
 
     int x1 = x < 0 ? 0 : x;
     int y1 = y < 0 ? 0 : y;
     int x2 = x + w > cw ? cw : x + w;
     int y2 = y + h > ch ? ch : y + h;
     if (x1 >= x2 || y1 >= y2) return;
+
+    uint32_t base_alpha = (color >> 24) & 0xFF;
+    if (base_alpha == 0) return;
+    uint32_t rgb = color & 0x00FFFFFF;
+    int r_fp = r << 8;
 
     for (int cy = y1; cy < y2; cy++) {
         uint32_t *row = win->canvas + cy * cw + x1;
@@ -678,14 +700,24 @@ static inline void os_fill_rounded_rect(os_window_t *win, int x, int y, int w, i
             } else if (cx >= x + w - r && cy >= y + h - r) {
                 dx = cx - (x + w - r - 1); dy = cy - (y + h - r - 1);
             }
+
             if (dx > 0 && dy > 0) {
                 int dist2 = dx * dx + dy * dy;
-                if (dist2 > r2) {
+                int dist_fp = (int)os_isqrt((uint32_t)(dist2 << 16));
+                int cov = r_fp + 128 - dist_fp;
+                if (cov <= 0) {
+                    row++;
+                    continue;
+                }
+                if (cov < 256) {
+                    uint32_t a = (base_alpha * (uint32_t)cov) >> 8;
+                    *row = os_alpha_blend((a << 24) | rgb, *row);
                     row++;
                     continue;
                 }
             }
-            if ((color >> 24) == 0xFF) {
+
+            if (base_alpha == 255) {
                 *row++ = color;
             } else {
                 *row = os_alpha_blend(color, *row);
@@ -695,7 +727,7 @@ static inline void os_fill_rounded_rect(os_window_t *win, int x, int y, int w, i
     }
 }
 
-/* Smooth Rounded Rectangle Outline */
+/* Smooth Rounded Rectangle Outline with Subpixel Anti-Aliasing */
 static inline void os_draw_rounded_rect(os_window_t *win, int x, int y, int w, int h, int r, uint32_t color) {
     if (!win || !win->canvas || w <= 0 || h <= 0) return;
     if (r <= 0) {
@@ -710,17 +742,229 @@ static inline void os_draw_rounded_rect(os_window_t *win, int x, int y, int w, i
     os_fill_rect(win, x, y + r, 1, h - 2 * r, color);
     os_fill_rect(win, x + w - 1, y + r, 1, h - 2 * r, color);
 
+    uint32_t base_alpha = (color >> 24) & 0xFF;
+    uint32_t rgb = color & 0x00FFFFFF;
+    int r_outer_fp = r << 8;
+    int r_inner_fp = (r > 1 ? (r - 1) : 0) << 8;
+
     for (int dy = 0; dy <= r; dy++) {
         for (int dx = 0; dx <= r; dx++) {
-            int d = dx * dx + dy * dy;
-            if (d >= (r - 1) * (r - 1) && d <= r * r) {
-                os_put_pixel_blend(win, x + r - dx, y + r - dy, color);
-                os_put_pixel_blend(win, x + w - 1 - r + dx, y + r - dy, color);
-                os_put_pixel_blend(win, x + r - dx, y + h - 1 - r + dy, color);
-                os_put_pixel_blend(win, x + w - 1 - r + dx, y + h - 1 - r + dy, color);
-            }
+            int d2 = dx * dx + dy * dy;
+            int d_fp = (int)os_isqrt((uint32_t)(d2 << 16));
+            int cov_out = r_outer_fp + 128 - d_fp;
+            int cov_in  = d_fp - (r_inner_fp - 128);
+            int cov = cov_out < cov_in ? cov_out : cov_in;
+            if (cov <= 0) continue;
+            if (cov > 255) cov = 255;
+            uint32_t a = (base_alpha * (uint32_t)cov) >> 8;
+            if (a == 0) continue;
+            uint32_t c = (a << 24) | rgb;
+
+            os_put_pixel_blend(win, x + r - dx, y + r - dy, c);
+            os_put_pixel_blend(win, x + w - 1 - r + dx, y + r - dy, c);
+            os_put_pixel_blend(win, x + r - dx, y + h - 1 - r + dy, c);
+            os_put_pixel_blend(win, x + w - 1 - r + dx, y + h - 1 - r + dy, c);
         }
     }
+}
+
+/* =============================================================================
+ * Anti-Aliased Typography Engine (Segoe UI 16px & Consolas 15px)
+ * ============================================================================= */
+
+static inline void os_draw_char_ui_aa(os_window_t *win, int x, int y, char c, uint32_t color) {
+    if (!win || !win->canvas) return;
+    if (c < 32 || c > 126) c = ' ';
+    int idx = c - 32;
+    const uint8_t *glyph = os_font_ui_data[idx];
+    int cw = win->client_w;
+    int ch = win->client_h;
+    uint32_t base_alpha = (color >> 24) & 0xFF;
+    if (base_alpha == 0) return;
+    uint32_t rgb = color & 0x00FFFFFF;
+
+    for (int row = 0; row < OS_FONT_UI_H; row++) {
+        int py = y + row;
+        if (py < 0 || py >= ch) continue;
+        uint32_t *prow = win->canvas + py * cw;
+        const uint8_t *grow = glyph + row * OS_FONT_UI_MAX_W;
+        for (int col = 0; col < OS_FONT_UI_MAX_W; col++) {
+            uint32_t galpha = grow[col];
+            if (galpha == 0) continue;
+            int px = x + col;
+            if (px < 0 || px >= cw) continue;
+
+            uint32_t final_alpha = (base_alpha * galpha) >> 8;
+            if (final_alpha == 0) continue;
+
+            prow[px] = os_alpha_blend((final_alpha << 24) | rgb, prow[px]);
+        }
+    }
+}
+
+static inline int os_text_width_ui_aa(const char *str) {
+    if (!str) return 0;
+    int w = 0;
+    while (*str) {
+        if (*str == '\n') break;
+        char c = *str;
+        if (c >= 32 && c <= 126) {
+            w += os_font_ui_widths[c - 32];
+        } else {
+            w += 6;
+        }
+        str++;
+    }
+    return w;
+}
+
+static inline int os_draw_text_ui_aa(os_window_t *win, int x, int y, const char *str, uint32_t color) {
+    if (!win || !win->canvas || !str) return 0;
+    int cur_x = x;
+    while (*str) {
+        if (*str == '\n') {
+            cur_x = x;
+            y += 20;
+        } else {
+            char c = *str;
+            if (c >= 32 && c <= 126) {
+                os_draw_char_ui_aa(win, cur_x, y, c, color);
+                cur_x += os_font_ui_widths[c - 32];
+            } else {
+                cur_x += 6;
+            }
+        }
+        str++;
+    }
+    return cur_x - x;
+}
+
+static inline void os_draw_char_mono_aa(os_window_t *win, int x, int y, char c, uint32_t color) {
+    if (!win || !win->canvas) return;
+    if (c < 32 || c > 126) c = ' ';
+    int idx = c - 32;
+    const uint8_t *glyph = os_font_mono_data[idx];
+    int cw = win->client_w;
+    int ch = win->client_h;
+    uint32_t base_alpha = (color >> 24) & 0xFF;
+    if (base_alpha == 0) return;
+    uint32_t rgb = color & 0x00FFFFFF;
+
+    for (int row = 0; row < OS_FONT_MONO_H; row++) {
+        int py = y + row;
+        if (py < 0 || py >= ch) continue;
+        uint32_t *prow = win->canvas + py * cw;
+        const uint8_t *grow = glyph + row * OS_FONT_MONO_W;
+        for (int col = 0; col < OS_FONT_MONO_W; col++) {
+            uint32_t galpha = grow[col];
+            if (galpha == 0) continue;
+            int px = x + col;
+            if (px < 0 || px >= cw) continue;
+
+            uint32_t final_alpha = (base_alpha * galpha) >> 8;
+            if (final_alpha == 0) continue;
+
+            prow[px] = os_alpha_blend((final_alpha << 24) | rgb, prow[px]);
+        }
+    }
+}
+
+static inline int os_draw_text_mono_aa(os_window_t *win, int x, int y, const char *str, uint32_t color) {
+    if (!win || !win->canvas || !str) return 0;
+    int cur_x = x;
+    while (*str) {
+        if (*str == '\n') {
+            cur_x = x;
+            y += 20;
+        } else {
+            char c = *str;
+            if (c >= 32 && c <= 126) {
+                os_draw_char_mono_aa(win, cur_x, y, c, color);
+            }
+            cur_x += OS_FONT_MONO_W;
+        }
+        str++;
+    }
+    return cur_x - x;
+}
+
+/* Bilinear smooth 2x scaling for large digits / display (16x30) */
+static inline void os_draw_char_mono_aa_2x(os_window_t *win, int x, int y, char c, uint32_t color) {
+    if (!win || !win->canvas) return;
+    if (c < 32 || c > 126) c = ' ';
+    int idx = c - 32;
+    const uint8_t *glyph = os_font_mono_data[idx];
+    int cw = win->client_w;
+    int ch = win->client_h;
+    uint32_t base_alpha = (color >> 24) & 0xFF;
+    if (base_alpha == 0) return;
+    uint32_t rgb = color & 0x00FFFFFF;
+
+    for (int py = 0; py < 30; py++) {
+        int vy = y + py;
+        if (vy < 0 || vy >= ch) continue;
+        uint32_t *prow = win->canvas + vy * cw;
+
+        int gy = py >> 1;
+        int fy = (py & 1) ? 128 : 0;
+        int gy2 = (gy + 1 < OS_FONT_MONO_H) ? gy + 1 : gy;
+
+        for (int px = 0; px < 16; px++) {
+            int vx = x + px;
+            if (vx < 0 || vx >= cw) continue;
+
+            int gx = px >> 1;
+            int fx = (px & 1) ? 128 : 0;
+            int gx2 = (gx + 1 < OS_FONT_MONO_W) ? gx + 1 : gx;
+
+            uint32_t a00 = glyph[gy * OS_FONT_MONO_W + gx];
+            uint32_t a10 = glyph[gy * OS_FONT_MONO_W + gx2];
+            uint32_t a01 = glyph[gy2 * OS_FONT_MONO_W + gx];
+            uint32_t a11 = glyph[gy2 * OS_FONT_MONO_W + gx2];
+
+            uint32_t top = a00 * (256 - fx) + a10 * fx;
+            uint32_t bot = a01 * (256 - fx) + a11 * fx;
+            uint32_t galpha = (top * (256 - fy) + bot * fy) >> 16;
+
+            if (galpha < 8) continue;
+            uint32_t final_alpha = (base_alpha * galpha) >> 8;
+            if (final_alpha == 0) continue;
+
+            prow[vx] = os_alpha_blend((final_alpha << 24) | rgb, prow[vx]);
+        }
+    }
+}
+
+static inline int os_draw_text_mono_aa_2x(os_window_t *win, int x, int y, const char *str, uint32_t color) {
+    if (!win || !win->canvas || !str) return 0;
+    int cur_x = x;
+    while (*str) {
+        char c = *str;
+        if (c >= 32 && c <= 126) {
+            os_draw_char_mono_aa_2x(win, cur_x, y, c, color);
+        }
+        cur_x += 16;
+        str++;
+    }
+    return cur_x - x;
+}
+
+/* Modern Vector Icons */
+static inline void os_draw_icon_folder(os_window_t *win, int x, int y) {
+    os_fill_rounded_rect(win, x, y, 10, 6, 2, OS_ARGB(0xFF, 0x02, 0x84, 0xC7));
+    os_fill_rounded_rect(win, x, y + 4, 22, 14, 3, OS_ARGB(0xFF, 0x38, 0xBD, 0xF8));
+    os_fill_rounded_rect(win, x + 1, y + 6, 20, 11, 2, OS_ARGB(0xFF, 0x7D, 0xD3, 0xFC));
+    os_fill_rect(win, x + 3, y + 6, 16, 1, OS_ARGB(0x70, 0xFF, 0xFF, 0xFF));
+}
+
+static inline void os_draw_icon_file(os_window_t *win, int x, int y, int is_elf) {
+    uint32_t bg = is_elf ? OS_ARGB(0xFF, 0x63, 0x66, 0xF1) : OS_ARGB(0xFF, 0x47, 0x55, 0x69);
+    uint32_t fg = is_elf ? OS_COLOR_CYAN_NEON : OS_COLOR_SLATE_200;
+    os_fill_rounded_rect(win, x, y, 18, 20, 3, bg);
+    os_fill_rect(win, x + 11, y, 7, 7, OS_ARGB(0x40, 0x00, 0x00, 0x00));
+    os_fill_rect(win, x + 3, y + 8, 12, 2, fg);
+    os_fill_rect(win, x + 3, y + 12, 10, 2, fg);
+    os_fill_rect(win, x + 3, y + 16, 7, 1, OS_ARGB(0x80, 0xFF, 0xFF, 0xFF));
 }
 
 /* Elevated Acrylic Glass Card with specular rim */
@@ -732,26 +976,26 @@ static inline void os_draw_card(os_window_t *win, int x, int y, int w, int h, ui
     }
 }
 
-/* Modern pill or card button with interactive hover/pressed states */
+/* Modern pill or card button with interactive hover/pressed states and Segoe UI typography */
 static inline void os_draw_button_modern(os_window_t *win, int x, int y, int w, int h, const char *text, uint32_t accent, int is_hovered, int is_pressed) {
     uint32_t bg = is_pressed ? OS_COLOR_SLATE_950 : (is_hovered ? OS_COLOR_SLATE_700 : OS_COLOR_SLATE_800);
     uint32_t border = is_hovered ? accent : OS_COLOR_SLATE_600;
     os_draw_card(win, x, y, w, h, bg, border, 6);
-    int tlen = (int)os_strlen(text);
-    int tx = x + (w - tlen * 8) / 2 + (is_pressed ? 1 : 0);
-    int ty = y + (h - 8) / 2 + (is_pressed ? 1 : 0);
+    int tw = os_text_width_ui_aa(text);
+    int tx = x + (w - tw) / 2 + (is_pressed ? 1 : 0);
+    int ty = y + (h - OS_FONT_UI_H) / 2 + (is_pressed ? 1 : 0);
     uint32_t fg = is_pressed ? OS_COLOR_SLATE_400 : (is_hovered ? OS_COLOR_WHITE : OS_COLOR_SLATE_200);
-    os_draw_text(win, tx, ty, text, fg);
+    os_draw_text_ui_aa(win, tx, ty, text, fg);
 }
 
-/* Category or Type Badge */
+/* Category or Type Badge with Segoe UI typography */
 static inline void os_draw_badge(os_window_t *win, int x, int y, const char *text, uint32_t bg, uint32_t fg) {
-    int tlen = (int)os_strlen(text);
-    int bw = tlen * 8 + 12;
-    int bh = 18;
-    os_fill_rounded_rect(win, x, y, bw, bh, 4, bg);
-    os_draw_rounded_rect(win, x, y, bw, bh, 4, OS_ARGB(0x40, 0xFF, 0xFF, 0xFF));
-    os_draw_text(win, x + 6, y + 5, text, fg);
+    int tw = os_text_width_ui_aa(text);
+    int bw = tw + 16;
+    int bh = 20;
+    os_fill_rounded_rect(win, x, y, bw, bh, 5, bg);
+    os_draw_rounded_rect(win, x, y, bw, bh, 5, OS_ARGB(0x40, 0xFF, 0xFF, 0xFF));
+    os_draw_text_ui_aa(win, x + 8, y + 2, text, fg);
 }
 
 /* Modern Minimalist Scrollbar */
