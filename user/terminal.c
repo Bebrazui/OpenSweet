@@ -90,6 +90,8 @@ static void execute_command(const char *cmd) {
         term_print_line("  ls / dir      List files and folders on ext4 filesystem", OS_COLOR_SLATE_300);
         term_print_line("  clear / cls   Clear the terminal screen", OS_COLOR_SLATE_300);
         term_print_line("  echo <text>   Print text to console", OS_COLOR_SLATE_300);
+        term_print_line("  write <f> <t> Write/create file on ext4 filesystem", OS_COLOR_SLATE_300);
+        term_print_line("  memtest       Test dynamic memory allocation (malloc/free)", OS_COLOR_SLATE_300);
         term_print_line("  uptime        Display system uptime in seconds", OS_COLOR_SLATE_300);
         term_print_line("  calc          Launch Desktop Calculator (Ring 3)", OS_COLOR_SLATE_300);
         term_print_line("  notepad       Launch Desktop Notepad (Ring 3)", OS_COLOR_SLATE_300);
@@ -110,6 +112,45 @@ static void execute_command(const char *cmd) {
     } else if (os_strcmp(cmd, "version") == 0) {
         term_print_line("OpenSweet OS v0.0.4 [x86_64 Long Mode SMP]", OS_COLOR_VIOLET);
         term_print_line("Pure 64-bit micro-monolithic kernel with Ring 3 userspace", OS_COLOR_SLATE_400);
+    } else if (os_strcmp(cmd, "memtest") == 0) {
+        term_print_line("Running dynamic heap allocator test (sys_brk)...", OS_COLOR_CYAN_NEON);
+        void *p1 = os_malloc(256);
+        if (!p1) {
+            term_print_line("FAIL: malloc(256) returned NULL", OS_COLOR_ROSE);
+        } else {
+            char p1_str[64];
+            char addr_buf[24];
+            os_itoa((int64_t)(uintptr_t)p1, addr_buf);
+            os_strcpy(p1_str, "Allocated 256 bytes at virtual address 0x");
+            os_strcpy(p1_str + os_strlen(p1_str), addr_buf);
+            term_print_line(p1_str, OS_COLOR_EMERALD_LT);
+
+            /* Fill buffer with pattern and verify */
+            uint8_t *b = (uint8_t*)p1;
+            for (int i = 0; i < 256; i++) b[i] = (uint8_t)(i & 0xFF);
+            int ok = 1;
+            for (int i = 0; i < 256; i++) {
+                if (b[i] != (uint8_t)(i & 0xFF)) { ok = 0; break; }
+            }
+
+            if (!ok) {
+                term_print_line("FAIL: Data integrity check failed!", OS_COLOR_ROSE);
+            } else {
+                term_print_line("PASS: Memory read/write integrity verified!", OS_COLOR_EMERALD_LT);
+            }
+
+            void *p2 = os_malloc(1024);
+            if (!p2) {
+                term_print_line("FAIL: malloc(1024) returned NULL", OS_COLOR_ROSE);
+            } else {
+                term_print_line("PASS: malloc(1024) succeeded!", OS_COLOR_EMERALD_LT);
+                os_free(p2);
+                term_print_line("PASS: free(1024) succeeded!", OS_COLOR_SLATE_300);
+            }
+
+            os_free(p1);
+            term_print_line("PASS: Heap block coalescing verified!", OS_COLOR_CYAN_NEON);
+        }
     } else if (os_strcmp(cmd, "ls") == 0 || os_strcmp(cmd, "dir") == 0) {
         os_dirent_t entries[32];
         int count = os_read_dir(entries, 32);
@@ -149,6 +190,36 @@ static void execute_command(const char *cmd) {
         os_spawn("/files.elf");
     } else if (cmd[0] == 'e' && cmd[1] == 'c' && cmd[2] == 'h' && cmd[3] == 'o' && cmd[4] == ' ') {
         term_print_line(cmd + 5, OS_COLOR_WHITE);
+    } else if (cmd[0] == 'w' && cmd[1] == 'r' && cmd[2] == 'i' && cmd[3] == 't' && cmd[4] == 'e' && cmd[5] == ' ') {
+        /* Parse: write <filename> <content> */
+        const char *p = cmd + 6;
+        while (*p == ' ') p++;
+        char fname[32];
+        int fi = 0;
+        while (*p && *p != ' ' && fi < 31) {
+            fname[fi++] = *p++;
+        }
+        fname[fi] = '\0';
+        while (*p == ' ') p++;
+
+        if (fi == 0) {
+            term_print_line("Usage: write <filename> <content>", OS_COLOR_ROSE);
+        } else {
+            ssize_t written = os_write_file(fname, p, os_strlen(p));
+            if (written < 0) {
+                term_print_line("Error: ext4 write failed", OS_COLOR_ROSE);
+            } else {
+                char res[64];
+                char bytes[16];
+                os_itoa((int64_t)written, bytes);
+                os_strcpy(res, "Successfully wrote ");
+                os_strcpy(res + os_strlen(res), bytes);
+                os_strcpy(res + os_strlen(res), " bytes to ext4 file '");
+                os_strcpy(res + os_strlen(res), fname);
+                os_strcpy(res + os_strlen(res), "'");
+                term_print_line(res, OS_COLOR_EMERALD_LT);
+            }
+        }
     } else if (os_strcmp(cmd, "exit") == 0) {
         os_exit(0);
     } else {

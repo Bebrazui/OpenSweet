@@ -17,6 +17,8 @@ SYS_APP_REGISTER   = 14
 SYS_APP_INFO       = 15
 SYS_LISTDIR        = 16
 SYS_SPAWN          = 17
+SYS_BRK            = 18
+SYS_WRITE_FILE     = 19
 
 align 16
 sys_user_rsp       dq 0
@@ -151,6 +153,10 @@ syscall_entry:
     je .do_listdir
     cmp eax, SYS_SPAWN
     je .do_spawn
+    cmp eax, SYS_BRK
+    je .do_brk
+    cmp eax, SYS_WRITE_FILE
+    je .do_write_file
 
     ; Unimplemented syscall
     mov rax, -1
@@ -224,6 +230,16 @@ syscall_entry:
 .do_spawn:
     ; RDI = user path pointer
     call sys_handler_spawn
+    jmp .syscall_ret
+
+.do_brk:
+    ; RDI = new brk address (or 0 to query current brk)
+    call sys_handler_brk
+    jmp .syscall_ret
+
+.do_write_file:
+    ; RDI = path, RSI = buffer, RDX = count
+    call sys_handler_write_file
     jmp .syscall_ret
 
 .syscall_ret:
@@ -645,4 +661,167 @@ sys_handler_spawn:
     pop rbx
     mov rax, -1
     ret
+
+; ==============================================================================
+; sys_handler_brk: Change data segment size (heap brk) for current Ring 3 task
+; RDI = requested new brk address (or 0 to query current brk)
+; Returns: RAX = current/new brk address, or -1 on failure
+; ==============================================================================
+sys_handler_brk:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+
+    ; Get current task TCB
+    mov eax, [r15 + sched_curr_task - kmain]
+    imul eax, TCB_SIZE
+    lea rbx, [r15 + task_table - kmain + rax]
+
+    ; Check if query (RDI == 0)
+    test rdi, rdi
+    jz .brk_query
+
+    ; Validate requested address: must be >= 0x00500000 and < 0x00600000 (heap range)
+    cmp rdi, 0x00500000
+    jb .brk_fail
+    cmp rdi, 0x00600000
+    jae .brk_fail
+
+    ; Update current brk
+    mov [rbx + TCB_HEAP_BRK], edi
+    mov eax, edi
+    jmp .brk_done
+
+.brk_query:
+    mov eax, [rbx + TCB_HEAP_BRK]
+    test eax, eax
+    jnz .brk_done
+    ; Default initial brk if 0
+    mov eax, 0x00500000
+    mov [rbx + TCB_HEAP_BRK], eax
+
+.brk_done:
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+.brk_fail:
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    mov rax, -1
+    ret
+
+; ==============================================================================
+; sys_handler_write_file: Create or write data to an ext4 file
+; RDI = user path pointer (ASCIIZ, e.g. "/notes.txt")
+; RSI = user buffer with file content
+; RDX = byte count (up to 1024 for ext4 write block)
+; Returns: RAX = bytes written, or -1 on error
+; ==============================================================================
+sys_handler_write_file:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r12
+    push r13
+    push r14
+    push r15
+    sub rsp, 64
+
+    test rdi, rdi
+    jz .wf_err
+    test rsi, rsi
+    jz .wf_err
+
+    mov r12, rsi                      ; r12 = user data buffer
+    mov r13, rdx                      ; r13 = count
+
+    ; Validate path pointer
+    mov rsi, 64
+    call sys_validate_user_ptr
+    jc .wf_err
+
+    ; Validate data buffer pointer
+    mov rdi, r12
+    mov rsi, r13
+    call sys_validate_user_ptr
+    jc .wf_err
+
+    ; Copy path string to stack buffer
+    mov rsi, [rsp + 64 + 32]          ; saved rdi (original user path)
+    lea rdi, [rsp]
+    mov ecx, 63
+.wf_cp_path:
+    lodsb
+    stosb
+    test al, al
+    jz .wf_cp_done
+    dec ecx
+    jnz .wf_cp_path
+    mov byte [rdi], 0
+.wf_cp_done:
+
+    ; Skip leading slash '/' if present
+    lea rsi, [rsp]
+    cmp byte [rsi], '/'
+    jne @f
+    inc rsi
+@@:
+    ; Check if file already exists in ext4
+    call ext4_lookup
+    test eax, eax
+    jnz .wf_have_inode
+
+    ; File does not exist, create it!
+    call ext4_create_file
+    cmp eax, -1
+    je .wf_err
+
+.wf_have_inode:
+    ; EAX = inode number
+    mov rdi, rax                      ; rdi = inode
+    mov rax, rdi                      ; rax = inode
+    mov rsi, r12                      ; rsi = user buffer
+    mov rdx, r13                      ; rdx = count
+    call ext4_write_file
+    cmp rax, -1
+    je .wf_err
+
+    ; RAX contains bytes written
+    add rsp, 64
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+.wf_err:
+    add rsp, 64
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    mov rax, -1
+    ret
+
 

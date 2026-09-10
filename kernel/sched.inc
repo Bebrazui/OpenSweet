@@ -30,6 +30,7 @@ TCB_NAME        = 0x30                ; 8 bytes: ASCIIZ task name
 TCB_CR3         = 0x38                ; uint64: CR3 page directory base (phys)
 TCB_USER_RSP    = 0x40                ; uint64: Saved user RSP for Ring 3 task
 TCB_IS_USER     = 0x48                ; uint32: 1 if Ring 3 user task, 0 if kernel
+TCB_HEAP_BRK    = 0x4C                ; uint32: Current heap brk virtual address for Ring 3 task
 TCB_FXSAVE      = 0x50                ; 512 bytes: 16-byte aligned FXSAVE/FXRSTOR area
 TCB_SIZE        = 592                 ; 0x50 + 512 = 592 bytes (multiple of 16)
 
@@ -451,6 +452,7 @@ task_finalize_user:
     mov dword [rdi + TCB_SLICE], SCHED_QUANTUM
     mov qword [rdi + TCB_TICKS], 0
     mov dword [rdi + TCB_IS_USER], 1
+    mov dword [rdi + TCB_HEAP_BRK], 0x00500000 ; Initial user heap base (5MB)
     mov [rdi + TCB_USER_RSP], r11
 
     ; Copy name (up to 7 chars)

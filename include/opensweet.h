@@ -51,6 +51,8 @@ typedef _Bool bool;
 #define SYS_APP_INFO       15
 #define SYS_LISTDIR        16
 #define SYS_SPAWN          17
+#define SYS_BRK            18
+#define SYS_WRITE_FILE     19
 
 /* File System Directory Entry Structure */
 typedef struct {
@@ -280,6 +282,155 @@ static inline int os_read_dir(os_dirent_t *entries, int max_entries) {
 static inline int os_spawn(const char *path) {
     if (!path) return -1;
     return (int)os_syscall1(SYS_SPAWN, (int64_t)path);
+}
+
+/* Write/create a file on ext4 filesystem */
+static inline ssize_t os_write_file(const char *path, const void *buf, size_t count) {
+    if (!path) return -1;
+    return (ssize_t)os_syscall3(SYS_WRITE_FILE, (int64_t)path, (int64_t)buf, (int64_t)count);
+}
+
+/* Adjust or query process heap break (sys_brk) */
+static inline void *os_brk(void *addr) {
+    return (void*)(uintptr_t)os_syscall1(SYS_BRK, (int64_t)addr);
+}
+
+/* =============================================================================
+ * Dynamic Memory Allocation (malloc, free, realloc, calloc)
+ * Simple, robust boundary-tag heap allocator built on top of os_brk.
+ * ============================================================================= */
+typedef struct os_mem_block {
+    size_t size;                /* Size of user data area */
+    int is_free;                /* 1 if free, 0 if allocated */
+    struct os_mem_block *next;  /* Pointer to next block */
+} os_mem_block_t;
+
+#define OS_MEM_BLOCK_HEADER_SIZE sizeof(os_mem_block_t)
+
+static os_mem_block_t *os_heap_head = NULL;
+
+static inline void *os_malloc(size_t size) {
+    if (size == 0) return NULL;
+
+    /* Align size to 16 bytes */
+    size = (size + 15) & ~((size_t)15);
+
+    /* Search for first matching free block */
+    os_mem_block_t *curr = os_heap_head;
+    os_mem_block_t *prev = NULL;
+
+    while (curr) {
+        if (curr->is_free && curr->size >= size) {
+            /* Split block if extra capacity is large enough */
+            if (curr->size >= size + OS_MEM_BLOCK_HEADER_SIZE + 16) {
+                os_mem_block_t *split = (os_mem_block_t*)((uint8_t*)(curr + 1) + size);
+                split->size = curr->size - size - OS_MEM_BLOCK_HEADER_SIZE;
+                split->is_free = 1;
+                split->next = curr->next;
+                curr->next = split;
+                curr->size = size;
+            }
+            curr->is_free = 0;
+            return (void*)(curr + 1);
+        }
+        prev = curr;
+        curr = curr->next;
+    }
+
+    /* No free block large enough; expand heap via os_brk */
+    void *current_brk = os_brk(NULL);
+    if (!current_brk || (int64_t)(uintptr_t)current_brk == -1) return NULL;
+
+    size_t total_needed = OS_MEM_BLOCK_HEADER_SIZE + size;
+    void *new_brk = (void*)((uint8_t*)current_brk + total_needed);
+    void *allocated_brk = os_brk(new_brk);
+    if (allocated_brk != new_brk) {
+        return NULL; /* Out of memory or brk limit exceeded */
+    }
+
+    os_mem_block_t *block = (os_mem_block_t*)current_brk;
+    block->size = size;
+    block->is_free = 0;
+    block->next = NULL;
+
+    if (prev) {
+        prev->next = block;
+    } else {
+        os_heap_head = block;
+    }
+
+    return (void*)(block + 1);
+}
+
+static inline void os_free(void *ptr) {
+    if (!ptr) return;
+
+    os_mem_block_t *block = ((os_mem_block_t*)ptr) - 1;
+    block->is_free = 1;
+
+    /* Coalesce adjacent free blocks */
+    os_mem_block_t *curr = os_heap_head;
+    while (curr && curr->next) {
+        if (curr->is_free && curr->next->is_free) {
+            curr->size += OS_MEM_BLOCK_HEADER_SIZE + curr->next->size;
+            curr->next = curr->next->next;
+        } else {
+            curr = curr->next;
+        }
+    }
+}
+
+static inline void *os_realloc(void *ptr, size_t new_size) {
+    if (!ptr) return os_malloc(new_size);
+    if (new_size == 0) {
+        os_free(ptr);
+        return NULL;
+    }
+
+    os_mem_block_t *block = ((os_mem_block_t*)ptr) - 1;
+    if (block->size >= new_size) {
+        return ptr; /* Already fits */
+    }
+
+    void *new_ptr = os_malloc(new_size);
+    if (!new_ptr) return NULL;
+
+    /* Copy existing data */
+    uint8_t *dst = (uint8_t*)new_ptr;
+    const uint8_t *src = (const uint8_t*)ptr;
+    for (size_t i = 0; i < block->size; i++) {
+        dst[i] = src[i];
+    }
+
+    os_free(ptr);
+    return new_ptr;
+}
+
+static inline void *os_calloc(size_t num, size_t size) {
+    size_t total = num * size;
+    void *ptr = os_malloc(total);
+    if (ptr) {
+        uint8_t *p = (uint8_t*)ptr;
+        for (size_t i = 0; i < total; i++) p[i] = 0;
+    }
+    return ptr;
+}
+
+/* Standard C library aliases */
+__attribute__((weak)) void *malloc(size_t size) {
+    return os_malloc(size);
+}
+
+__attribute__((weak)) void free(void *ptr) {
+    os_free(ptr);
+}
+
+__attribute__((weak)) void *realloc(void *ptr, size_t size) {
+    return os_realloc(ptr, size);
+}
+
+__attribute__((weak)) void *calloc(size_t num, size_t size) {
+    return os_calloc(num, size);
 }
 
 /* =============================================================================
