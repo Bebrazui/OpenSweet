@@ -152,6 +152,17 @@ kmain:
     mov eax, FB_CLR_DEFAULT
     call fb_console_set_color
 
+    ; Install Modern C Apps from ext4 into Dock Registry (slots 0..3)
+    lea rsi, [r15 + str_reg_term_path - kmain]
+    call app_reg_install_by_path
+
+    lea rsi, [r15 + str_reg_file_path - kmain]
+    call app_reg_install_by_path
+    lea rsi, [r15 + str_reg_calc_path - kmain]
+    call app_reg_install_by_path
+    lea rsi, [r15 + str_reg_note_path - kmain]
+    call app_reg_install_by_path
+
     ; Launch Native C Terminal in Ring 3 as the default desktop shell
     lea rsi, [r15 + str_reg_term_path - kmain]
     call elf_load_from_ext4
@@ -172,7 +183,7 @@ kmain:
 
 .no_render:
     call getc
-    test al, al
+    test ah, ah
     jnz .key
 
     ; Fast path: If mouse moved or button changed while blitting, loop immediately without hlt sleep
@@ -189,32 +200,35 @@ kmain:
 
     hlt                       ; sleep until IRQ
     jmp .shell
-.key:
-    ; Check if focused window is a user application window (wm_focus_app >= 4)
-    cmp byte [r15 + wm_focus_app - kmain], 4
-    jb .term_key
 
-    ; Route key to user application event queue
+.key:
+    ; AH = event type (4 = KEY_DOWN, 6 = KEY_UP)
+    ; AL = key code
     movzx ebx, byte [r15 + wm_focus_app - kmain]
-    sub ebx, 4                         ; ebx = slot (0..3)
-    shl ebx, 4                         ; slot * 16
-    lea rdi, [r15 + wm_user_events - kmain + rbx]
-    mov dword [rdi + 0], 4             ; EVENT_KEY_DOWN = 4
-    mov dword [rdi + 4], 0
-    mov dword [rdi + 8], 0
-    movzx eax, al                      ; ASCII key code
-    mov dword [rdi + 12], eax          ; param = key
-    movzx ebx, byte [r15 + wm_focus_app - kmain]
-    sub ebx, 4
-    mov byte [r15 + wm_user_has_event - kmain + rbx], 1
-    mov byte [r15 + md_term_dirty - kmain], 1
+    cmp bl, APP_COUNT
+    jae .term_key_check
+
+    ; Route key to focused application event queue (both KEY_DOWN and KEY_UP)
+    movzx r8d, al                      ; param = key code
+    movzx eax, ah                      ; event_type = 4 (DOWN) or 6 (UP)
+    xor ecx, ecx
+    xor edx, edx
+    call wm_post_event
     jmp .shell
+
+.term_key_check:
+    cmp ah, 4                          ; Terminal CLI only cares about KEY_DOWN!
+    jne .shell
 
 .term_key:
     cmp al, 10
     je .enter
     cmp al, 8
     je .bs
+    cmp al, 32
+    jb .shell
+    cmp al, 126
+    ja .shell
     movzx ecx, byte [r15 + cmd_len - kmain]
     cmp ecx, 127
     jae .echo
@@ -1606,13 +1620,18 @@ kmain:
     call modern_desktop_render
     jmp .shell
 
-; --- read next ASCII from keyboard ring buffer; AL=0 if empty ---
+; --- read next key event from keyboard ring buffer ---
+; Output:
+; AL = key code (0 if empty)
+; AH = event type (0 if empty, 4 = KEY_DOWN, 6 = KEY_UP)
 getc:
     movzx ecx, byte [r15 + kb_tail - kmain]
     movzx edx, byte [r15 + kb_head - kmain]
     cmp ecx, edx
     je .empty
-    mov al, [r15 + kb_buf - kmain + rcx]
+    movzx ebx, cl
+    shl ebx, 1                ; 2 bytes per entry
+    movzx eax, word [r15 + kb_buf - kmain + rbx]
     inc ecx
     and ecx, 31
     mov [r15 + kb_tail - kmain], cl
@@ -1621,7 +1640,7 @@ getc:
     xor eax, eax
     ret
 
-; --- IRQ1: translate scancode -> ASCII, push into ring buffer ---
+; --- IRQ1: translate scancode -> key event (make/break), push into ring buffer ---
 kb_irq:
     in  al, 0x64
     test al, 0x20             ; bit 5: 1 = mouse / aux, 0 = keyboard
@@ -1629,43 +1648,92 @@ kb_irq:
     test al, 0x01             ; bit 0: 1 = output buffer has data
     jz .skip
     in  al, 0x60
+
+    ; Check for extended 0xE0 prefix
+    cmp al, 0xE0
+    jne .not_e0
+    mov byte [r15 + kb_is_e0 - kmain], 1
+    ret
+
+.not_e0:
+    cmp byte [r15 + kb_is_e0 - kmain], 1
+    je .extended_key
+
+    ; --- Normal key (not 0xE0) ---
     cmp al, 0x2A              ; LShift make
     je .sh_on
     cmp al, 0x36              ; RShift make
     je .sh_on
-    cmp al, 0xAA
+    cmp al, 0xAA              ; LShift break
     je .sh_off
-    cmp al, 0xB6
+    cmp al, 0xB6              ; RShift break
     je .sh_off
-    test al, 0x80             ; ignore breaks
-    jnz .skip
+
+    ; Determine event type (make vs break)
+    mov ah, 4                 ; default = 4 (KEY_DOWN)
+    test al, 0x80
+    jz .norm_make
+    mov ah, 6                 ; 6 = KEY_UP
+    and al, 0x7F              ; clear bit 7 to get scancode
+.norm_make:
     cmp al, KEYMAP_SIZE
     jae .skip
+
     lea rbx, [r15 + keymap_norm - kmain]
     cmp byte [r15 + shift - kmain], 0
-    je .sel
+    je .norm_lookup
     lea rbx, [r15 + keymap_shift - kmain]
-.sel:
+.norm_lookup:
     movzx r8d, al
     mov al, [rbx + r8]
     test al, al
     jz .skip
+    jmp .push_event
+
+.extended_key:
+    mov byte [r15 + kb_is_e0 - kmain], 0
+    mov ah, 4                 ; default = 4 (KEY_DOWN)
+    test al, 0x80
+    jz .ext_make
+    mov ah, 6                 ; 6 = KEY_UP
+    and al, 0x7F              ; clear bit 7 to get scancode
+.ext_make:
+    cmp al, KEYMAP_SIZE
+    jae .skip
+
+    lea rbx, [r15 + keymap_norm - kmain]
+    movzx r8d, al
+    mov al, [rbx + r8]
+    test al, al
+    jz .skip
+    jmp .push_event
+
+.push_event:
+    ; AL = key code, AH = event type (4 = KEY_DOWN, 6 = KEY_UP)
     movzx ecx, byte [r15 + kb_head - kmain]
     lea edx, [ecx+1]
     and edx, 31
     movzx r8d, byte [r15 + kb_tail - kmain]
     cmp edx, r8d
-    je .skip                  ; full - drop char
-    mov [r15 + kb_buf - kmain + rcx], al
+    je .skip                  ; full - drop event
+    movzx ebx, cl
+    shl ebx, 1                ; 2 bytes per entry
+    mov word [r15 + kb_buf - kmain + rbx], ax
     mov [r15 + kb_head - kmain], dl
 .skip:
     ret
+
 .sh_on:
     mov byte [r15 + shift - kmain], 1
-    ret
+    mov al, 0xB6              ; KEY_RSHIFT
+    mov ah, 4                 ; KEY_DOWN
+    jmp .push_event
+
 .sh_off:
     mov byte [r15 + shift - kmain], 0
-    ret
+    mov al, 0xB6              ; KEY_RSHIFT
+    mov ah, 6                 ; KEY_UP
+    jmp .push_event
 
 ; --- print ASCIIZ string at RSI ---
 puts:
@@ -1717,6 +1785,28 @@ serial_putc:
     mov al, byte [rsp + 8]
     out dx, al
     pop rdx
+    pop rax
+    ret
+
+serial_puthex8:
+    push rax
+    push rax
+    shr al, 4
+    and al, 0x0F
+    add al, '0'
+    cmp al, '9'
+    jbe @f
+    add al, 7
+@@:
+    call serial_putc
+    pop rax
+    and al, 0x0F
+    add al, '0'
+    cmp al, '9'
+    jbe @f
+    add al, 7
+@@:
+    call serial_putc
     pop rax
     ret
 
@@ -2176,6 +2266,9 @@ pmm_init:
 
 ; RAX = phys addr of free page (0 = OOM)
 pmm_alloc:
+    push rbx
+    push r14
+    xor r14d, r14d
     mov ebx, RESERVE_PAGES / 32
 .dw:
     mov eax, [r14 + PMM_BITMAP + rbx*4]
@@ -2188,12 +2281,16 @@ pmm_alloc:
     add ebx, ecx
     shl rbx, 12
     mov rax, rbx
+    pop r14
+    pop rbx
     ret
 .next:
     inc ebx
     cmp ebx, BITMAP_DWORDS
     jb .dw
     xor eax, eax
+    pop r14
+    pop rbx
     ret
 
 ; RAX = zeroed free page phys (0 = OOM)
@@ -2212,11 +2309,14 @@ pmm_alloc_zero:
 
 ; RDI = phys addr to release
 pmm_free:
+    push r14
+    xor r14d, r14d
     shr rdi, 12
     mov ecx, edi
     shr ecx, 5
     and edi, 31
     btr dword [r14 + PMM_BITMAP + rcx*4], edi
+    pop r14
     ret
 
 ; RDI = number of contiguous pages needed
@@ -2228,6 +2328,8 @@ pmm_alloc_contiguous:
     push r8
     push r9
     push r10
+    push r14
+    xor r14d, r14d
 
     mov r8d, edi                      ; r8d = pages needed
     test r8d, r8d
@@ -2301,6 +2403,7 @@ pmm_alloc_contiguous:
     xor eax, eax
 
 .done:
+    pop r14
     pop r10
     pop r9
     pop r8
@@ -2316,6 +2419,8 @@ pmm_free_contiguous:
     push rcx
     push rdi
     push rsi
+    push r14
+    xor r14d, r14d
 
     shr rdi, 12                       ; page index
     xor ecx, ecx
@@ -2331,6 +2436,7 @@ pmm_free_contiguous:
     jmp .free_loop
 
 .free_done:
+    pop r14
     pop rsi
     pop rdi
     pop rcx
@@ -2340,6 +2446,10 @@ pmm_free_contiguous:
 
 ; count free pages -> R8D
 count_free:
+    push rbx
+    push rcx
+    push r14
+    xor r14d, r14d
     xor ebx, ebx
     xor r8d, r8d
 .dw:
@@ -2354,6 +2464,9 @@ count_free:
     inc ebx
     cmp ebx, BITMAP_DWORDS
     jb .dw
+    pop r14
+    pop rcx
+    pop rbx
     ret
 
 ; --- VMM: map/unmap single 4KB pages, tables allocated on demand ---
@@ -3054,9 +3167,10 @@ strpref:
     pop rdi
     pop rsi
     ret
-kb_buf   rb 32
+kb_buf   rb 64
 kb_head  db 0
 kb_tail  db 0
+kb_is_e0 db 0
 timer_ticks dd 0
 ticks_msg db "ticks=", 0
 cmd_len  db 0
@@ -3104,17 +3218,20 @@ TSS64_SIZE = 104
 
 KEYMAP_SIZE = 0x54
 keymap_norm:
-db 0,27,"1234567890-=",8,9
-db "qwertyuiop[]",10,0
-db "asdfghjkl;'",96,0,92
-db "zxcvbnm,./",0,0,0," "
-rb 0x53-$+keymap_norm
+db 0,27,"1234567890-=",8,9        ; 0x00 - 0x0F
+db "qwertyuiop[]",10,0x84       ; 0x10 - 0x1D (0x1D = Left Ctrl -> 0x84)
+db "asdfghjkl;'",96,0,92          ; 0x1E - 0x2B
+db "zxcvbnm,./",0,0,0," "         ; 0x2C - 0x39
+db 0,0,0,0,0,0,0,0,0,0,0,0,0,0    ; 0x3A - 0x47 (14 zeros)
+db 0x80,0,0,0x82,0,0x83,0,0,0x81,0,0,0 ; 0x48 - 0x53 (0x80=Up, 0x82=Left, 0x83=Right, 0x81=Down)
+
 keymap_shift:
-db 0,27,"!@#$%^&*()_+",8,9
-db "QWERTYUIOP{}",10,0
-db 'ASDFGHJKL:"',126,0,"|"
-db "ZXCVBNM<>?",0,0,0," "
-rb 0x53-$+keymap_shift
+db 0,27,"!@#$%^&*()_+",8,9        ; 0x00 - 0x0F
+db "QWERTYUIOP{}",10,0x84       ; 0x10 - 0x1D (0x1D = Left Ctrl -> 0x84)
+db 'ASDFGHJKL:"',126,0,"|"        ; 0x1E - 0x2B
+db "ZXCVBNM<>?",0,0,0," "         ; 0x2C - 0x39
+db 0,0,0,0,0,0,0,0,0,0,0,0,0,0    ; 0x3A - 0x47 (14 zeros)
+db 0x80,0,0,0x82,0,0x83,0,0,0x81,0,0,0 ; 0x48 - 0x53 (0x80=Up, 0x82=Left, 0x83=Right, 0x81=Down)
 
 include '..\drivers\ata.asm'
 include '..\drivers\mouse.asm'
@@ -3123,6 +3240,7 @@ include '..\drivers\console.asm'
 include 'D:\Opensweet\gui\modern_desktop.inc'
 include 'D:\Opensweet\kernel\sched.inc'
 include 'D:\Opensweet\kernel\heap.inc'
+include 'D:\Opensweet\kernel\vfs.inc'
 include 'D:\Opensweet\kernel\syscall.inc'
 include 'D:\Opensweet\kernel\test_user.inc'
 include 'D:\Opensweet\kernel\elf.inc'

@@ -8,6 +8,7 @@
 
 MAX_REG_APPS        = 8
 APP_ENTRY_SIZE      = 160
+OS_APP_PKG_SIZE     = 164 + 7744       ; 7908 bytes: os_app_package_t with 44x44 ARGB icon
 
 ; Field Offsets in App Registry Entry:
 REG_APP_ID          = 0    ; byte (0..7)
@@ -31,28 +32,30 @@ app_custom_icons  rb MAX_REG_APPS * (44 * 44 * 4)
 align 16
 str_inst_path_buf rb 64
 
-; Default Core OS application string tables
+; Default Desktop applications (OpenSweet Team C Apps)
 str_reg_term_name db "Terminal", 0
 str_reg_term_ver  db "1.0.0", 0
-str_reg_term_auth db "OpenSweet Core", 0
+str_reg_term_auth db "OpenSweet Team", 0
 str_reg_term_desc db "Interactive Shell Terminal", 0
 str_reg_term_path db "/terminal.elf", 0
 
 str_reg_file_name db "Files", 0
 str_reg_file_ver  db "1.0.0", 0
-str_reg_file_auth db "OpenSweet Core", 0
-str_reg_file_desc db "ext4 File Explorer", 0
+str_reg_file_auth db "OpenSweet Team", 0
+str_reg_file_desc db "Modern ext4 File Explorer", 0
 str_reg_file_path db "/files.elf", 0
 
-str_reg_sys_name  db "Activity", 0
-str_reg_sys_ver   db "1.0.0", 0
-str_reg_sys_auth  db "OpenSweet Core", 0
-str_reg_sys_desc  db "System Resource Monitor", 0
+str_reg_calc_name db "Calculator", 0
+str_reg_calc_ver  db "1.0.0", 0
+str_reg_calc_auth db "OpenSweet Team", 0
+str_reg_calc_desc db "Modern Fluent Calculator", 0
+str_reg_calc_path db "/calc.elf", 0
 
-str_reg_set_name  db "Settings", 0
-str_reg_set_ver   db "1.0.0", 0
-str_reg_set_auth  db "OpenSweet Core", 0
-str_reg_set_desc  db "OS Personalization & Settings", 0
+str_reg_note_name db "Notepad", 0
+str_reg_note_ver  db "1.0.0", 0
+str_reg_note_auth db "OpenSweet Team", 0
+str_reg_note_desc db "Modern Text Editor", 0
+str_reg_note_path db "/notepad.elf", 0
 
 ; ==============================================================================
 ; app_reg_init: Initialize default core system registry entries
@@ -79,93 +82,8 @@ app_reg_init:
     cld
     rep stosq
 
-    ; --- Entry 0: Terminal ---
-    lea rdi, [r15 + app_registry_data - kmain + 0 * APP_ENTRY_SIZE]
-    mov byte [rdi + REG_APP_ID], 0
-    mov byte [rdi + REG_APP_INSTALLED], 1
-    lea rsi, [r15 + str_reg_term_name - kmain]
-    lea rdx, [rdi + REG_APP_NAME]
-    call .copy_str24
-    lea rsi, [r15 + str_reg_term_ver - kmain]
-    lea rdx, [rdi + REG_APP_VER]
-    call .copy_str12
-    lea rsi, [r15 + str_reg_term_auth - kmain]
-    lea rdx, [rdi + REG_APP_AUTH]
-    call .copy_str32
-    lea rsi, [r15 + str_reg_term_desc - kmain]
-    lea rdx, [rdi + REG_APP_DESC]
-    call .copy_str48
-    lea rsi, [r15 + str_reg_term_path - kmain]
-    lea rdx, [rdi + REG_APP_PATH]
-    call .copy_str32
-    mov word [rdi + REG_APP_ICON_ID], 0
-    lea rax, [r15 + icon_terminal_44x44 - kmain]
-    mov [rdi + REG_APP_ICON_PTR], rax
-
-    ; --- Entry 1: Files ---
-    lea rdi, [r15 + app_registry_data - kmain + 1 * APP_ENTRY_SIZE]
-    mov byte [rdi + REG_APP_ID], 1
-    mov byte [rdi + REG_APP_INSTALLED], 1
-    lea rsi, [r15 + str_reg_file_name - kmain]
-    lea rdx, [rdi + REG_APP_NAME]
-    call .copy_str24
-    lea rsi, [r15 + str_reg_file_ver - kmain]
-    lea rdx, [rdi + REG_APP_VER]
-    call .copy_str12
-    lea rsi, [r15 + str_reg_file_auth - kmain]
-    lea rdx, [rdi + REG_APP_AUTH]
-    call .copy_str32
-    lea rsi, [r15 + str_reg_file_desc - kmain]
-    lea rdx, [rdi + REG_APP_DESC]
-    call .copy_str48
-    lea rsi, [r15 + str_reg_file_path - kmain]
-    lea rdx, [rdi + REG_APP_PATH]
-    call .copy_str32
-    mov word [rdi + REG_APP_ICON_ID], 1
-    lea rax, [r15 + icon_files_44x44 - kmain]
-    mov [rdi + REG_APP_ICON_PTR], rax
-
-    ; --- Entry 2: Activity (Sys) ---
-    lea rdi, [r15 + app_registry_data - kmain + 2 * APP_ENTRY_SIZE]
-    mov byte [rdi + REG_APP_ID], 2
-    mov byte [rdi + REG_APP_INSTALLED], 1
-    lea rsi, [r15 + str_reg_sys_name - kmain]
-    lea rdx, [rdi + REG_APP_NAME]
-    call .copy_str24
-    lea rsi, [r15 + str_reg_sys_ver - kmain]
-    lea rdx, [rdi + REG_APP_VER]
-    call .copy_str12
-    lea rsi, [r15 + str_reg_sys_auth - kmain]
-    lea rdx, [rdi + REG_APP_AUTH]
-    call .copy_str32
-    lea rsi, [r15 + str_reg_sys_desc - kmain]
-    lea rdx, [rdi + REG_APP_DESC]
-    call .copy_str48
-    mov word [rdi + REG_APP_ICON_ID], 2
-    lea rax, [r15 + icon_sys_44x44 - kmain]
-    mov [rdi + REG_APP_ICON_PTR], rax
-
-    ; --- Entry 3: Settings ---
-    lea rdi, [r15 + app_registry_data - kmain + 3 * APP_ENTRY_SIZE]
-    mov byte [rdi + REG_APP_ID], 3
-    mov byte [rdi + REG_APP_INSTALLED], 1
-    lea rsi, [r15 + str_reg_set_name - kmain]
-    lea rdx, [rdi + REG_APP_NAME]
-    call .copy_str24
-    lea rsi, [r15 + str_reg_set_ver - kmain]
-    lea rdx, [rdi + REG_APP_VER]
-    call .copy_str12
-    lea rsi, [r15 + str_reg_set_auth - kmain]
-    lea rdx, [rdi + REG_APP_AUTH]
-    call .copy_str32
-    lea rsi, [r15 + str_reg_set_desc - kmain]
-    lea rdx, [rdi + REG_APP_DESC]
-    call .copy_str48
-    mov word [rdi + REG_APP_ICON_ID], 3
-    lea rax, [r15 + icon_settings_44x44 - kmain]
-    mov [rdi + REG_APP_ICON_PTR], rax
-
-    ; Slots 4..7 are dynamic user app slots populated from ELF files!
+    ; All slots 0..7 are dynamic user app slots populated directly by ELF files on ext4!
+    ; No hardcoded legacy apps.
 
     pop rdi
     pop rsi
@@ -319,8 +237,8 @@ app_reg_find_or_alloc_slot:
 
     mov r12, rsi
 
-    ; 1. Check if an installed user slot already matches path or name
-    mov ecx, 4
+    ; 1. Check if an installed slot (0..7) already matches path or name
+    mov ecx, 0
 .match_loop:
     cmp ecx, MAX_REG_APPS
     jae .find_free
@@ -360,8 +278,8 @@ app_reg_find_or_alloc_slot:
     jmp .alloc_done
 
 .find_free:
-    ; 2. Pick first free slot in 4..7
-    mov ecx, 4
+    ; 2. Pick first free slot in 0..7
+    mov ecx, 0
 .free_loop:
     cmp ecx, MAX_REG_APPS
     jae .no_slot
@@ -402,6 +320,10 @@ app_reg_install_from_user:
     push rdi
     push r12
     push r13
+
+    ; M2 Mitigation: Ensure user-supplied size is at least OS_APP_PKG_SIZE (7908 bytes)
+    cmp rsi, OS_APP_PKG_SIZE
+    jb .uerr_ret
 
     ; 1. Validate user pointer
     call sys_validate_user_ptr
@@ -519,6 +441,8 @@ app_reg_install_by_path:
     push r13
     push r14
     push r15
+    pushfq
+    cli
 
     mov r14, rsi                      ; r14 = original input path string
 
@@ -704,6 +628,7 @@ app_reg_install_by_path:
     mov eax, -1
 
 .inst_ret:
+    popfq
     pop r15
     pop r14
     pop r13

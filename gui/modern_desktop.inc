@@ -5,10 +5,6 @@
 ; ==============================================================================
 
 include 'D:\Opensweet\gui\render2d.inc'
-include 'D:\Opensweet\gui\app_term.inc'
-include 'D:\Opensweet\gui\app_files.inc'
-include 'D:\Opensweet\gui\app_sysmon.inc'
-include 'D:\Opensweet\gui\app_settings.inc'
 include 'D:\Opensweet\gui\wm.inc'
 include 'D:\Opensweet\kernel\app_registry.inc'
 
@@ -226,11 +222,6 @@ modern_desktop_render:
     push r12
     push r13
 
-    rdtsc
-    shl rdx, 32
-    or rax, rdx
-    mov r12, rax                        ; r12 = start cycles
-
     ; Acquire GUI compositor lock to prevent concurrent daemon blitting
     mov dword [r15 + gui_lock - kmain], 1
 
@@ -259,18 +250,6 @@ modern_desktop_render:
     ; Release GUI compositor lock
     mov dword [r15 + gui_lock - kmain], 0
 
-    rdtsc
-    shl rdx, 32
-    or rax, rdx
-    sub rax, r12
-    mov r13, rax
-    lea rsi, [r15 + str_log_frender - kmain]
-    call serial_puts
-    mov rax, r13
-    call serial_putdec64
-    mov al, 10
-    call serial_putc
-
     pop r13
     pop r12
     pop r11
@@ -283,6 +262,7 @@ modern_desktop_render:
     pop rcx
     pop rbx
     pop rax
+    ret
 ; ==============================================================================
 ; md_format_fps: Convert gui_fps (0..999) to string " XX FPS"
 ; ==============================================================================
@@ -506,8 +486,8 @@ md_render_dock:
     movzx eax, byte [rdi + REG_APP_ID]
     cmp eax, APP_COUNT
     jae .next_dock_icon
-    cmp byte [r15 + wm_state - kmain + rax], WM_STATE_OPEN
-    jne .next_dock_icon
+    cmp byte [r15 + wm_state - kmain + rax], WM_STATE_CLOSED
+    je .next_dock_icon
 
     mov ecx, ebp
     imul ecx, 80

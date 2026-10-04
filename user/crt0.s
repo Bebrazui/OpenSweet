@@ -8,12 +8,13 @@
 .text
 
 _start:
-    /* Align stack to 16 bytes per System V AMD64 ABI */
-    andq $-16, %rsp
+    /* Extract System V AMD64 ABI startup arguments from initial stack */
+    movq (%rsp), %rdi                 /* %rdi = argc */
+    leaq 8(%rsp), %rsi                /* %rsi = argv */
+    leaq 8(%rsi, %rdi, 8), %rdx       /* %rdx = envp (&argv[argc + 1]) */
 
-    /* Pass argc = 0, argv = NULL */
-    xor %edi, %edi
-    xor %esi, %esi
+    /* Align stack to 16 bytes per AMD64 ABI requirements */
+    andq $-16, %rsp
     call main
 
     /* Exit code in EAX -> EDI */
@@ -25,4 +26,14 @@ _start:
     jmp .halt
 
 __main:
+    ret
+
+.globl ___chkstk_ms
+.globl __chkstk_ms
+.globl ___chkstk
+.globl __chkstk
+___chkstk_ms:
+__chkstk_ms:
+___chkstk:
+__chkstk:
     ret

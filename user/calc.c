@@ -244,6 +244,13 @@ int main(void) {
         if (has_event) {
             if (ev.type == OS_EVENT_WIN_CLOSE) {
                 running = false;
+            } else if (ev.type == OS_EVENT_WIN_MAXIMIZE) {
+                win.width = ev.x;
+                win.height = ev.y;
+                win.client_w = ev.x;
+                win.client_h = ev.y > 33 ? ev.y - 33 : 0;
+                render_calc(&win);
+                os_update_window(&win);
             } else if (ev.type == OS_EVENT_MOUSE_DOWN) {
                 /* Hit test buttons */
                 for (size_t i = 0; i < BUTTON_COUNT; i++) {

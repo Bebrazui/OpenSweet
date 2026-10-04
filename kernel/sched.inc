@@ -17,7 +17,7 @@ USER_PAGE_TABLES_BASE = 0x00200000    ; 2MB: Physical base for per-process page 
 USER_PHYS_BASE        = 0x05000000    ; 80MB: Physical base for per-process code/stack (28MB for 7 slots)
 USER_MEM_STRIDE       = 0x00400000    ; 4MB physical stride per task slot (2MB code + 2MB stack)
 
-; TCB offsets (592 bytes per TCB, 16-byte aligned)
+; TCB offsets (608 bytes per TCB, 16-byte aligned)
 TCB_RSP         = 0x00                ; uint64: Saved stack pointer
 TCB_STATE       = 0x08                ; uint32: TASK_* state
 TCB_ID          = 0x0C                ; uint32: Task ID
@@ -31,8 +31,12 @@ TCB_CR3         = 0x38                ; uint64: CR3 page directory base (phys)
 TCB_USER_RSP    = 0x40                ; uint64: Saved user RSP for Ring 3 task
 TCB_IS_USER     = 0x48                ; uint32: 1 if Ring 3 user task, 0 if kernel
 TCB_HEAP_BRK    = 0x4C                ; uint32: Current heap brk virtual address for Ring 3 task
-TCB_FXSAVE      = 0x50                ; 512 bytes: 16-byte aligned FXSAVE/FXRSTOR area
-TCB_SIZE        = 592                 ; 0x50 + 512 = 592 bytes (multiple of 16)
+TCB_PARENT_ID   = 0x50                ; uint32: Parent task ID (who spawned this process)
+TCB_EXIT_CODE   = 0x54                ; uint32: Process exit status code
+TCB_WAIT_TID    = 0x58                ; int32: Target child TID being waited on (-1 if none)
+TCB_PAD         = 0x5C                ; uint32: 16-byte alignment padding
+TCB_FXSAVE      = 0x60                ; 512 bytes: 16-byte aligned FXSAVE/FXRSTOR area
+TCB_SIZE        = 608                 ; 0x60 + 512 = 608 bytes (multiple of 16)
 
 TASK_STACK_SIZE = 8192                ; 8 KB stack per task
 
@@ -108,6 +112,10 @@ sched_init:
     mov dword [r15 + sched_curr_task - kmain], 0
     mov dword [r15 + sched_task_cnt - kmain], 1
     mov dword [r15 + sched_enabled - kmain], 1
+
+    ; Initialize Task 0 (Shell) file descriptors (stdin, stdout, stderr)
+    xor ebx, ebx
+    call vfs_init_task_fds
 
     pop rsi
     pop rdi
@@ -301,10 +309,11 @@ task_setup_pagetables:
     or eax, 0x07
     mov [r9], rax
 
-    ; PDPT[1..3] -> identity maps for 1..4GB (LAPIC/VBE LFB)
-    mov dword [r9 + 0x08], 0x40000087
-    mov dword [r9 + 0x10], 0x80000087
-    mov dword [r9 + 0x18], 0xC0000087
+    ; C3 Mitigation: PDPT[1..3] -> supervisor-only identity maps for 1..4GB (LAPIC/VBE LFB)
+    ; Flags 0x83 = Present | Writable | Supervisor | Huge (no User bit 2)
+    mov dword [r9 + 0x08], 0x40000083
+    mov dword [r9 + 0x10], 0x80000083
+    mov dword [r9 + 0x18], 0xC0000083
 
     ; 3. PD:
     ; Fill all 512 entries with 2MB identity mapping (supervisor 0x83)
@@ -351,6 +360,17 @@ task_setup_pagetables:
     cmp ecx, 8
     jb .map_canvas_loop
 
+    ; Entries 8..31 (virtual 0x01000000..0x04000000 = 16MB..64MB, 48MB): User Heap (for Doom / Games)
+    mov eax, 0x01000087
+    mov ecx, 8
+.map_ext_heap_loop:
+    mov [r10 + rcx*8], eax
+    mov dword [r10 + rcx*8 + 4], 0
+    add eax, 0x00200000
+    inc ecx
+    cmp ecx, 32
+    jb .map_ext_heap_loop
+
     ; Return PML4 physical address in RAX
     mov rax, r8
 
@@ -377,20 +397,32 @@ task_alloc_user_slot:
     push rdx
     push rsi
 
-    ; Find free slot (1..MAX_TASKS-1)
+    ; Pass 1: Find completely unused slot (1..MAX_TASKS-1)
     mov ebx, 1
-.find_slot:
+.find_unused:
     cmp ebx, MAX_TASKS
-    jae .no_slot
+    jae .try_dead
 
     imul eax, ebx, TCB_SIZE
     lea rdi, [r15 + task_table - kmain + rax]
     cmp dword [rdi + TCB_STATE], TASK_UNUSED
     je .found
+    inc ebx
+    jmp .find_unused
+
+.try_dead:
+    ; Pass 2: Reclaim unreaped dead slot
+    mov ebx, 1
+.find_dead:
+    cmp ebx, MAX_TASKS
+    jae .no_slot
+
+    imul eax, ebx, TCB_SIZE
+    lea rdi, [r15 + task_table - kmain + rax]
     cmp dword [rdi + TCB_STATE], TASK_DEAD
     je .found
     inc ebx
-    jmp .find_slot
+    jmp .find_dead
 
 .no_slot:
     pop rsi
@@ -452,7 +484,11 @@ task_finalize_user:
     mov dword [rdi + TCB_SLICE], SCHED_QUANTUM
     mov qword [rdi + TCB_TICKS], 0
     mov dword [rdi + TCB_IS_USER], 1
-    mov dword [rdi + TCB_HEAP_BRK], 0x00500000 ; Initial user heap base (5MB)
+    mov dword [rdi + TCB_HEAP_BRK], 0x01000000 ; Initial user heap base (16MB)
+    mov eax, [r15 + sched_curr_task - kmain]
+    mov dword [rdi + TCB_PARENT_ID], eax
+    mov dword [rdi + TCB_EXIT_CODE], 0
+    mov dword [rdi + TCB_WAIT_TID], -1
     mov [rdi + TCB_USER_RSP], r11
 
     ; Copy name (up to 7 chars)
@@ -530,6 +566,34 @@ task_finalize_user:
     ; Mark task as READY
     mov dword [rdi + TCB_STATE], TASK_READY
     inc dword [r15 + sched_task_cnt - kmain]
+
+    ; Initialize standard file descriptors (stdin, stdout, stderr) for task ebx
+    push rbx
+    call vfs_init_task_fds
+    pop rbx
+
+    ; Check if parent requested stdin/stdout/stderr redirections
+    mov edx, [r15 + sys_spawn_in_fd - kmain]
+    cmp edx, 0
+    jl @f
+    mov eax, [r15 + sched_curr_task - kmain]
+    mov ecx, 0                          ; child fd 0
+    call vfs_redirect_child_fd
+@@:
+    mov edx, [r15 + sys_spawn_out_fd - kmain]
+    cmp edx, 0
+    jl @f
+    mov eax, [r15 + sched_curr_task - kmain]
+    mov ecx, 1                          ; child fd 1
+    call vfs_redirect_child_fd
+@@:
+    mov edx, [r15 + sys_spawn_err_fd - kmain]
+    cmp edx, 0
+    jl @f
+    mov eax, [r15 + sched_curr_task - kmain]
+    mov ecx, 2                          ; child fd 2
+    call vfs_redirect_child_fd
+@@:
 
     mov eax, ebx                      ; return TID
 
@@ -619,8 +683,13 @@ task_exit:
     mov eax, [r15 + sched_curr_task - kmain]
     imul eax, TCB_SIZE
     lea rbx, [r15 + task_table - kmain + rax]
+    mov [rbx + TCB_EXIT_CODE], edi     ; Store user exit status
     mov dword [rbx + TCB_STATE], TASK_DEAD
     dec dword [r15 + sched_task_cnt - kmain]
+
+    ; Close all file descriptors for exiting task
+    call vfs_cleanup_task_fds
+
     int 0x31
 .halt:
     hlt

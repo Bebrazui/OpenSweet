@@ -53,6 +53,23 @@ typedef _Bool bool;
 #define SYS_SPAWN          17
 #define SYS_BRK            18
 #define SYS_WRITE_FILE     19
+#define SYS_READ_FILE      20
+#define SYS_UNLINK         21
+#define SYS_GET_TIME       22
+#define SYS_SYSINFO        23
+#define SYS_OPEN           24
+#define SYS_CLOSE          25
+#define SYS_LSEEK          26
+#define SYS_PIPE           27
+#define SYS_DUP2           28
+#define SYS_WAITPID        29
+#define SYS_GETCWD         30
+#define SYS_CHDIR          31
+#define SYS_SPAWN_STDIO    32
+
+#define WNOHANG            1
+#define WIFEXITED(s)       (((s) & 0x7f) == 0)
+#define WEXITSTATUS(s)     (((s) & 0xff00) >> 8)
 
 /* File System Directory Entry Structure */
 typedef struct {
@@ -86,7 +103,17 @@ typedef os_app_package_t os_app_info_t;
 #define OS_EVENT_MOUSE_DOWN 2
 #define OS_EVENT_MOUSE_UP   3
 #define OS_EVENT_KEY_DOWN   4
-#define OS_EVENT_WIN_CLOSE  5
+#define OS_EVENT_WIN_CLOSE    5
+#define OS_EVENT_KEY_UP       6
+#define OS_EVENT_WIN_MINIMIZE 7
+#define OS_EVENT_WIN_MAXIMIZE 8
+
+/* Special Key Codes (param for OS_EVENT_KEY_DOWN / OS_EVENT_KEY_UP) */
+#define OS_KEY_UP           0x80
+#define OS_KEY_DOWN         0x81
+#define OS_KEY_LEFT         0x82
+#define OS_KEY_RIGHT        0x83
+#define OS_KEY_CTRL         0x84
 
 /* Color Definitions (32bpp ARGB) */
 #define OS_ARGB(a, r, g, b) (((uint32_t)(a) << 24) | ((uint32_t)(r) << 16) | ((uint32_t)(g) << 8) | (uint32_t)(b))
@@ -227,10 +254,54 @@ static inline uint32_t os_uptime(void) {
     return (uint32_t)os_syscall0(SYS_UPTIME);
 }
 
+typedef struct {
+    uint8_t hours;
+    uint8_t minutes;
+    uint8_t seconds;
+} os_time_t;
+
+/* Read true hardware Real-Time Clock (RTC CMOS) */
+static inline os_time_t os_get_time(void) {
+    uint64_t val = (uint64_t)os_syscall0(SYS_GET_TIME);
+    os_time_t t;
+    t.hours = (uint8_t)((val >> 16) & 0xFF);
+    t.minutes = (uint8_t)((val >> 8) & 0xFF);
+    t.seconds = (uint8_t)(val & 0xFF);
+    return t;
+}
+
+/* System Hardware & Kernel Diagnostics Structure */
+typedef struct {
+    uint32_t total_ram_mb;   /* Total physical RAM in MB (256) */
+    uint32_t free_ram_mb;    /* Free physical RAM in MB */
+    uint32_t used_ram_mb;    /* Used physical RAM in MB */
+    uint32_t total_pages;    /* Total PMM 4KB pages (65536) */
+    uint32_t free_pages;     /* Free PMM 4KB pages */
+    uint32_t screen_w;       /* Display resolution width (1920) */
+    uint32_t screen_h;       /* Display resolution height (1080) */
+    uint32_t screen_bpp;     /* Display color depth (32) */
+    uint32_t task_count;     /* Active tasks in scheduler */
+    char     kernel_ver[32]; /* Kernel version string */
+    char     os_name[32];    /* OS name string */
+    char     wm_name[32];    /* Window Manager / Compositor name */
+} os_sysinfo_t;
+
+static inline int os_get_sysinfo(os_sysinfo_t *info) {
+    if (!info) return -1;
+    return (int)os_syscall1(SYS_SYSINFO, (int64_t)info);
+}
+
+
 /* =============================================================================
  * Window Management API
  * ============================================================================= */
 static inline os_window_t os_create_window(const char *title, int x, int y, int w, int h) {
+    /* H2 Mitigation: Clamp dimensions to guaranteed 2MB canvas bounds [200..960] x [150..560] */
+    if (w < 200) w = 200;
+    if (w > 960) w = 960;
+    if (h < 150) h = 150;
+    if (h > 560) h = 560;
+
     os_window_t win;
     win.win_id = -1;
     win.canvas = NULL;
@@ -278,10 +349,15 @@ static inline int os_read_dir(os_dirent_t *entries, int max_entries) {
     return (int)os_syscall2(SYS_LISTDIR, (int64_t)entries, max_entries);
 }
 
+/* Spawn an ELF application with command line arguments from ext4 storage */
+static inline int os_spawn_args(const char *path, const char *const argv[]) {
+    if (!path) return -1;
+    return (int)os_syscall2(SYS_SPAWN, (int64_t)path, (int64_t)argv);
+}
+
 /* Spawn an ELF application from ext4 storage */
 static inline int os_spawn(const char *path) {
-    if (!path) return -1;
-    return (int)os_syscall1(SYS_SPAWN, (int64_t)path);
+    return os_spawn_args(path, (const char *const[]){ path, NULL });
 }
 
 /* Write/create a file on ext4 filesystem */
@@ -290,6 +366,80 @@ static inline ssize_t os_write_file(const char *path, const void *buf, size_t co
     return (ssize_t)os_syscall3(SYS_WRITE_FILE, (int64_t)path, (int64_t)buf, (int64_t)count);
 }
 
+/* Read file content directly from ext4 filesystem into memory */
+static inline ssize_t os_read_file(const char *path, void *buf, size_t max_count) {
+    if (!path || !buf || max_count == 0) return -1;
+    return (ssize_t)os_syscall3(SYS_READ_FILE, (int64_t)path, (int64_t)buf, (int64_t)max_count);
+}
+
+/* Delete/unlink a file from ext4 filesystem */
+static inline int os_delete_file(const char *path) {
+    if (!path) return -1;
+    return (int)os_syscall1(SYS_UNLINK, (int64_t)path);
+}
+
+/* =============================================================================
+ * POSIX File Descriptor API (open, close, read, write, lseek)
+ * ============================================================================= */
+static inline int os_open(const char *path, int flags, int mode) {
+    if (!path) return -1;
+    return (int)os_syscall3(SYS_OPEN, (int64_t)path, flags, mode);
+}
+
+static inline int os_close(int fd) {
+    return (int)os_syscall1(SYS_CLOSE, fd);
+}
+
+static inline ssize_t os_read_fd(int fd, void *buf, size_t count) {
+    if (!buf || count == 0) return 0;
+    return (ssize_t)os_syscall3(SYS_READ, fd, (int64_t)buf, (int64_t)count);
+}
+
+static inline ssize_t os_write_fd(int fd, const void *buf, size_t count) {
+    if (!buf || count == 0) return 0;
+    return (ssize_t)os_syscall3(SYS_WRITE, fd, (int64_t)buf, (int64_t)count);
+}
+
+static inline int64_t os_lseek(int fd, int64_t offset, int whence) {
+    return (int64_t)os_syscall3(SYS_LSEEK, fd, offset, whence);
+}
+
+static inline int os_pipe(int pipefd[2]) {
+    if (!pipefd) return -1;
+    return (int)os_syscall1(SYS_PIPE, (int64_t)pipefd);
+}
+
+static inline int os_dup2(int oldfd, int newfd) {
+    return (int)os_syscall2(SYS_DUP2, oldfd, newfd);
+}
+
+static inline int os_waitpid(int pid, int *status, int options) {
+    return (int)os_syscall3(SYS_WAITPID, pid, (int64_t)status, options);
+}
+
+static inline int os_wait(int *status) {
+    return os_waitpid(-1, status, 0);
+}
+
+/* Get current working directory path (POSIX getcwd) */
+static inline char *os_getcwd(char *buf, size_t size) {
+    if (!buf || size == 0) return NULL;
+    int64_t res = os_syscall2(SYS_GETCWD, (int64_t)buf, (int64_t)size);
+    if (res <= 0) return NULL;
+    return (char*)(uintptr_t)res;
+}
+
+/* Change current working directory (POSIX chdir) */
+static inline int os_chdir(const char *path) {
+    if (!path) return -1;
+    return (int)os_syscall1(SYS_CHDIR, (int64_t)path);
+}
+
+/* Spawn an ELF application with arguments and custom stdin/stdout/stderr redirections */
+static inline int os_spawn_stdio(const char *path, const char *const argv[], int in_fd, int out_fd, int err_fd) {
+    if (!path) return -1;
+    return (int)os_syscall5(SYS_SPAWN_STDIO, (int64_t)path, (int64_t)argv, in_fd, out_fd, err_fd);
+}
 /* Adjust or query process heap break (sys_brk) */
 static inline void *os_brk(void *addr) {
     return (void*)(uintptr_t)os_syscall1(SYS_BRK, (int64_t)addr);
@@ -368,15 +518,18 @@ static inline void os_free(void *ptr) {
     os_mem_block_t *block = ((os_mem_block_t*)ptr) - 1;
     block->is_free = 1;
 
-    /* Coalesce adjacent free blocks */
+    /* Coalesce physically adjacent free blocks */
     os_mem_block_t *curr = os_heap_head;
     while (curr && curr->next) {
         if (curr->is_free && curr->next->is_free) {
-            curr->size += OS_MEM_BLOCK_HEADER_SIZE + curr->next->size;
-            curr->next = curr->next->next;
-        } else {
-            curr = curr->next;
+            uint8_t *expected_next = (uint8_t*)(curr + 1) + curr->size;
+            if ((uint8_t*)curr->next == expected_next) {
+                curr->size += OS_MEM_BLOCK_HEADER_SIZE + curr->next->size;
+                curr->next = curr->next->next;
+                continue; /* Check if next block can also be coalesced */
+            }
         }
+        curr = curr->next;
     }
 }
 
@@ -395,10 +548,11 @@ static inline void *os_realloc(void *ptr, size_t new_size) {
     void *new_ptr = os_malloc(new_size);
     if (!new_ptr) return NULL;
 
-    /* Copy existing data */
+    /* Copy existing data (safely bounded by smaller of old and new size) */
+    size_t copy_len = (block->size < new_size) ? block->size : new_size;
     uint8_t *dst = (uint8_t*)new_ptr;
     const uint8_t *src = (const uint8_t*)ptr;
-    for (size_t i = 0; i < block->size; i++) {
+    for (size_t i = 0; i < copy_len; i++) {
         dst[i] = src[i];
     }
 
@@ -407,6 +561,8 @@ static inline void *os_realloc(void *ptr, size_t new_size) {
 }
 
 static inline void *os_calloc(size_t num, size_t size) {
+    /* L2 Mitigation: Prevent multiplication overflow on allocation size */
+    if (size != 0 && num > ((size_t)-1) / size) return NULL;
     size_t total = num * size;
     void *ptr = os_malloc(total);
     if (ptr) {
@@ -521,6 +677,217 @@ static inline void os_itoa(int64_t n, char *buf) {
 static inline void os_print(const char *s) {
     if (!s) return;
     os_write(1, s, os_strlen(s));
+}
+
+/* =============================================================================
+ * POSIX Runtime Compatibility Layer (Foundations for Unix Shells & Utilities)
+ * ============================================================================= */
+
+static inline int os_strncmp(const char *s1, const char *s2, size_t n) {
+    while (n && *s1 && (*s1 == *s2)) {
+        s1++;
+        s2++;
+        n--;
+    }
+    if (n == 0) return 0;
+    return *(const unsigned char*)s1 - *(const unsigned char*)s2;
+}
+
+static inline char *os_strncpy(char *dst, const char *src, size_t n) {
+    if (!dst || !src) return dst;
+    char *orig = dst;
+    while (n && (*dst++ = *src++)) n--;
+    while (n--) *dst++ = '\0';
+    return orig;
+}
+
+/* 1. Environment Variables & CWD */
+static char os_env_table[16][128] = {
+    "PATH=/bin:/",
+    "HOME=/",
+    "USER=root",
+    "TERM=xterm-256color",
+    "SHELL=/terminal.elf",
+    "PWD=/",
+    "OS=OpenSweet"
+};
+static int os_env_count = 7;
+static char *os_environ_ptrs[17] = {
+    os_env_table[0], os_env_table[1], os_env_table[2], os_env_table[3],
+    os_env_table[4], os_env_table[5], os_env_table[6], NULL
+};
+static char **environ = os_environ_ptrs;
+
+static char os_cwd[128] = "/";
+
+static inline char *getenv(const char *name) {
+    if (!name) return NULL;
+    size_t len = os_strlen(name);
+    for (int i = 0; i < os_env_count; i++) {
+        if (os_strncmp(os_env_table[i], name, len) == 0 && os_env_table[i][len] == '=') {
+            return os_env_table[i] + len + 1;
+        }
+    }
+    return NULL;
+}
+
+static inline int setenv(const char *name, const char *value, int overwrite) {
+    if (!name || !value) return -1;
+    size_t nlen = os_strlen(name);
+    size_t vlen = os_strlen(value);
+    /* L2 Mitigation: Enforce 128-byte slot limit (name + '=' + value + '\0') */
+    if (nlen + 1 + vlen >= 128) return -1;
+    for (int i = 0; i < os_env_count; i++) {
+        if (os_strncmp(os_env_table[i], name, nlen) == 0 && os_env_table[i][nlen] == '=') {
+            if (!overwrite) return 0;
+            os_strcpy(os_env_table[i] + nlen + 1, value);
+            return 0;
+        }
+    }
+    if (os_env_count < 15) {
+        char *p = os_env_table[os_env_count];
+        os_strcpy(p, name);
+        os_strcpy(p + nlen, "=");
+        os_strcpy(p + nlen + 1, value);
+        os_environ_ptrs[os_env_count] = p;
+        os_env_count++;
+        os_environ_ptrs[os_env_count] = NULL;
+        return 0;
+    }
+    return -1;
+}
+
+static inline char *getcwd(char *buf, size_t size) {
+    char *res = os_getcwd(buf, size);
+    if (res) {
+        os_strncpy(os_cwd, res, sizeof(os_cwd) - 1);
+        setenv("PWD", os_cwd, 1);
+    }
+    return res;
+}
+
+static inline int chdir(const char *path) {
+    if (!path) return -1;
+    int res = os_chdir(path);
+    if (res == 0) {
+        os_getcwd(os_cwd, sizeof(os_cwd));
+        setenv("PWD", os_cwd, 1);
+    }
+    return res;
+}
+
+/* 2. Standard POSIX File Descriptors (0=stdin, 1=stdout, 2=stderr, 3..15=files) */
+#define O_RDONLY 0x0000
+#define O_WRONLY 0x0001
+#define O_RDWR   0x0002
+#define O_CREAT  0x0040
+#define O_TRUNC  0x0200
+#define O_APPEND 0x0400
+
+#define SEEK_SET 0
+#define SEEK_CUR 1
+#define SEEK_END 2
+
+typedef struct {
+    int      is_open;
+    int      flags;
+    char     path[64];
+    size_t   offset;
+    size_t   size;
+    uint8_t *data;
+} os_fd_entry_t;
+
+static os_fd_entry_t os_fd_table[16];
+static int os_fd_initialized = 0;
+
+static inline void os_fd_init(void) {
+    if (os_fd_initialized) return;
+    os_fd_table[0].is_open = 1;
+    os_fd_table[1].is_open = 1;
+    os_fd_table[2].is_open = 1;
+    os_fd_initialized = 1;
+}
+
+static inline int isatty(int fd) {
+    return (fd >= 0 && fd <= 2);
+}
+
+static inline int open(const char *pathname, int flags, ...) {
+    os_fd_init();
+    if (!pathname) return -1;
+    int slot = -1;
+    for (int i = 3; i < 16; i++) {
+        if (!os_fd_table[i].is_open) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) return -24;
+
+    os_fd_table[slot].is_open = 1;
+    os_fd_table[slot].flags = flags;
+    os_strncpy(os_fd_table[slot].path, pathname, 63);
+    os_fd_table[slot].offset = 0;
+    os_fd_table[slot].size = 0;
+    os_fd_table[slot].data = (uint8_t*)os_malloc(65536);
+    if (os_fd_table[slot].data) {
+        ssize_t n = os_read_file(pathname, os_fd_table[slot].data, 65536);
+        if (n >= 0) os_fd_table[slot].size = (size_t)n;
+    }
+    return slot;
+}
+
+static inline int close(int fd) {
+    os_fd_init();
+    if (fd < 0 || fd >= 16 || !os_fd_table[fd].is_open) return -1;
+    if (fd >= 3) {
+        if ((os_fd_table[fd].flags & (O_WRONLY | O_RDWR)) && os_fd_table[fd].data) {
+            os_write_file(os_fd_table[fd].path, os_fd_table[fd].data, os_fd_table[fd].size);
+        }
+        if (os_fd_table[fd].data) {
+            os_free(os_fd_table[fd].data);
+            os_fd_table[fd].data = NULL;
+        }
+        os_fd_table[fd].is_open = 0;
+    }
+    return 0;
+}
+
+static inline ssize_t read(int fd, void *buf, size_t count) {
+    os_fd_init();
+    if (fd < 0 || fd >= 16 || !os_fd_table[fd].is_open || !buf) return -1;
+    if (fd == 0) return os_read(0, buf, count);
+    if (fd >= 3 && os_fd_table[fd].data) {
+        size_t rem = (os_fd_table[fd].offset < os_fd_table[fd].size) ?
+                     (os_fd_table[fd].size - os_fd_table[fd].offset) : 0;
+        if (count > rem) count = rem;
+        if (count > 0) {
+            os_memcpy(buf, os_fd_table[fd].data + os_fd_table[fd].offset, count);
+            os_fd_table[fd].offset += count;
+        }
+        return count;
+    }
+    return 0;
+}
+
+static inline ssize_t write(int fd, const void *buf, size_t count) {
+    os_fd_init();
+    if (fd < 0 || fd >= 16 || !os_fd_table[fd].is_open || !buf) return -1;
+    if (fd == 1 || fd == 2) return os_write(fd, buf, count);
+    if (fd >= 3 && os_fd_table[fd].data) {
+        if (os_fd_table[fd].offset + count > 65536) {
+            count = 65536 - os_fd_table[fd].offset;
+        }
+        if (count > 0) {
+            os_memcpy(os_fd_table[fd].data + os_fd_table[fd].offset, buf, count);
+            os_fd_table[fd].offset += count;
+            if (os_fd_table[fd].offset > os_fd_table[fd].size) {
+                os_fd_table[fd].size = os_fd_table[fd].offset;
+            }
+        }
+        return count;
+    }
+    return 0;
 }
 
 /* =============================================================================
@@ -1100,22 +1467,33 @@ static inline int os_draw_text_mono_aa_2x(os_window_t *win, int x, int y, const 
     return cur_x - x;
 }
 
-/* Modern Vector Icons */
+/* Modern Vector Icons (Anti-Aliased Squircles & Soft Highlights) */
 static inline void os_draw_icon_folder(os_window_t *win, int x, int y) {
-    os_fill_rounded_rect(win, x, y, 10, 6, 2, OS_ARGB(0xFF, 0x02, 0x84, 0xC7));
-    os_fill_rounded_rect(win, x, y + 4, 22, 14, 3, OS_ARGB(0xFF, 0x38, 0xBD, 0xF8));
-    os_fill_rounded_rect(win, x + 1, y + 6, 20, 11, 2, OS_ARGB(0xFF, 0x7D, 0xD3, 0xFC));
-    os_fill_rect(win, x + 3, y + 6, 16, 1, OS_ARGB(0x70, 0xFF, 0xFF, 0xFF));
+    /* Back folder tab with subtle rounded curve */
+    os_fill_rounded_rect(win, x, y + 1, 11, 6, 2, OS_ARGB(0xFF, 0x02, 0x84, 0xC7));
+    /* Front folder body with rich sky-blue tone */
+    os_fill_rounded_rect(win, x, y + 5, 22, 13, 3, OS_ARGB(0xFF, 0x38, 0xBD, 0xF8));
+    /* Soft top highlight rim */
+    os_fill_rounded_rect(win, x + 1, y + 6, 20, 2, 1, OS_ARGB(0x70, 0xFF, 0xFF, 0xFF));
+    /* Subtle inner surface depth */
+    os_fill_rounded_rect(win, x + 2, y + 9, 18, 8, 2, OS_ARGB(0x18, 0x02, 0x84, 0xC7));
+    /* Anti-aliased outer border */
+    os_draw_rounded_rect(win, x, y + 5, 22, 13, 3, OS_ARGB(0x30, 0xFF, 0xFF, 0xFF));
 }
 
 static inline void os_draw_icon_file(os_window_t *win, int x, int y, int is_elf) {
     uint32_t bg = is_elf ? OS_ARGB(0xFF, 0x63, 0x66, 0xF1) : OS_ARGB(0xFF, 0x47, 0x55, 0x69);
     uint32_t fg = is_elf ? OS_COLOR_CYAN_NEON : OS_COLOR_SLATE_200;
+    /* File document card */
     os_fill_rounded_rect(win, x, y, 18, 20, 3, bg);
-    os_fill_rect(win, x + 11, y, 7, 7, OS_ARGB(0x40, 0x00, 0x00, 0x00));
-    os_fill_rect(win, x + 3, y + 8, 12, 2, fg);
-    os_fill_rect(win, x + 3, y + 12, 10, 2, fg);
-    os_fill_rect(win, x + 3, y + 16, 7, 1, OS_ARGB(0x80, 0xFF, 0xFF, 0xFF));
+    os_draw_rounded_rect(win, x, y, 18, 20, 3, OS_ARGB(0x40, 0xFF, 0xFF, 0xFF));
+    /* Top-right folded dog-ear */
+    os_fill_rounded_rect(win, x + 10, y, 8, 7, 1, OS_ARGB(0x35, 0x00, 0x00, 0x00));
+    os_fill_rounded_rect(win, x + 11, y, 7, 6, 1, OS_ARGB(0x40, 0xFF, 0xFF, 0xFF));
+    /* Anti-aliased content lines */
+    os_fill_rounded_rect(win, x + 3, y + 8, 11, 2, 1, fg);
+    os_fill_rounded_rect(win, x + 3, y + 12, 9, 2, 1, fg);
+    os_fill_rounded_rect(win, x + 3, y + 15, 6, 2, 1, OS_ARGB(0x80, 0xFF, 0xFF, 0xFF));
 }
 
 /* Elevated Acrylic Glass Card with specular rim */

@@ -15,9 +15,10 @@ include 'D:\Opensweet\gui\font_ui_aa.inc'
 include 'D:\Opensweet\gui\icons_32bpp.inc'
 include 'D:\Opensweet\gui\cursor_aa.inc'
 include 'D:\Opensweet\gui\png.inc'
+include 'D:\Opensweet\gui\qoi.inc'
 
 ; ==============================================================================
-; r2d_init: Read VBE parameters and load wallpaper into cache (0x02400000)
+; r2d_init: Read VBE parameters and load wallpaper into cache (0x02800000)
 ; ==============================================================================
 r2d_init:
     push rax
@@ -27,12 +28,11 @@ r2d_init:
     mov eax, dword [r14 + VBS_LFB]
     mov [r15 + vbe_lfb - kmain], eax
 
-    ; Try loading TrueColor PNG wallpaper from ext4 storage (/wallpaper.png)
-    lea rsi, [r15 + str_default_wallpaper - kmain]
-    call png_load_wallpaper_from_ext4
+    ; 1. Try loading lossless original wallpaper via ultra-fast QOI decoder (<0.04s)
+    call qoi_load_wallpaper_from_ext4
     jnc .done
 
-    ; Fallback to procedural gradient if PNG not available
+    ; 2. Fallback to procedural obsidian dark gradient if /wallpaper.qoi not present
     call r2d_render_wallpaper_to_cache
 .done:
     pop rsi
@@ -283,37 +283,59 @@ r2d_blit_bitmap:
     test r12d, r12d
     jz .bb_done
 
+    ; Check if row is vertically within screen
     cmp r10d, 0
     jl .bb_skip_row
     cmp r10d, R2D_SCREEN_H
     jge .bb_done
 
-    ; Check if row is horizontally within screen
-    cmp r9d, 0
-    jl .bb_skip_row
+    ; Horizontal clipping:
+    ; cur_x in r9d, width in r11d
     mov eax, r9d
-    add eax, r11d
+    mov ecx, r11d                     ; ecx = draw_w
+    mov rsi, r8                       ; rsi = src_ptr
+
+    ; Clip left (cur_x < 0)
+    test eax, eax
+    jns .bb_left_ok
+    ; eax is negative: adjust src_ptr and draw_w
+    neg eax
+    cmp eax, ecx
+    jae .bb_skip_row                  ; entirely off-screen left
+    sub ecx, eax                      ; draw_w -= (-cur_x)
+    shl eax, 2
+    add rsi, rax                      ; src_ptr += (-cur_x)*4
+    xor eax, eax                      ; cur_x = 0
+.bb_left_ok:
+    ; Clip right (cur_x + draw_w > R2D_SCREEN_W)
     cmp eax, R2D_SCREEN_W
-    ja .bb_skip_row
+    jae .bb_skip_row                  ; entirely off-screen right
+    mov edx, eax
+    add edx, ecx                      ; cur_x + draw_w
+    cmp edx, R2D_SCREEN_W
+    jbe .bb_right_ok
+    mov ecx, R2D_SCREEN_W
+    sub ecx, eax                      ; draw_w = R2D_SCREEN_W - cur_x
+.bb_right_ok:
+    test ecx, ecx
+    jle .bb_skip_row
 
-    ; Compute Backbuffer dest address: R2D_BACKBUFFER + y * R2D_PITCH + x * 4
-    mov eax, r10d
-    imul eax, R2D_PITCH
-    lea rdi, [R2D_BACKBUFFER + rax]
-    lea rdi, [rdi + r9*4]
+    ; Compute Backbuffer dest address: R2D_BACKBUFFER + y * R2D_PITCH + cur_x * 4
+    push rdx
+    mov edx, r10d
+    imul edx, R2D_PITCH
+    lea rdi, [R2D_BACKBUFFER + rdx]
+    lea rdi, [rdi + rax*4]
+    pop rdx
 
-    ; Source pointer in r8
-    mov rsi, r8
-
-    ; Row copy: r11d dwords
+    ; Row copy: ecx dwords
     push rcx
-    mov ecx, r11d
     cld
     rep movsd
     pop rcx
 
 .bb_skip_row:
-    ; Next row in source buffer: src += w * 4
+    ; Next row in source buffer: src += original_w * 4
     mov eax, r11d
     shl eax, 2
     add r8, rax
@@ -472,59 +494,75 @@ r2d_render_wallpaper_to_cache:
     push r12
 
     mov rdi, R2D_WALLPAPER_CACHE
-    xor r10d, r10d                    ; y = 0..767
+    xor r10d, r10d                    ; y = 0..R2D_SCREEN_H-1
 
 .y_loop:
-    mov eax, 768
-    sub eax, r10d
-    imul eax, 10
-    shr eax, 9
-    add eax, 11
+    ; Smooth vertical dark obsidian gradient:
+    ; R: 8..20, G: 12..28, B: 20..46
+    mov eax, r10d
+    imul eax, 12
+    mov ecx, R2D_SCREEN_H
+    xor edx, edx
+    div ecx
+    add eax, 8
     mov r11d, eax                     ; r_base
 
-    mov eax, 768
-    sub eax, r10d
-    imul eax, 12
-    shr eax, 9
-    add eax, 15
+    mov eax, r10d
+    imul eax, 16
+    mov ecx, R2D_SCREEN_H
+    xor edx, edx
+    div ecx
+    add eax, 12
     mov r12d, eax                     ; g_base
 
-    mov eax, 768
-    sub eax, r10d
-    imul eax, 28
-    shr eax, 9
-    add eax, 25
+    mov eax, r10d
+    imul eax, 26
+    mov ecx, R2D_SCREEN_H
+    xor edx, edx
+    div ecx
+    add eax, 20
     mov ebx, eax                      ; b_base
 
-    xor r9d, r9d                      ; x = 0..1023
+    xor r9d, r9d                      ; x = 0..R2D_SCREEN_W-1
 
 .x_loop:
+    ; Subtle ambient indigo glow centered at (960, 850), radius 550
     mov ecx, r9d
-    sub ecx, 512
+    sub ecx, 960
     mov edx, r10d
-    sub edx, 620
+    sub edx, 850
 
     imul ecx, ecx
     imul edx, edx
     add ecx, edx
 
-    cmp ecx, 144400
+    cmp ecx, 302500                   ; 550^2
     jae .no_glow
 
-    mov eax, 144400
+    mov eax, 302500
     sub eax, ecx
-    shr eax, 11
+    mov edx, 0
+    mov esi, 12000
+    div esi                           ; eax = glow factor 0..25
     mov r8d, eax
 
+    ; Apply glow to RGB
     mov esi, r11d
-    lea esi, [esi + r8d*1]
+    lea esi, [esi + r8d*1]            ; R += glow
     cmp esi, 255
     jbe @f
     mov esi, 255
 @@:
     mov edx, r12d
+    shr r8d, 1
+    add edx, r8d                      ; G += glow/2
+    shl r8d, 1
+    cmp edx, 255
+    jbe @f
+    mov edx, 255
+@@:
     mov eax, ebx
-    lea eax, [eax + r8d*2]
+    lea eax, [eax + r8d*2]            ; B += glow*2 (indigo)
     cmp eax, 255
     jbe @f
     mov eax, 255
@@ -761,14 +799,16 @@ r2d_draw_rounded_rect_aa:
 .bot_corners:
     mov eax, r11d
     sub eax, r9d                        ; h - r
+    dec eax                             ; h - r - 1
     mov esi, r8d
-    sub esi, eax                        ; dy = py - (h - r)
+    sub esi, eax                        ; dy = py - (h - r - 1)
 
 .check_x_corners:
     cmp r12d, r9d
     jb .left_corners
     mov eax, r10d
     sub eax, r9d                        ; w - r
+    dec eax                             ; w - r - 1
     cmp r12d, eax
     jae .right_corners
     jmp .inside_solid                   ; center top/bottom: solid
@@ -781,8 +821,9 @@ r2d_draw_rounded_rect_aa:
 .right_corners:
     mov eax, r10d
     sub eax, r9d                        ; w - r
+    dec eax                             ; w - r - 1
     mov ecx, r12d
-    sub ecx, eax                        ; dx = px - (w - r)
+    sub ecx, eax                        ; dx = px - (w - r - 1)
 
 .calc_corner_dist:
     imul ecx, ecx
@@ -1078,6 +1119,121 @@ r2d_draw_shadow:
     pop rax
     ret
 
+align 16
+circle_12_aa_mask:
+    db 0x00, 0x00, 0x00, 0x04, 0x48, 0x79, 0x79, 0x48, 0x04, 0x00, 0x00, 0x00
+    db 0x00, 0x00, 0x3E, 0xDE, 0xFF, 0xFF, 0xFF, 0xFF, 0xDE, 0x3E, 0x00, 0x00
+    db 0x00, 0x3E, 0xF9, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xF9, 0x3E, 0x00
+    db 0x04, 0xDE, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xDE, 0x04
+    db 0x48, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x48
+    db 0x79, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x79
+    db 0x79, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x79
+    db 0x48, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x48
+    db 0x04, 0xDE, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xDE, 0x04
+    db 0x00, 0x3E, 0xF9, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xF9, 0x3E, 0x00
+    db 0x00, 0x00, 0x3E, 0xDE, 0xFF, 0xFF, 0xFF, 0xFF, 0xDE, 0x3E, 0x00, 0x00
+    db 0x00, 0x00, 0x00, 0x04, 0x48, 0x79, 0x79, 0x48, 0x04, 0x00, 0x00, 0x00
+
+; ==============================================================================
+; r2d_draw_circle_12_aa: Draw 12x12 subpixel anti-aliased circle at ECX=x, EDX=y with EAX=color
+; ==============================================================================
+r2d_draw_circle_12_aa:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+
+    mov r8d, ecx                      ; x
+    mov r9d, edx                      ; y
+    mov r10d, eax                     ; color
+
+    lea rsi, [r15 + circle_12_aa_mask - kmain]
+
+    xor r11d, r11d                    ; py = 0..11
+.c12_y_loop:
+    cmp r11d, 12
+    jae .c12_done
+
+    mov eax, r9d
+    add eax, r11d                     ; abs_y
+    cmp eax, R2D_SCREEN_H
+    jae .c12_done
+
+    imul eax, R2D_PITCH
+    lea rdx, [rax + R2D_BACKBUFFER]
+    mov eax, r8d
+    lea rdi, [rdx + rax*4]            ; scanline start at (x, abs_y)
+
+    xor r12d, r12d                    ; px = 0..11
+.c12_x_loop:
+    cmp r12d, 12
+    jae .c12_next_y
+
+    mov eax, r8d
+    add eax, r12d                     ; abs_x
+    cmp eax, R2D_SCREEN_W
+    jae .c12_next_y
+
+    mov eax, r11d
+    imul eax, 12
+    add eax, r12d
+    movzx eax, byte [rsi + rax]       ; mask coverage (0..255)
+    test eax, eax
+    jz .c12_skip_px
+
+    cmp eax, 255
+    jae .c12_solid
+
+    ; Scale base_alpha (color >> 24) with coverage
+    mov ebx, r10d
+    shr ebx, 24
+    imul eax, ebx
+    shr eax, 8
+    test eax, eax
+    jz .c12_skip_px
+
+    shl eax, 24
+    mov ebx, r10d
+    and ebx, 0x00FFFFFF
+    or eax, ebx
+
+    push rdi
+    lea rdi, [rdi + r12*4]
+    call r2d_blend_pixel
+    pop rdi
+    jmp .c12_skip_px
+
+.c12_solid:
+    mov eax, r10d
+    mov [rdi + r12*4], eax
+
+.c12_skip_px:
+    inc r12d
+    jmp .c12_x_loop
+
+.c12_next_y:
+    inc r11d
+    jmp .c12_y_loop
+
+.c12_done:
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
 ; ==============================================================================
 ; r2d_draw_traffic_lights: Draws 3 macOS-style dots at ECX=x, EDX=y
 ; ==============================================================================
@@ -1086,17 +1242,12 @@ r2d_draw_traffic_lights:
     push rbx
     push rcx
     push rdx
-    push rsi
-    push rdi
 
     ; Red Close Button (#FF5F56)
     push rcx
     push rdx
-    mov esi, 12
-    mov edi, 12
-    mov ebx, 6
     mov eax, 0xFFFF5F56
-    call r2d_draw_rounded_rect_aa
+    call r2d_draw_circle_12_aa
     pop rdx
     pop rcx
 
@@ -1104,11 +1255,8 @@ r2d_draw_traffic_lights:
     push rcx
     push rdx
     add ecx, 18
-    mov esi, 12
-    mov edi, 12
-    mov ebx, 6
     mov eax, 0xFFFFBD2E
-    call r2d_draw_rounded_rect_aa
+    call r2d_draw_circle_12_aa
     pop rdx
     pop rcx
 
@@ -1116,16 +1264,11 @@ r2d_draw_traffic_lights:
     push rcx
     push rdx
     add ecx, 36
-    mov esi, 12
-    mov edi, 12
-    mov ebx, 6
     mov eax, 0xFF27C93F
-    call r2d_draw_rounded_rect_aa
+    call r2d_draw_circle_12_aa
     pop rdx
     pop rcx
 
-    pop rdi
-    pop rsi
     pop rdx
     pop rcx
     pop rbx
@@ -1469,6 +1612,10 @@ r2d_draw_cursor_aa:
     mov eax, r8d
     lea rdi, [rdi + rax*4]
 
+    lea rsi, [r15 + cursor_aa_data - kmain]
+    imul eax, ebx, (CURSOR_AA_W * 4)
+    add rsi, rax
+
     xor ecx, ecx
 .cur_col:
     cmp ecx, CURSOR_AA_W
@@ -1479,12 +1626,16 @@ r2d_draw_cursor_aa:
     cmp eax, R2D_SCREEN_W
     jae .cur_next_row
 
-    lodsd
+    mov eax, [rsi + rcx*4]
+    test eax, 0xFF000000
+    jz .cur_skip_pix
+
     push rdi
     lea rdi, [rdi + rcx*4]
     call r2d_blend_pixel
     pop rdi
 
+.cur_skip_pix:
     inc ecx
     jmp .cur_col
 

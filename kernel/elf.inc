@@ -91,6 +91,8 @@ elf_load_from_ext4:
     push r13
     push r14
     push r15
+    pushfq
+    cli
 
     mov r14, rsi                      ; r14 = original path string
 
@@ -219,6 +221,7 @@ elf_load_from_ext4:
     mov eax, ebx                      ; return TID or error
 
 .elff_ret:
+    popfq
     pop r15
     pop r14
     pop r13
@@ -320,6 +323,7 @@ elf_load_exec:
     mov rax, r10
     imul rax, r11
     add rax, r9
+    jc .no_phdrs
     cmp rax, r13
     jbe .phdrs_bounds_ok
 .no_phdrs:
@@ -402,9 +406,26 @@ elf_load_exec:
     mov rax, [rdx + PHDR_OFF_FILESZ]  ; rax = file size
     mov r8,  [rdx + PHDR_OFF_MEMSZ]   ; r8  = memory size
 
-    ; Validate file offset + filesz <= file size
-    lea rbp, [rsi + rax]
+    ; Validate file offset + filesz <= file size (with 64-bit integer overflow check)
+    mov rbp, rsi
+    add rbp, rax
+    jc .next_phdr
     cmp rbp, r13
+    ja .next_phdr
+
+    ; C1 Mitigation: Validate segment virtual address and memory bounds
+    ; Segment must fall completely within the 2MB user code slot [0x400000, 0x600000)
+    cmp rdi, 0x400000
+    jb .next_phdr
+    cmp rax, r8                       ; filesz <= memsz
+    ja .next_phdr
+    cmp r8, 0x200000                  ; memsz <= 2MB
+    ja .next_phdr
+
+    mov rbp, rdi
+    sub rbp, 0x400000
+    add rbp, r8                       ; (vaddr - 0x400000) + memsz
+    cmp rbp, 0x200000
     ja .next_phdr
 
     ; Map virtual address (0x400000..) to slot's private physical code memory
@@ -483,7 +504,107 @@ elf_load_exec:
 
     ; 9. Setup AMD64 System V ABI User Stack at virtual 0x7FFF00
     ; Physical address = phys_stack + 0x1FFF00
-    ; Store process name string at physical phys_stack + 0x1FFF80 (virtual 0x7FFF80)
+    mov r9, [r15 + sys_spawn_argv_ptr - kmain]
+    test r9, r9
+    jz .fallback_args
+
+    ; Validate argv array pointer
+    push rbx
+    mov rdi, r9
+    mov rsi, 8
+    call sys_validate_user_ptr
+    pop rbx
+    jc .fallback_args
+
+    ; Copy arguments into phys_stack + 0x1FF800 (virtual 0x7FF800)
+    lea r12, [r10 + 0x1FF800]          ; physical destination
+    mov r13, 0x7FF800                  ; virtual destination
+    xor ecx, ecx                       ; ecx = argc
+
+.copy_argv_loop:
+    cmp ecx, 16
+    jae .argv_copied
+    mov rsi, [r9 + rcx*8]              ; rsi = user string pointer
+    test rsi, rsi
+    jz .argv_copied
+
+    ; Validate string pointer
+    push rcx
+    push r9
+    push rbx
+    mov rdi, rsi
+    mov rsi, 1
+    call sys_validate_user_ptr
+    pop rbx
+    pop r9
+    pop rcx
+    jc .argv_copied
+
+    ; Store virtual address in argv[rcx] table
+    mov [r10 + 0x1FFF00 + 8 + rcx*8], r13
+
+    ; Copy string characters
+    mov edx, 127                       ; max 127 bytes per arg
+.cp_char:
+    mov al, [rsi]
+    mov [r12], al
+    inc rsi
+    inc r12
+    inc r13
+    test al, al
+    jz .cp_char_done
+    dec edx
+    jnz .cp_char
+    mov byte [r12 - 1], 0              ; force null terminator
+.cp_char_done:
+    ; Align r12 and r13 to 8 bytes
+    add r12, 7
+    and r12, -8
+    add r13, 7
+    and r13, -8
+    inc ecx
+    jmp .copy_argv_loop
+
+.argv_copied:
+    test ecx, ecx
+    jz .fallback_args
+
+    ; Successfully copied arguments
+    mov [r10 + 0x1FFF00], rcx                  ; [0x00] = argc
+    mov qword [r10 + 0x1FFF00 + 8 + rcx*8], 0  ; argv[argc] = NULL
+
+    ; Setup standard POSIX environment strings at phys_stack + 0x1FF500 (virtual 0x7FF500)
+    lea rdi, [r10 + 0x1FF500]
+    mov dword [rdi + 0], "PATH"
+    mov dword [rdi + 4], "=/bi"
+    mov dword [rdi + 8], "n:/"
+    mov dword [rdi + 16], "HOME"
+    mov word  [rdi + 20], "=/"
+    mov byte  [rdi + 22], 0
+    mov dword [rdi + 32], "USER"
+    mov dword [rdi + 36], "=roo"
+    mov word  [rdi + 40], "t"
+    mov dword [rdi + 48], "TERM"
+    mov dword [rdi + 52], "=xte"
+    mov dword [rdi + 56], "rm-2"
+    mov dword [rdi + 60], "56co"
+    mov dword [rdi + 64], "lor"
+    mov dword [rdi + 80], "SHEL"
+    mov dword [rdi + 84], "L=/s"
+    mov word  [rdi + 88], "h"
+
+    ; Populate envp pointers
+    lea rdi, [r10 + 0x1FFF00 + 16 + rcx*8]
+    mov qword [rdi + 0*8], 0x7FF500
+    mov qword [rdi + 1*8], 0x7FF500 + 16
+    mov qword [rdi + 2*8], 0x7FF500 + 32
+    mov qword [rdi + 3*8], 0x7FF500 + 48
+    mov qword [rdi + 4*8], 0x7FF500 + 80
+    mov qword [rdi + 5*8], 0
+    jmp .args_done
+
+.fallback_args:
+    ; Fallback: 1 argument (process name string at virtual 0x7FFF80)
     push rdi
     push rsi
     mov rsi, r14                      ; process name
@@ -504,14 +625,44 @@ elf_load_exec:
 
     ; Stack layout at phys_stack + 0x1FFF00 (virtual 0x7FFF00):
     ; [0x00] = 1 (argc)
-    ; [0x08] = 0x7FFF80 (argv[0] - user virtual address)
+    ; [0x08] = 0x7FFF80 (argv[0])
     ; [0x10] = 0 (argv[1] = NULL)
-    ; [0x18] = 0 (envp[0] = NULL)
+    ; [0x18..] = envp
     lea rdi, [r10 + 0x1FFF00]
     mov qword [rdi + 0x00], 1
     mov qword [rdi + 0x08], 0x7FFF80
     mov qword [rdi + 0x10], 0
-    mov qword [rdi + 0x18], 0
+
+    ; Setup standard POSIX environment strings at phys_stack + 0x1FF500 (virtual 0x7FF500)
+    lea rdi, [r10 + 0x1FF500]
+    mov dword [rdi + 0], "PATH"
+    mov dword [rdi + 4], "=/bi"
+    mov dword [rdi + 8], "n:/"
+    mov dword [rdi + 16], "HOME"
+    mov word  [rdi + 20], "=/"
+    mov byte  [rdi + 22], 0
+    mov dword [rdi + 32], "USER"
+    mov dword [rdi + 36], "=roo"
+    mov word  [rdi + 40], "t"
+    mov dword [rdi + 48], "TERM"
+    mov dword [rdi + 52], "=xte"
+    mov dword [rdi + 56], "rm-2"
+    mov dword [rdi + 60], "56co"
+    mov dword [rdi + 64], "lor"
+    mov dword [rdi + 80], "SHEL"
+    mov dword [rdi + 84], "L=/s"
+    mov word  [rdi + 88], "h"
+
+    lea rdi, [r10 + 0x1FFF00 + 0x18]
+    mov qword [rdi + 0*8], 0x7FF500
+    mov qword [rdi + 1*8], 0x7FF500 + 16
+    mov qword [rdi + 2*8], 0x7FF500 + 32
+    mov qword [rdi + 3*8], 0x7FF500 + 48
+    mov qword [rdi + 4*8], 0x7FF500 + 80
+    mov qword [rdi + 5*8], 0
+
+.args_done:
+    mov qword [r15 + sys_spawn_argv_ptr - kmain], 0
 
     ; 10. Finalize Ring 3 User Task!
     ; EBX = slot ID

@@ -16,8 +16,9 @@ APP_USER_3   = 7   ; User Application 3
 APP_COUNT    = 8
 
 ; Window Lifecycle States
-WM_STATE_CLOSED = 0
-WM_STATE_OPEN   = 1
+WM_STATE_CLOSED    = 0
+WM_STATE_OPEN      = 1
+WM_STATE_MINIMIZED = 2
 
 align 16
 ; Application Descriptors & Geometry (8 windows: 4 system + 4 dynamic user apps)
@@ -26,6 +27,11 @@ wm_x          dd 120, 760, 1260, 520, 240, 300, 360, 420
 wm_y          dd 80,  120, 160,  240, 140, 180, 220, 260
 wm_w          dd 680, 620, 480,  560, 500, 500, 500, 500
 wm_h          dd 600, 560, 480,  440, 380, 380, 380, 380
+wm_maximized  db 0, 0, 0, 0, 0, 0, 0, 0
+wm_saved_x    dd 0, 0, 0, 0, 0, 0, 0, 0
+wm_saved_y    dd 0, 0, 0, 0, 0, 0, 0, 0
+wm_saved_w    dd 0, 0, 0, 0, 0, 0, 0, 0
+wm_saved_h    dd 0, 0, 0, 0, 0, 0, 0, 0
 
 ; Global Compositor / WM State
 wm_z_order    db 0, 1, 2, 3, 4, 5, 6, 7         ; App IDs from back (0) to front (open_count - 1)
@@ -43,13 +49,14 @@ wm_drag_dirty_y    dd 0
 wm_drag_dirty_w    dd 0
 wm_drag_dirty_h    dd 0
 
-; Dynamic User Window Storage (4 slots: 0..3 for apps 4..7)
+; Dynamic User Window Storage (8 slots: 0..7)
 align 16
-wm_user_canvas    dq 0x00800000, 0x00A00000, 0x00C00000, 0x00E00000
-wm_user_titles    rb 4 * 64
-wm_user_has_event db 0, 0, 0, 0
+wm_user_canvas    dq 0x00800000, 0x00A00000, 0x00C00000, 0x00E00000, 0x01000000, 0x01200000, 0x01400000, 0x01600000
+wm_user_titles    rb 8 * 64
+wm_user_ev_head   db 0, 0, 0, 0, 0, 0, 0, 0
+wm_user_ev_tail   db 0, 0, 0, 0, 0, 0, 0, 0
 align 16
-wm_user_events    rb 4 * 16
+wm_user_events    rb 8 * 16 * 16       ; 8 windows * 16 events * 16 bytes = 2048 bytes
 
 ; Window Titles
 str_title_term db "Terminal - Opensweet Shell (x86_64)", 0
@@ -81,7 +88,8 @@ wm_init:
     mov byte [r15 + wm_state - kmain + 5], 0     ; User 1 CLOSED
     mov byte [r15 + wm_state - kmain + 6], 0     ; User 2 CLOSED
     mov byte [r15 + wm_state - kmain + 7], 0     ; User 3 CLOSED
-    mov dword [r15 + wm_user_has_event - kmain], 0
+    mov qword [r15 + wm_user_ev_head - kmain], 0
+    mov qword [r15 + wm_user_ev_tail - kmain], 0
 
     mov dword [r15 + wm_x - kmain + 0*4], 120
     mov dword [r15 + wm_y - kmain + 0*4], 80
@@ -226,6 +234,159 @@ wm_close_app:
     ret
 
 ; ==============================================================================
+; wm_minimize_app: Minimize application window AL (hide from screen, keep state)
+; ==============================================================================
+wm_minimize_app:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push r8
+
+    movzx ebx, al
+    cmp ebx, APP_COUNT
+    jae .min_ret
+
+    cmp byte [r15 + wm_state - kmain + rbx], WM_STATE_OPEN
+    jne .min_ret
+
+    ; Mark minimized
+    mov byte [r15 + wm_state - kmain + rbx], WM_STATE_MINIMIZED
+
+    ; Clear drag if this window was being dragged
+    cmp [r15 + wm_drag_app - kmain], bl
+    jne @f
+    mov byte [r15 + wm_drag_app - kmain], 0xFF
+@@:
+    ; Find in wm_z_order
+    xor ecx, ecx
+    movzx edx, byte [r15 + wm_open_count - kmain]
+.min_find_loop:
+    cmp ecx, edx
+    jae .min_done
+    cmp [r15 + wm_z_order - kmain + rcx], bl
+    je .min_found_in_z
+    inc ecx
+    jmp .min_find_loop
+
+.min_found_in_z:
+    ; Shift remaining elements down: z[i] = z[i+1]
+    mov eax, ecx
+.min_shift_loop:
+    inc eax
+    cmp eax, edx
+    jae .min_shifted
+    mov r8b, [r15 + wm_z_order - kmain + rax]
+    mov [r15 + wm_z_order - kmain + rax - 1], r8b
+    jmp .min_shift_loop
+
+.min_shifted:
+    dec byte [r15 + wm_open_count - kmain]
+    movzx edx, byte [r15 + wm_open_count - kmain]
+    test edx, edx
+    jz .min_no_focus
+    ; New top window receives focus
+    mov al, [r15 + wm_z_order - kmain + rdx - 1]
+    mov [r15 + wm_focus_app - kmain], al
+    jmp .min_done
+
+.min_no_focus:
+    mov byte [r15 + wm_focus_app - kmain], 0xFF
+
+.min_done:
+    ; Post EVENT_WIN_MINIMIZE = 7
+    movzx ebx, bl
+    mov eax, 7
+    xor ecx, ecx
+    xor edx, edx
+    xor r8d, r8d
+    call wm_post_event
+
+    mov byte [r15 + md_term_dirty - kmain], 1
+
+.min_ret:
+    pop r8
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; ==============================================================================
+; wm_toggle_maximize_app: Toggle maximize / zoom for window AL
+; ==============================================================================
+wm_toggle_maximize_app:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+
+    movzx ebx, al
+    cmp ebx, APP_COUNT
+    jae .max_ret
+
+    cmp byte [r15 + wm_state - kmain + rbx], WM_STATE_OPEN
+    jne .max_ret
+
+    cmp byte [r15 + wm_maximized - kmain + rbx], 0
+    jne .restore_from_max
+
+    ; 1. Maximize window:
+    ; Save current geometry
+    mov eax, [r15 + wm_x - kmain + rbx*4]
+    mov [r15 + wm_saved_x - kmain + rbx*4], eax
+    mov eax, [r15 + wm_y - kmain + rbx*4]
+    mov [r15 + wm_saved_y - kmain + rbx*4], eax
+    mov eax, [r15 + wm_w - kmain + rbx*4]
+    mov [r15 + wm_saved_w - kmain + rbx*4], eax
+    mov eax, [r15 + wm_h - kmain + rbx*4]
+    mov [r15 + wm_saved_h - kmain + rbx*4], eax
+
+    mov byte [r15 + wm_maximized - kmain + rbx], 1
+
+    ; Large maximized geometry: 960x560, centered at x=480, y=80
+    mov dword [r15 + wm_x - kmain + rbx*4], 480
+    mov dword [r15 + wm_y - kmain + rbx*4], 80
+    mov dword [r15 + wm_w - kmain + rbx*4], 960
+    mov dword [r15 + wm_h - kmain + rbx*4], 560
+    jmp .max_done
+
+.restore_from_max:
+    ; 2. Restore normal geometry:
+    mov eax, [r15 + wm_saved_x - kmain + rbx*4]
+    mov [r15 + wm_x - kmain + rbx*4], eax
+    mov eax, [r15 + wm_saved_y - kmain + rbx*4]
+    mov [r15 + wm_y - kmain + rbx*4], eax
+    mov eax, [r15 + wm_saved_w - kmain + rbx*4]
+    mov [r15 + wm_w - kmain + rbx*4], eax
+    mov eax, [r15 + wm_saved_h - kmain + rbx*4]
+    mov [r15 + wm_h - kmain + rbx*4], eax
+
+    mov byte [r15 + wm_maximized - kmain + rbx], 0
+
+.max_done:
+    ; Bring to front & notify
+    mov al, bl
+    call wm_bring_to_front
+
+    ; Post EVENT_WIN_MAXIMIZE = 8
+    movzx ebx, bl
+    mov eax, 8
+    mov ecx, [r15 + wm_w - kmain + rbx*4]
+    mov edx, [r15 + wm_h - kmain + rbx*4]
+    xor r8d, r8d
+    call wm_post_event
+
+    mov byte [r15 + md_term_dirty - kmain], 1
+
+.max_ret:
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; ==============================================================================
 ; wm_bring_to_front: Bring application window AL to top of z-order
 ; ==============================================================================
 wm_bring_to_front:
@@ -295,12 +456,30 @@ wm_toggle_dock:
     cmp ebx, APP_COUNT
     jae .td_ret
 
+    cmp byte [r15 + wm_state - kmain + rbx], WM_STATE_MINIMIZED
+    je .td_unminimize
+
     cmp byte [r15 + wm_state - kmain + rbx], WM_STATE_CLOSED
     je .td_open
 
-    ; Already open: bring to front
+    ; Already open: if already top-most and focused, toggle minimize!
+    cmp bl, [r15 + wm_focus_app - kmain]
+    jne .td_bring_front
+    mov al, bl
+    call wm_minimize_app
+    jmp .td_ret
+
+.td_bring_front:
     mov al, bl
     call wm_bring_to_front
+    mov byte [r15 + md_term_dirty - kmain], 1
+    jmp .td_ret
+
+.td_unminimize:
+    ; Restore minimized window
+    mov al, bl
+    call wm_open_app
+    mov byte [r15 + md_term_dirty - kmain], 1
     jmp .td_ret
 
 .td_open:
@@ -389,14 +568,14 @@ wm_render_window:
 
     ; 3. Traffic Lights (Close = Red, Minimize = Amber, Maximize = Emerald)
     mov ecx, r8d
-    add ecx, 14
+    add ecx, 16                         ; 16px from left edge (generous clearance from squircle corner)
     mov edx, r9d
-    add edx, 9
+    add edx, 10                         ; 10px from top edge (perfectly vertically centered in 32px title bar)
     call r2d_draw_traffic_lights
 
     ; 4. Window Title Text
     mov ecx, r8d
-    add ecx, 72                         ; Starts right after traffic lights (wx + 72)
+    add ecx, 76                         ; Starts cleanly after traffic lights (wx + 76)
     mov edx, r9d
     add edx, 8
 
@@ -407,34 +586,14 @@ wm_render_window:
 .title_unfocused:
     mov eax, 0xFF94A3B8                 ; Slate 400 when unfocused
 .draw_title:
-    ; Choose title string by app_id (r13d)
-    cmp r13d, APP_TERM
-    je .t_term
-    cmp r13d, APP_FILES
-    je .t_files
-    cmp r13d, APP_SYS
-    je .t_sys
-    cmp r13d, APP_SETTINGS
-    je .t_set
-
-    ; Dynamic User Window (r13d >= 4)
+    ; Window Title Text (r13d: 0..7)
     mov edx, r13d
-    sub edx, 4
-    shl edx, 6                         ; edx = slot * 64 (preserves EAX color!)
+    shl edx, 6                         ; edx = slot * 64
     lea rsi, [r15 + wm_user_titles - kmain + rdx]
-    jmp .do_title_draw
-
-.t_set:
-    lea rsi, [r15 + str_title_set - kmain]
-    jmp .do_title_draw
-.t_term:
+    cmp byte [rsi], 0
+    jne .do_title_draw
+    ; Fallback title
     lea rsi, [r15 + str_title_term - kmain]
-    jmp .do_title_draw
-.t_files:
-    lea rsi, [r15 + str_title_file - kmain]
-    jmp .do_title_draw
-.t_sys:
-    lea rsi, [r15 + str_title_sys - kmain]
 .do_title_draw:
     mov edx, r9d
     add edx, 8
@@ -456,40 +615,16 @@ wm_render_window:
     mov edi, r11d                       ; wh
     mov eax, r12d                       ; is_focused
 
-    cmp r13d, APP_TERM
-    je .call_term
-    cmp r13d, APP_FILES
-    je .call_files
-    cmp r13d, APP_SYS
-    je .call_sys
-    cmp r13d, APP_SETTINGS
-    je .call_settings
-
-    ; Dynamic User Window (r13d >= 4): Blit client canvas!
+    ; Blit client canvas for window (r13d: 0..7)!
     ; Client area: (wx, wy + 33, ww, wh - 33)
-    ; Input registers: ecx = wx, edx = wy, esi = ww, edi = wh
     add edx, 33                       ; dst_y = wy + 33
     sub edi, 33                       ; h = wh - 33
     mov eax, r13d
-    sub eax, 4
     mov r8, [r15 + wm_user_canvas - kmain + rax*8]
     test r8, r8
     jz .win_rendered
 
     call r2d_blit_bitmap
-    jmp .win_rendered
-
-.call_settings:
-    call app_settings_render
-    jmp .win_rendered
-.call_term:
-    call app_term_render
-    jmp .win_rendered
-.call_files:
-    call app_files_render
-    jmp .win_rendered
-.call_sys:
-    call app_sys_render
 
 .win_rendered:
     pop r13
@@ -615,10 +750,26 @@ wm_handle_mouse:
 
 .release_done:
     mov byte [r15 + wm_drag_app - kmain], 0xFF
+    mov byte [r15 + md_term_dirty - kmain], 1
     jmp .mouse_ret
 
 .release_no_drag:
     mov byte [r15 + wm_drag_app - kmain], 0xFF
+
+    ; Post EVENT_MOUSE_UP = 3 to focused window (if any)
+    movzx ebx, byte [r15 + wm_focus_app - kmain]
+    cmp bl, APP_COUNT
+    jae .mouse_ret
+
+    mov ecx, [r15 + md_mouse_x - kmain]
+    sub ecx, [r15 + wm_x - kmain + rbx*4]
+    mov edx, [r15 + md_mouse_y - kmain]
+    sub edx, [r15 + wm_y - kmain + rbx*4]
+    sub edx, 33
+
+    mov eax, 3                         ; EVENT_MOUSE_UP = 3
+    mov r8d, 1                         ; Button 1 (LMB)
+    call wm_post_event
     jmp .mouse_ret
 
 .just_hover:
@@ -731,45 +882,64 @@ wm_handle_mouse:
     ja .win_hit_loop
 
     ; HIT WINDOW ebx!
-    ; Check 1: Traffic Light Red Close Button
-    mov ecx, r8d
-    add ecx, 9
-    cmp eax, ecx
-    jb .not_close_btn
-    add ecx, 17
-    cmp eax, ecx
-    ja .not_close_btn
-
+    ; Check 1: Traffic Lights (Close = Red, Minimize = Yellow, Maximize = Green)
     mov ecx, r9d
     add ecx, 6
     cmp edx, ecx
-    jb .not_close_btn
+    jb .not_traffic_lights
     add ecx, 20
     cmp edx, ecx
-    ja .not_close_btn
+    ja .not_traffic_lights
 
+    ; Button 1: RED Close Button (wx + 9 .. wx + 26)
+    mov ecx, r8d
+    add ecx, 9
+    cmp eax, ecx
+    jb .not_traffic_lights
+    add ecx, 17                         ; wx + 26
+    cmp eax, ecx
+    jbe .click_red_btn
+
+    ; Button 2: YELLOW / AMBER Minimize Button (wx + 27 .. wx + 44)
+    add ecx, 18                         ; wx + 44
+    cmp eax, ecx
+    jbe .click_yellow_btn
+
+    ; Button 3: GREEN Maximize / Zoom Button (wx + 45 .. wx + 65)
+    add ecx, 21                         ; wx + 65
+    cmp eax, ecx
+    jbe .click_green_btn
+
+    jmp .not_traffic_lights
+
+.click_red_btn:
     ; Red close button CLICKED! Cleanly close app!
-    cmp bl, 4
-    jb .do_close_app
-    ; User application window (bl >= 4): post WIN_CLOSE event
-    movzx eax, bl
-    sub eax, 4
-    shl eax, 4                         ; slot * 16
-    lea rdi, [r15 + wm_user_events - kmain + rax]
-    mov dword [rdi + 0], 5             ; EVENT_WIN_CLOSE = 5
-    mov dword [rdi + 4], 0
-    mov dword [rdi + 8], 0
-    mov dword [rdi + 12], 0
-    movzx eax, bl
-    sub eax, 4
-    mov byte [r15 + wm_user_has_event - kmain + rax], 1
+    movzx ebx, bl
+    mov eax, 5                         ; EVENT_WIN_CLOSE = 5
+    xor ecx, ecx
+    xor edx, edx
+    xor r8d, r8d
+    call wm_post_event
 
-.do_close_app:
     mov al, bl
     call wm_close_app
     jmp .mouse_ret
 
-.not_close_btn:
+.click_yellow_btn:
+    ; Yellow minimize button CLICKED! Minimize app!
+    movzx ebx, bl
+    mov al, bl
+    call wm_minimize_app
+    jmp .mouse_ret
+
+.click_green_btn:
+    ; Green maximize button CLICKED! Toggle maximize / zoom!
+    movzx ebx, bl
+    mov al, bl
+    call wm_toggle_maximize_app
+    jmp .mouse_ret
+
+.not_traffic_lights:
     ; Check 2: Title bar drag region (wy to wy + 32)
     mov ecx, r9d
     add ecx, 32
@@ -850,44 +1020,17 @@ wm_handle_mouse:
     mov al, bl
     call wm_bring_to_front
 
-    cmp ebx, 4
-    jb .sys_body_click
-
-    ; User application window (ebx >= 4): post MOUSE_DOWN event
-    mov eax, ebx
-    sub eax, 4
-    shl eax, 4                         ; slot * 16
-    lea rdi, [r15 + wm_user_events - kmain + rax]
-    mov dword [rdi + 0], 2             ; EVENT_MOUSE_DOWN = 2
-
-    ; Compute client-relative coordinates
+    ; Post MOUSE_DOWN event to target window (ebx: 0..7)
     mov ecx, [r15 + md_mouse_x - kmain]
     sub ecx, [r15 + wm_x - kmain + rbx*4]
-    mov [rdi + 4], ecx
 
     mov edx, [r15 + md_mouse_y - kmain]
     sub edx, [r15 + wm_y - kmain + rbx*4]
     sub edx, 33                        ; Title bar height = 33
-    mov [rdi + 8], edx
 
-    mov dword [rdi + 12], 1            ; Button = 1 (LMB)
-
-    mov eax, ebx
-    sub eax, 4
-    mov byte [r15 + wm_user_has_event - kmain + rax], 1
-    mov byte [r15 + md_term_dirty - kmain], 1
-    jmp .mouse_ret
-
-.sys_body_click:
-    cmp ebx, APP_FILES
-    jne .mouse_ret
-    ; Dispatch to File Explorer
-    mov ecx, [r15 + md_mouse_x - kmain]
-    mov edx, [r15 + md_mouse_y - kmain]
-    call app_files_click
-    test al, al
-    jz .mouse_ret
-    mov byte [r15 + md_term_dirty - kmain], 1
+    mov eax, 2                         ; EVENT_MOUSE_DOWN = 2
+    mov r8d, 1                         ; Button = 1 (LMB)
+    call wm_post_event
     jmp .mouse_ret
 
 .lmb_is_held:
@@ -1152,7 +1295,14 @@ wm_drag_step:
     call md_render_menubar
 .skip_mb:
 
-    ; Step 3: Redraw Dock if dirty rect touches it
+    ; Step 3: Render all intersecting windows in Z-order
+    mov r8d, [r15 + wm_drag_dirty_x - kmain]
+    mov r9d, [r15 + wm_drag_dirty_y - kmain]
+    mov r10d, [r15 + wm_drag_dirty_w - kmain]
+    mov r11d, [r15 + wm_drag_dirty_h - kmain]
+    call wm_render_intersecting
+
+    ; Step 4: Redraw Dock if dirty rect touches it (Dock is always on top)
     mov eax, [r15 + wm_drag_dirty_y - kmain]
     add eax, [r15 + wm_drag_dirty_h - kmain]     ; Y_max
     cmp eax, 990
@@ -1165,13 +1315,6 @@ wm_drag_step:
     ja .skip_dk
     call md_render_dock
 .skip_dk:
-
-    ; Step 4: Render all intersecting windows in Z-order
-    mov r8d, [r15 + wm_drag_dirty_x - kmain]
-    mov r9d, [r15 + wm_drag_dirty_y - kmain]
-    mov r10d, [r15 + wm_drag_dirty_w - kmain]
-    mov r11d, [r15 + wm_drag_dirty_h - kmain]
-    call wm_render_intersecting
 .render_done:
 
     ; Step 5: Flip only dirty rect to VRAM LFB (~3-5 ms)
@@ -1394,6 +1537,11 @@ wm_drag_flush_pending:
 ; ESI = x, EDX = y, R10D = w, R8D = h
 ; Returns: RAX = (canvas_ptr << 32) | win_id (or -1 if no slots available)
 ; ==============================================================================
+; wm_create_user_window: Allocate and show a dynamic user application window
+; RDI = title pointer (user or kernel memory)
+; ESI = x, EDX = y, R10D = w, R8D = h
+; Returns: RAX = (canvas_ptr << 32) | win_id (or -1 if no slots available)
+; ==============================================================================
 wm_create_user_window:
     push rbx
     push rcx
@@ -1407,12 +1555,12 @@ wm_create_user_window:
     push r12
     push r13
 
-    ; 1. Find free user window slot (0..3, corresponding to app_id 4..7)
+    ; 1. Find free user window slot (0..7)
     mov ebx, 0
 .find_slot:
-    cmp ebx, 4
+    cmp ebx, APP_COUNT
     jae .no_slot
-    cmp byte [r15 + wm_state - kmain + 4 + rbx], WM_STATE_CLOSED
+    cmp byte [r15 + wm_state - kmain + rbx], WM_STATE_CLOSED
     je .found_slot
     inc ebx
     jmp .find_slot
@@ -1422,28 +1570,28 @@ wm_create_user_window:
     jmp .create_done
 
 .found_slot:
-    ; ebx = slot (0..3), app_id = ebx + 4
-    lea r12d, [ebx + 4]
+    ; ebx = slot (0..7), app_id = ebx
+    mov r12d, ebx
 
-    ; 2. Validate and clamp dimensions
-    ; Width: clamp to [200, 1600], default 440
+    ; 2. Validate and clamp dimensions (H1 Mitigation: 960x560 fits 2MB canvas)
+    ; Width: clamp to [200, 960]
     cmp r10d, 200
     jge @f
-    mov r10d, 440
+    mov r10d, 200
 @@:
-    cmp r10d, 1600
+    cmp r10d, 960
     jle @f
-    mov r10d, 1600
+    mov r10d, 960
 @@:
 
-    ; Height: clamp to [150, 900], default 320
+    ; Height: clamp to [150, 560]
     cmp r8d, 150
     jge @f
-    mov r8d, 320
+    mov r8d, 150
 @@:
-    cmp r8d, 900
+    cmp r8d, 560
     jle @f
-    mov r8d, 900
+    mov r8d, 560
 @@:
 
     ; Position X: clamp/default
@@ -1496,7 +1644,6 @@ wm_create_user_window:
     jc .default_title
 
     ; Copy from user string at rdi
-
     mov rsi, rdi
     mov rdi, r13
     mov ecx, 63
@@ -1524,18 +1671,18 @@ wm_create_user_window:
     mov eax, r8d                      ; height
     sub eax, 33                       ; client height = h - 33
     imul ecx, eax                     ; total dwords
+    ; H1 Mitigation: Never write beyond 2MB canvas (524288 dwords)
+    cmp ecx, 524288
+    jbe @f
+    mov ecx, 524288
+@@:
     mov eax, 0xFF0F172A               ; Default Dark Slate background
     cld
     rep stosd
 
     ; 5. Clear event state
-    mov byte [r15 + wm_user_has_event - kmain + rbx], 0
-    mov eax, ebx
-    shl eax, 4
-    lea rdi, [r15 + wm_user_events - kmain + rax]
-    xor eax, eax
-    mov qword [rdi], rax
-    mov qword [rdi + 8], rax
+    mov byte [r15 + wm_user_ev_head - kmain + rbx], 0
+    mov byte [r15 + wm_user_ev_tail - kmain + rbx], 0
 
     ; 6. Open window via WM
     mov al, r12b                      ; app_id
@@ -1544,7 +1691,7 @@ wm_create_user_window:
     ; 7. Return (canvas_ptr << 32) | app_id
     mov rdx, [r15 + wm_user_canvas - kmain + rbx*8]
     shl rdx, 32
-    mov eax, r12d                     ; app_id (4..7)
+    mov eax, r12d                     ; app_id (0..7)
     or rax, rdx
 
 .create_done:
@@ -1562,22 +1709,64 @@ wm_create_user_window:
     ret
 
 ; ==============================================================================
+; wm_post_event: Push 16-byte event into window EBX's event ring buffer
+; Input:
+; EBX = win_id (0..7)
+; EAX = event_type (1..6)
+; ECX = data1 / x
+; EDX = data2 / y
+; R8D = param / key / button
+; ==============================================================================
+wm_post_event:
+    cmp ebx, APP_COUNT
+    jae .wpe_ret
+    push rdi
+    push rsi
+    push r9
+
+    movzx esi, byte [r15 + wm_user_ev_head - kmain + rbx]
+    lea r9d, [esi + 1]
+    and r9d, 15
+    cmp r9b, byte [r15 + wm_user_ev_tail - kmain + rbx]
+    je .wpe_full              ; Queue is full, drop event
+
+    ; Calculate slot offset: (slot << 8) + (head << 4)
+    movzx edi, bl
+    shl edi, 8
+    shl esi, 4
+    add edi, esi
+    lea rdi, [r15 + wm_user_events - kmain + rdi]
+
+    mov [rdi + 0], eax        ; type
+    mov [rdi + 4], ecx        ; data1
+    mov [rdi + 8], edx        ; data2
+    mov [rdi + 12], r8d       ; param
+
+    mov [r15 + wm_user_ev_head - kmain + rbx], r9b
+    mov byte [r15 + md_term_dirty - kmain], 1
+
+.wpe_full:
+    pop r9
+    pop rsi
+    pop rdi
+.wpe_ret:
+    ret
+
+; ==============================================================================
 ; wm_close_user_window: Close user application window
-; EDI = win_id (4..7)
+; EDI = win_id (0..7)
 ; Returns: RAX = 0 on success, -1 on error
 ; ==============================================================================
 wm_close_user_window:
-    cmp edi, 4
-    jb .cuw_err
-    cmp edi, 8
+    cmp edi, APP_COUNT
     jae .cuw_err
 
     mov al, dil
     call wm_close_app
 
     mov eax, edi
-    sub eax, 4
-    mov byte [r15 + wm_user_has_event - kmain + rax], 0
+    mov byte [r15 + wm_user_ev_head - kmain + rax], 0
+    mov byte [r15 + wm_user_ev_tail - kmain + rax], 0
     xor eax, eax
     ret
 
@@ -1587,13 +1776,11 @@ wm_close_user_window:
 
 ; ==============================================================================
 ; wm_poll_user_event: Poll for pending GUI events for window EDI
-; EDI = win_id (4..7), RSI = pointer to 16-byte user buffer
+; EDI = win_id (0..7), RSI = pointer to 16-byte user buffer
 ; Returns: RAX = 1 if event retrieved, 0 if no event, -1 on invalid win_id
 ; ==============================================================================
 wm_poll_user_event:
-    cmp edi, 4
-    jb .pue_err
-    cmp edi, 8
+    cmp edi, APP_COUNT
     jae .pue_err
     test rsi, rsi
     jz .pue_err
@@ -1608,23 +1795,31 @@ wm_poll_user_event:
     pop rdi
     jc .pue_err
 
-    mov eax, edi
-    sub eax, 4
+    movzx ebx, dil            ; window slot (0..7)
+    movzx edx, byte [r15 + wm_user_ev_tail - kmain + rbx]
+    cmp dl, byte [r15 + wm_user_ev_head - kmain + rbx]
+    je .pue_none              ; Head == Tail: No event!
 
-    cmp byte [r15 + wm_user_has_event - kmain + rax], 0
-    je .pue_none
+    ; Read event at tail: (slot << 8) + (tail << 4)
+    movzx eax, bl
+    shl eax, 8
+    movzx ecx, dl
+    shl ecx, 4
+    add eax, ecx
+    lea r8, [r15 + wm_user_events - kmain + rax]
 
-    ; Consume event
-    mov byte [r15 + wm_user_has_event - kmain + rax], 0
-    shl eax, 4
-    lea rdx, [r15 + wm_user_events - kmain + rax]
+    mov rax, [r8]
+    mov [rsi], rax
+    mov rax, [r8 + 8]
+    mov [rsi + 8], rax
 
-    mov r8, [rdx]
-    mov [rsi], r8
-    mov r8, [rdx + 8]
-    mov [rsi + 8], r8
+    ; Advance tail: (tail + 1) & 15
+    movzx edx, byte [r15 + wm_user_ev_tail - kmain + rbx]
+    inc edx
+    and edx, 15
+    mov [r15 + wm_user_ev_tail - kmain + rbx], dl
 
-    mov eax, 1
+    mov eax, 1                ; Event retrieved!
     ret
 
 .pue_none:
@@ -1637,13 +1832,11 @@ wm_poll_user_event:
 
 ; ==============================================================================
 ; wm_update_user_window: Request window redraw (triggers compositor)
-; EDI = win_id (4..7)
+; EDI = win_id (0..7)
 ; Returns: RAX = 0 on success, -1 on error
 ; ==============================================================================
 wm_update_user_window:
-    cmp edi, 4
-    jb .uuw_err
-    cmp edi, 8
+    cmp edi, APP_COUNT
     jae .uuw_err
 
     mov byte [r15 + md_term_dirty - kmain], 1

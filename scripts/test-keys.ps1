@@ -4,7 +4,8 @@ param(
     [int]$BootWaitSec = 3,
     [int]$SettleMS = 300,
     [string]$MonitorPort = '4444',
-    [string]$ScreenDump = ''
+    [string]$ScreenDump = '',
+    [int]$WaitAfterKeysSec = 1
 )
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot\..
@@ -16,6 +17,7 @@ Remove-Item build\serial.log -ErrorAction SilentlyContinue
 
 $qemu = "C:\Program Files\qemu\qemu-system-x86_64.exe"
 $q = Start-Process -FilePath $qemu -ArgumentList `
+    "-m","512M", `
     "-drive","format=raw,file=build\os.img", "-drive","format=raw,file=build\disk.img,if=ide,index=1", `
     "-display","none", `
     "-serial","file:build\serial.log", `
@@ -31,7 +33,7 @@ try {
         $s.Write($b, 0, $b.Length)
         Start-Sleep -Milliseconds $SettleMS
     }
-    Start-Sleep -Seconds 1
+    Start-Sleep -Seconds $WaitAfterKeysSec
     if ($ScreenDump) {
         $b = [Text.Encoding]::ASCII.GetBytes("screendump $ScreenDump`n")
         $s.Write($b, 0, $b.Length)

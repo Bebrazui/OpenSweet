@@ -154,15 +154,7 @@ ata_read_one:
     or al, [r15 + ata_drv - kmain]
     mov dx, ATA_DRV
     out dx, al
-    mov al, 'z'
-    push rdx
-    mov dx, 0xE9
-    out dx, al
-    pop rdx
     call ata_wait_ready
-    mov al, 'a'
-    mov dx, 0xE9
-    out dx, al
     jnc .sel_ok
     stc
     jmp .pop
@@ -191,9 +183,6 @@ ata_read_one:
     out dx, al
 
     call ata_wait_drq
-    mov al, 'b'
-    mov dx, 0xE9
-    out dx, al
     jnc .got_data
     stc
     jmp .pop
@@ -201,6 +190,7 @@ ata_read_one:
 
     mov dx, ATA_DATA
     mov ecx, 256
+    cld
     rep insw
     clc
 .pop:
@@ -214,27 +204,102 @@ ata_read_one:
     jmp .pop
 
 ; --- public: RAX=LBA, RCX=count, RDI=buffer; CF=1 error ---
+; Reads RCX sectors starting from LBA RAX into [RDI].
+; Batches reads up to 128 sectors per ATA READ command for fast throughput.
 disk_read_blocks:
     test rcx, rcx
     jz .ok
-.dr_loop:
-    push rcx
-    push rax
-    call ata_read_one
-    pop rax
-    pop rcx
-    jnc .dr_ok
-    mov al, 'X'              ; DEBUG: sector read failed
-    call putc
-    stc
-    ret
-.dr_ok:
-    add rdi, 512
-    inc rax
-    dec rcx
-    jnz .dr_loop
+    push rbx
+    push rsi
+    push r12
+    push r13
+
+    mov r12, rax             ; r12 = current LBA
+    mov r13, rcx             ; r13 = remaining sectors
+
+.drb_chunk_loop:
+    test r13, r13
+    jz .drb_done
+
+    ; batch size = min(r13, 128)
+    mov rbx, r13
+    cmp rbx, 128
+    jbe @f
+    mov rbx, 128
+@@:
+    ; 1. Wait drive ready
+    call ata_wait_ready
+    jc .drb_err
+
+    ; 2. Select drive | LBA bits 24-27
+    mov eax, r12d
+    shr eax, 24
+    and al, 0x0F
+    or al, [r15 + ata_drv - kmain]
+    mov dx, ATA_DRV
+    out dx, al
+    call ata_wait_ready
+    jc .drb_err
+
+    ; 3. Sector count
+    mov dx, ATA_SCNT
+    mov al, bl               ; 1..128
+    out dx, al
+
+    ; 4. LBA bits 0-7, 8-15, 16-23
+    mov eax, r12d
+    mov dx, ATA_LBAL
+    out dx, al
+
+    mov eax, r12d
+    shr eax, 8
+    mov dx, ATA_LBAM
+    out dx, al
+
+    mov eax, r12d
+    shr eax, 16
+    mov dx, ATA_LBAH
+    out dx, al
+
+    ; 5. Issue ATA_CMD_READ
+    mov dx, ATA_STATC
+    mov al, ATA_CMD_READ
+    out dx, al
+
+    ; 6. Transfer each sector in batch
+    mov esi, ebx
+.drb_sec_loop:
+    call ata_wait_drq
+    jc .drb_err
+
+    mov dx, ATA_DATA
+    mov ecx, 256
+    cld
+    rep insw                 ; transfers 512 bytes, advances rdi by 512
+
+    dec esi
+    jnz .drb_sec_loop
+
+    ; Advance LBA and decrease count
+    add r12, rbx
+    sub r13, rbx
+    jmp .drb_chunk_loop
+
+.drb_done:
+    pop r13
+    pop r12
+    pop rsi
+    pop rbx
 .ok:
     clc
+    ret
+
+.drb_err:
+    pop r13
+    pop r12
+    pop rsi
+    pop rbx
+    stc
     ret
 
 ; --- write one sector: RAX=LBA, RSI=buffer(512); CF=1 error ---

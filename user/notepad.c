@@ -23,17 +23,47 @@ static char text_buf[MAX_TEXT];
 static int  text_len = 0;
 static int  cursor_pos = 0;
 static int  blink_cnt = 0;
+static char cur_file_path[64] = "/hello.txt";
+static char doc_title[64] = "hello.txt";
 
 /* Toolbar buttons */
-#define BTN_CLEAR_X 450
-#define BTN_CLEAR_Y 6
-#define BTN_CLEAR_W 76
-#define BTN_CLEAR_H 26
+#define BTN_SAVE_X   284
+#define BTN_SAVE_Y   6
+#define BTN_SAVE_W   76
+#define BTN_SAVE_H   26
 
 #define BTN_SAMPLE_X 366
 #define BTN_SAMPLE_Y 6
 #define BTN_SAMPLE_W 76
 #define BTN_SAMPLE_H 26
+
+#define BTN_CLEAR_X  450
+#define BTN_CLEAR_Y  6
+#define BTN_CLEAR_W  76
+#define BTN_CLEAR_H  26
+
+static void load_file(const char *path) {
+    if (!path || !path[0]) return;
+    ssize_t n = os_read_file(path, text_buf, MAX_TEXT - 1);
+    if (n >= 0) {
+        text_len = (int)n;
+        text_buf[text_len] = '\0';
+        cursor_pos = text_len;
+        os_strcpy(cur_file_path, path);
+        /* Extract file name for title */
+        const char *p = path;
+        for (int i = 0; path[i]; i++) {
+            if (path[i] == '/') p = path + i + 1;
+        }
+        os_strcpy(doc_title, p);
+    }
+}
+
+static void save_file(void) {
+    if (cur_file_path[0]) {
+        os_write_file(cur_file_path, text_buf, text_len);
+    }
+}
 
 static void insert_sample(void) {
     const char *sample = 
@@ -50,6 +80,7 @@ static void insert_sample(void) {
     }
     text_buf[text_len] = '\0';
     cursor_pos = text_len;
+    os_strcpy(doc_title, "Document 1.txt");
 }
 
 static void clear_text(void) {
@@ -111,9 +142,10 @@ static void render_notepad(os_window_t *win) {
 
     /* App badge / Document title */
     os_draw_badge(win, 12, 9, "NOTEPAD", OS_COLOR_INDIGO, OS_COLOR_WHITE);
-    os_draw_text_ui_aa(win, 112, 11, "Document 1.txt", OS_COLOR_SLATE_200);
+    os_draw_text_ui_aa(win, 112, 11, doc_title, OS_COLOR_SLATE_200);
 
     /* Toolbar buttons */
+    os_draw_button_modern(win, BTN_SAVE_X,   BTN_SAVE_Y,   BTN_SAVE_W,   BTN_SAVE_H,   "Save",   OS_COLOR_EMERALD, 0, 0);
     os_draw_button_modern(win, BTN_SAMPLE_X, BTN_SAMPLE_Y, BTN_SAMPLE_W, BTN_SAMPLE_H, "Sample", OS_COLOR_CYAN_NEON, 0, 0);
     os_draw_button_modern(win, BTN_CLEAR_X,  BTN_CLEAR_Y,  BTN_CLEAR_W,  BTN_CLEAR_H,  "Clear",  OS_COLOR_ROSE, 0, 0);
 
@@ -134,9 +166,9 @@ static void render_notepad(os_window_t *win) {
     /* Draw first line number */
     char lnum_str[8];
     os_itoa(cur_line, lnum_str);
-    int num_w = (int)os_strlen(lnum_str) * OS_FONT_MONO_W;
+    int num_w = os_text_width_ui_aa(lnum_str);
     int num_x = GUTTER_W - 12 - num_w;
-    os_draw_text_mono_aa(win, num_x > 4 ? num_x : 4, line_y, lnum_str, OS_COLOR_SLATE_500);
+    os_draw_text_ui_aa(win, num_x > 4 ? num_x : 4, line_y, lnum_str, OS_COLOR_SLATE_500);
 
     int cursor_draw_x = cur_x;
     int cursor_draw_y = line_y;
@@ -157,26 +189,27 @@ static void render_notepad(os_window_t *win) {
 
             if (line_y + 20 < editor_bot) {
                 os_itoa(cur_line, lnum_str);
-                int nw = (int)os_strlen(lnum_str) * OS_FONT_MONO_W;
+                int nw = os_text_width_ui_aa(lnum_str);
                 int nx = GUTTER_W - 12 - nw;
-                os_draw_text_mono_aa(win, nx > 4 ? nx : 4, line_y, lnum_str, OS_COLOR_SLATE_500);
+                os_draw_text_ui_aa(win, nx > 4 ? nx : 4, line_y, lnum_str, OS_COLOR_SLATE_500);
             }
         } else {
+            int cw_char = (c >= 32 && c <= 126) ? os_font_ui_widths[c - 32] : 6;
             /* Word wrap if exceeds line width */
-            if (cur_x + 12 >= cw - 12) {
+            if (cur_x + cw_char >= cw - 12) {
                 cur_line++;
                 line_y += 20;
                 cur_x = text_x;
             }
             if (line_y + 20 < editor_bot) {
-                os_draw_char_mono_aa(win, cur_x, line_y, c, OS_COLOR_SLATE_100);
+                os_draw_char_ui_aa(win, cur_x, line_y, c, OS_COLOR_SLATE_100);
             }
-            cur_x += OS_FONT_MONO_W;
+            cur_x += cw_char;
         }
     }
 
     /* 5. Draw Smooth Blinking Text Cursor */
-    if ((blink_cnt % 30) < 18) {
+    if ((blink_cnt % 70) < 42) {
         if (cursor_draw_y + 16 < editor_bot) {
             os_fill_rounded_rect(win, cursor_draw_x, cursor_draw_y, 2, 16, 1, OS_COLOR_CYAN_NEON);
         }
@@ -243,7 +276,17 @@ int main(void) {
         return 1;
     }
 
-    insert_sample();
+    /* Check if a file was requested to open (e.g. from File Explorer) */
+    char req_path[64];
+    ssize_t req_n = os_read_file("/last_opened.txt", req_path, sizeof(req_path) - 1);
+    if (req_n > 0) {
+        req_path[req_n] = '\0';
+        /* Clear last_opened so subsequent launches don't reuse it indefinitely */
+        os_write_file("/last_opened.txt", "", 0);
+        load_file(req_path);
+    } else {
+        insert_sample();
+    }
 
     render_notepad(&win);
     os_update_window(&win);
@@ -257,8 +300,8 @@ int main(void) {
         blink_cnt++;
         bool needs_redraw = false;
 
-        /* Cursor blink toggle every 15 ticks */
-        if ((blink_cnt % 15) == 0) {
+        /* Cursor blink toggle every 35 ticks */
+        if ((blink_cnt % 35) == 0) {
             needs_redraw = true;
         }
 
@@ -266,9 +309,18 @@ int main(void) {
             if (ev.type == OS_EVENT_WIN_CLOSE) {
                 running = false;
                 break;
+            } else if (ev.type == OS_EVENT_WIN_MAXIMIZE) {
+                win.width = ev.x;
+                win.height = ev.y;
+                win.client_w = ev.x;
+                win.client_h = ev.y > 33 ? ev.y - 33 : 0;
+                needs_redraw = true;
             } else if (ev.type == OS_EVENT_MOUSE_DOWN) {
                 /* Toolbar button clicks */
-                if (os_is_inside(ev.x, ev.y, BTN_SAMPLE_X, BTN_SAMPLE_Y, BTN_SAMPLE_W, BTN_SAMPLE_H)) {
+                if (os_is_inside(ev.x, ev.y, BTN_SAVE_X, BTN_SAVE_Y, BTN_SAVE_W, BTN_SAVE_H)) {
+                    save_file();
+                    needs_redraw = true;
+                } else if (os_is_inside(ev.x, ev.y, BTN_SAMPLE_X, BTN_SAMPLE_Y, BTN_SAMPLE_W, BTN_SAMPLE_H)) {
                     insert_sample();
                     needs_redraw = true;
                 } else if (os_is_inside(ev.x, ev.y, BTN_CLEAR_X, BTN_CLEAR_Y, BTN_CLEAR_W, BTN_CLEAR_H)) {
@@ -299,7 +351,7 @@ int main(void) {
             os_update_window(&win);
         }
 
-        os_sleep(16);
+        os_sleep(30);
     }
 
     os_print("[notepad.elf] Closing notepad window and exiting.\n");

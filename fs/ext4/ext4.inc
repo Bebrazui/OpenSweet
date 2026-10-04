@@ -40,9 +40,11 @@ ext4_mount:                       ; CF=0 ok
     and eax, ecx
     jnz .fail
 
+    ; C2 Mitigation: Only 1024-byte blocks (SB_LOG_BS == 0) are supported
+    ; by the static 1024-byte ext4_nbuf/ext4_bbuf/ext4_wbuf buffer design.
     mov eax, dword [r15 + ext4_sb - kmain + SB_LOG_BS]
-    cmp eax, 6
-    ja .fail
+    test eax, eax
+    jnz .fail
     mov dword [r15 + ext4_lbs - kmain], eax
     mov eax, dword [r15 + ext4_sb - kmain + SB_BPG]
     test eax, eax
@@ -59,6 +61,20 @@ ext4_mount:                       ; CF=0 ok
     mov eax, dword [r15 + ext4_sb - kmain + SB_FDB]
     inc eax
     mov [r15 + ext4_gdtb - kmain], eax   ; GDT block (v1: one block)
+
+    ; Calculate groups count: (s_blocks_count_lo - s_first_data_block + bpg - 1) / bpg
+    mov eax, dword [r15 + ext4_sb - kmain + 0x04] ; s_blocks_count_lo
+    sub eax, dword [r15 + ext4_sb - kmain + SB_FDB]
+    add eax, dword [r15 + ext4_bpg - kmain]
+    dec eax
+    xor edx, edx
+    div dword [r15 + ext4_bpg - kmain]
+    test eax, eax
+    jnz @f
+    mov eax, 1
+@@:
+    mov dword [r15 + ext4_groups_count - kmain], eax
+
     mov byte [r15 + ext4_ok - kmain], 1
     clc
 .pop:
@@ -92,6 +108,37 @@ ext4_blk_read:
     pop rdi
     pop rdx
     pop rcx
+    ret
+
+; ================= read N contiguous FS blocks =================
+; RAX = start block, RCX = block count, RSI = dest buffer. Preserves rbx,rsi,rdi,r8+.
+ext4_blks_read:
+    test rcx, rcx
+    jz .blks_ok
+    push rcx
+    push rdx
+    push rdi
+    push rax
+    push rsi
+
+    mov rdi, rsi                  ; destination buffer
+    push rcx                      ; save block count
+    movzx ecx, byte [r15 + ext4_lbs - kmain]
+    inc ecx                       ; shift count = lbs + 1
+    shl rax, cl                   ; LBA = start block << (lbs+1)
+    pop rdx                       ; rdx = block count
+    shl rdx, cl                   ; rdx = total sectors = count << (lbs+1)
+    mov ecx, edx                  ; rcx = sector count
+    call disk_read_blocks
+
+    pop rsi
+    pop rax
+    pop rdi
+    pop rdx
+    pop rcx
+    ret
+.blks_ok:
+    clc
     ret
 
 ; ================= write one FS block =================
@@ -153,6 +200,8 @@ ext4_inode_save:
 
     cmp dword [r15 + ext4_ipg - kmain], 0
     je .eis_err
+    test eax, eax
+    jle .eis_err
     dec eax
     xor edx, edx
     div dword [r15 + ext4_ipg - kmain]      ; eax = group, edx = index
@@ -222,87 +271,248 @@ ext4_inode_save:
     stc
     jmp .eis_pop
 
-; ================= allocate a free block =================
-; Out: RAX = physical block number, or -1 on error.
-ext4_alloc_block:
+; ================= allocate N contiguous free blocks =================
+; EDI = count of blocks needed
+; Out: RAX = starting physical block number, or -1 on error. CF=0 on success, 1 on error.
+ext4_alloc_blocks:
     push rbx
     push rcx
     push rdx
     push rsi
     push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
 
-    ; Read GDT block to find bg_block_bitmap
+    test edi, edi
+    jz .abk_zero
+
+    mov r8d, edi                            ; r8d = count needed
+
+    xor r12d, r12d                          ; r12d = current group G
+.abk_group_loop:
+    cmp r12d, dword [r15 + ext4_groups_count - kmain]
+    jae .abk_err                            ; no group has enough contiguous space!
+
+    ; Read GDT block
     mov eax, dword [r15 + ext4_gdtb - kmain]
     lea rsi, [r15 + ext4_nbuf - kmain]
     call ext4_blk_read
-    jc .ab_err
+    jc .abk_err
 
-    ; Group 0 block bitmap is at [ext4_nbuf + 0]
-    mov eax, dword [r15 + ext4_nbuf - kmain + 0]
+    ; Group descriptor offset = G * 32
+    mov ecx, r12d
+    shl ecx, 5                              ; ecx = G * 32
+    ; Check bg_free_blocks_count_lo
+    movzx edx, word [r15 + ext4_nbuf - kmain + rcx + 0x0C]
+    cmp edx, r8d
+    jb .abk_next_group                      ; not enough free blocks in this group
+
+    ; Get this group's block bitmap block
+    mov eax, dword [r15 + ext4_nbuf - kmain + rcx + 0x00]
     mov dword [r15 + e4w_bmp_blk - kmain], eax
 
-    ; Read block bitmap block into ext4_bbuf
+    ; Read block bitmap into ext4_bbuf
     lea rsi, [r15 + ext4_bbuf - kmain]
     call ext4_blk_read
-    jc .ab_err
+    jc .abk_next_group
 
-    ; Search for first 0-bit in bitmap
-    xor ecx, ecx                            ; byte index
-.ab_scan:
-    cmp ecx, 1024
-    jae .ab_err
-    mov al, [r15 + ext4_bbuf - kmain + rcx]
-    cmp al, 0xFF
-    jne .ab_found_byte
+    ; Scan ext4_bbuf for run of r8d consecutive 0-bits
+    ; Limit is ext4_bpg (e.g. 8192 bits)
+    xor r9d, r9d                            ; bit index (0 .. bpg-1)
+    xor r10d, r10d                          ; current run length
+    xor r11d, r11d                          ; starting bit of current run
+
+.abk_scan_loop:
+    cmp r9d, dword [r15 + ext4_bpg - kmain]
+    jae .abk_next_group                     ; no contiguous run in this group
+
+    ; Test bit r9d in ext4_bbuf
+    mov eax, r9d
+    bt dword [r15 + ext4_bbuf - kmain], eax
+    jc .abk_bit_is_one
+
+    ; Bit is 0
+    test r10d, r10d
+    jnz @f
+    mov r11d, r9d                           ; start of new run
+@@:
+    inc r10d
+    cmp r10d, r8d
+    je .abk_found_run
+    inc r9d
+    jmp .abk_scan_loop
+
+.abk_bit_is_one:
+    xor r10d, r10d
+    inc r9d
+    jmp .abk_scan_loop
+
+.abk_next_group:
+    inc r12d
+    jmp .abk_group_loop
+
+.abk_found_run:
+    ; Found run starting at bit r11d in group r12d!
+    ; Set r8d bits in ext4_bbuf starting at r11d
+    xor ecx, ecx
+.abk_set_loop:
+    cmp ecx, r8d
+    jae .abk_set_done
+    lea eax, [r11d + ecx]
+    bts dword [r15 + ext4_bbuf - kmain], eax
     inc ecx
-    jmp .ab_scan
+    jmp .abk_set_loop
+.abk_set_done:
 
-.ab_found_byte:
-    ; ecx = byte index. AL = byte value.
-    movzx eax, al
-    not eax
-    and eax, 0xFF
-    bsf edx, eax                            ; edx = bit index 0..7
-
-    ; Compute physical block number = ecx * 8 + edx
-    mov eax, ecx
-    shl eax, 3
-    add eax, edx                            ; eax = physical block
-    mov ebx, eax                            ; save block in ebx
-
-    ; Set bit in bitmap
-    mov al, 1
-    push rcx
-    mov cl, dl
-    shl al, cl
-    pop rcx
-    or [r15 + ext4_bbuf - kmain + rcx], al
-
-    ; Write block bitmap back to disk!
+    ; Write updated block bitmap back to disk
     mov eax, dword [r15 + e4w_bmp_blk - kmain]
     lea rsi, [r15 + ext4_bbuf - kmain]
     call ext4_blk_write
-    jc .ab_err
+    jc .abk_err
 
-    ; Decrement free blocks count in SB and GDT
-    dec dword [r15 + ext4_sb - kmain + 0x0C]
-    dec word  [r15 + ext4_nbuf - kmain + 0x0C]
-    call ext4_sb_save
+    ; Re-read GDT into ext4_nbuf
+    mov eax, dword [r15 + ext4_gdtb - kmain]
+    lea rsi, [r15 + ext4_nbuf - kmain]
+    call ext4_blk_read
+    jc .abk_err
+
+    ; Decrement free blocks count in GDT descriptor for group r12d
+    mov ecx, r12d
+    shl ecx, 5
+    sub word [r15 + ext4_nbuf - kmain + rcx + 0x0C], r8w
     call ext4_gdt_save
 
-    mov eax, ebx                            ; return allocated physical block in RAX
+    ; Decrement free blocks in Superblock
+    sub dword [r15 + ext4_sb - kmain + 0x0C], r8d
+    call ext4_sb_save
+
+    ; Compute physical block number: RAX = r12d * ext4_bpg + r11d
+    mov eax, r12d
+    mul dword [r15 + ext4_bpg - kmain]
+    add eax, r11d
     clc
-.ab_pop:
+.abk_pop:
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
     pop rdi
     pop rsi
     pop rdx
     pop rcx
     pop rbx
     ret
-.ab_err:
+
+.abk_zero:
+    xor eax, eax
+    clc
+    jmp .abk_pop
+
+.abk_err:
     mov rax, -1
     stc
-    jmp .ab_pop
+    jmp .abk_pop
+
+; ================= free N contiguous blocks =================
+; EDI = starting physical block number, ESI = count of blocks
+; Out: CF=0 on success, 1 on error.
+ext4_free_blocks:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r12
+
+    test esi, esi
+    jz .fbk_ok
+    test edi, edi
+    jz .fbk_ok
+
+    mov r9d, esi                            ; r9d = count
+
+    mov eax, edi
+    xor edx, edx
+    div dword [r15 + ext4_bpg - kmain]      ; eax = group G, edx = bit in group
+    mov r12d, eax                           ; r12d = group G
+    mov r8d, edx                            ; r8d = start bit in group
+
+    ; Read GDT block to find bg_block_bitmap
+    mov eax, dword [r15 + ext4_gdtb - kmain]
+    lea rsi, [r15 + ext4_nbuf - kmain]
+    call ext4_blk_read
+    jc .fbk_err
+
+    ; Get group G's block bitmap
+    mov ecx, r12d
+    shl ecx, 5
+    mov eax, dword [r15 + ext4_nbuf - kmain + rcx + 0x00]
+    mov dword [r15 + e4w_bmp_blk - kmain], eax
+
+    ; Read block bitmap into ext4_bbuf
+    lea rsi, [r15 + ext4_bbuf - kmain]
+    call ext4_blk_read
+    jc .fbk_err
+
+    ; Clear r9d bits starting at r8d
+    xor ecx, ecx
+.fbk_clear_loop:
+    cmp ecx, r9d
+    jae .fbk_clear_done
+    lea eax, [r8d + ecx]
+    cmp eax, dword [r15 + ext4_bpg - kmain]
+    jae .fbk_clear_done
+    btr dword [r15 + ext4_bbuf - kmain], eax
+    inc ecx
+    jmp .fbk_clear_loop
+.fbk_clear_done:
+
+    ; Write block bitmap back to disk
+    mov eax, dword [r15 + e4w_bmp_blk - kmain]
+    lea rsi, [r15 + ext4_bbuf - kmain]
+    call ext4_blk_write
+    jc .fbk_err
+
+    ; Increment free blocks in GDT descriptor for group r12d
+    mov ecx, r12d
+    shl ecx, 5
+    add word [r15 + ext4_nbuf - kmain + rcx + 0x0C], r9w
+    call ext4_gdt_save
+
+    ; Increment free blocks in Superblock
+    add dword [r15 + ext4_sb - kmain + 0x0C], r9d
+    call ext4_sb_save
+
+.fbk_ok:
+    clc
+.fbk_pop:
+    pop r12
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+.fbk_err:
+    stc
+    jmp .fbk_pop
+
+; ================= allocate a single free block =================
+; Out: RAX = physical block number, or -1 on error.
+ext4_alloc_block:
+    mov edi, 1
+    jmp ext4_alloc_blocks
 
 ; ================= allocate a free inode =================
 ; Out: RAX = inode number (1-based), or -1 on error.
@@ -312,45 +522,66 @@ ext4_alloc_inode:
     push rdx
     push rsi
     push rdi
+    push r12
+    push r13
 
-    ; Read GDT block to find bg_inode_bitmap
+    ; Read GDT block
     mov eax, dword [r15 + ext4_gdtb - kmain]
     lea rsi, [r15 + ext4_nbuf - kmain]
     call ext4_blk_read
     jc .ai_err
 
-    ; Group 0 inode bitmap is at [ext4_nbuf + 4]
-    mov eax, dword [r15 + ext4_nbuf - kmain + 4]
+    xor r12d, r12d                          ; group G
+.ai_group_loop:
+    cmp r12d, dword [r15 + ext4_groups_count - kmain]
+    jae .ai_err
+
+    ; Check bg_free_inodes_count_lo in group G
+    mov ecx, r12d
+    shl ecx, 5
+    cmp word [r15 + ext4_nbuf - kmain + rcx + 0x0E], 0
+    ja .ai_group_has_inodes
+
+    inc r12d
+    jmp .ai_group_loop
+
+.ai_group_has_inodes:
+    ; Get group G's inode bitmap
+    mov eax, dword [r15 + ext4_nbuf - kmain + rcx + 0x04]
     mov dword [r15 + e4w_bmp_blk - kmain], eax
 
-    ; Read inode bitmap block into ext4_bbuf
+    ; Read inode bitmap into ext4_bbuf
     lea rsi, [r15 + ext4_bbuf - kmain]
     call ext4_blk_read
     jc .ai_err
 
-    ; Search for first 0-bit in bitmap (64 inodes = 8 bytes)
+    ; Scan for first 0-bit
+    ; Inodes per group = ext4_ipg, bytes = ext4_ipg / 8
+    mov ebx, dword [r15 + ext4_ipg - kmain]
+    shr ebx, 3                              ; ebx = bytes to scan
+    test ebx, ebx
+    jnz @f
+    mov ebx, 1
+@@:
     xor ecx, ecx                            ; byte index
 .ai_scan:
-    cmp ecx, 8
-    jae .ai_err
+    cmp ecx, ebx
+    jae .ai_next_group
     mov al, [r15 + ext4_bbuf - kmain + rcx]
     cmp al, 0xFF
     jne .ai_found_byte
     inc ecx
     jmp .ai_scan
 
+.ai_next_group:
+    inc r12d
+    jmp .ai_group_loop
+
 .ai_found_byte:
     movzx eax, al
     not eax
     and eax, 0xFF
     bsf edx, eax                            ; bit index 0..7
-
-    ; Inode number = (ecx * 8 + edx) + 1
-    mov eax, ecx
-    shl eax, 3
-    add eax, edx
-    inc eax                                 ; eax = 1-based inode number
-    mov ebx, eax                            ; ebx = inode number
 
     ; Set bit in bitmap
     mov al, 1
@@ -360,31 +591,284 @@ ext4_alloc_inode:
     pop rcx
     or [r15 + ext4_bbuf - kmain + rcx], al
 
-    ; Write inode bitmap back to disk!
+    ; Inode number = r12d * ext4_ipg + (ecx * 8 + edx) + 1
+    mov eax, ecx
+    shl eax, 3
+    add eax, edx
+    inc eax                                 ; eax = 1-based inode in group
+    push rax
+    mov eax, r12d
+    mul dword [r15 + ext4_ipg - kmain]
+    pop rdx
+    add eax, edx                            ; eax = global 1-based inode number
+    mov r13d, eax                           ; r13d = allocated inode number
+
+    ; Write inode bitmap back to disk
     mov eax, dword [r15 + e4w_bmp_blk - kmain]
     lea rsi, [r15 + ext4_bbuf - kmain]
     call ext4_blk_write
     jc .ai_err
 
-    ; Decrement free inodes count in SB and GDT
-    dec dword [r15 + ext4_sb - kmain + 0x10]
-    dec word  [r15 + ext4_nbuf - kmain + 0x0E]
-    call ext4_sb_save
+    ; Re-read GDT into ext4_nbuf
+    mov eax, dword [r15 + ext4_gdtb - kmain]
+    lea rsi, [r15 + ext4_nbuf - kmain]
+    call ext4_blk_read
+    jc .ai_err
+
+    ; Decrement free inodes in GDT descriptor for group r12d
+    mov ecx, r12d
+    shl ecx, 5
+    dec word [r15 + ext4_nbuf - kmain + rcx + 0x0E]
     call ext4_gdt_save
 
-    mov eax, ebx                            ; return allocated inode number in RAX
+    ; Decrement free inodes in Superblock
+    dec dword [r15 + ext4_sb - kmain + 0x10]
+    call ext4_sb_save
+
+    mov eax, r13d                           ; return allocated inode number
     clc
 .ai_pop:
+    pop r13
+    pop r12
     pop rdi
     pop rsi
     pop rdx
     pop rcx
     pop rbx
     ret
+
 .ai_err:
     mov rax, -1
     stc
     jmp .ai_pop
+
+; ================= free an inode =================
+; EDI = inode number (1-based)
+; Out: CF=0 on success, 1 on error.
+ext4_free_inode:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r12
+    push r13
+
+    cmp edi, 11                             ; inodes 1..10 are reserved
+    jb .fi_err
+    cmp dword [r15 + ext4_ipg - kmain], 0
+    je .fi_err
+
+    dec edi                                 ; 0-based inode index
+    mov eax, edi
+    xor edx, edx
+    div dword [r15 + ext4_ipg - kmain]      ; eax = group G, edx = bit in group
+    mov r12d, eax                           ; r12d = group G
+    mov r13d, edx                           ; r13d = bit index in group
+
+    ; Read GDT block
+    mov eax, dword [r15 + ext4_gdtb - kmain]
+    lea rsi, [r15 + ext4_nbuf - kmain]
+    call ext4_blk_read
+    jc .fi_err
+
+    ; Get group G's inode bitmap
+    mov ecx, r12d
+    shl ecx, 5
+    mov eax, dword [r15 + ext4_nbuf - kmain + rcx + 0x04]
+    mov dword [r15 + e4w_bmp_blk - kmain], eax
+
+    ; Read inode bitmap into ext4_bbuf
+    lea rsi, [r15 + ext4_bbuf - kmain]
+    call ext4_blk_read
+    jc .fi_err
+
+    ; Clear bit r13d in bitmap
+    mov eax, r13d
+    btr dword [r15 + ext4_bbuf - kmain], eax
+
+    ; Write inode bitmap back to disk
+    mov eax, dword [r15 + e4w_bmp_blk - kmain]
+    lea rsi, [r15 + ext4_bbuf - kmain]
+    call ext4_blk_write
+    jc .fi_err
+
+    ; Increment free inodes in GDT descriptor for group r12d
+    mov ecx, r12d
+    shl ecx, 5
+    add word [r15 + ext4_nbuf - kmain + rcx + 0x0E], 1
+    call ext4_gdt_save
+
+    ; Increment free inodes in Superblock
+    inc dword [r15 + ext4_sb - kmain + 0x10]
+    call ext4_sb_save
+
+    clc
+.fi_pop:
+    pop r13
+    pop r12
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+.fi_err:
+    stc
+    jmp .fi_pop
+
+; ================= delete file from ext4 filesystem =================
+; RSI = filename or path (ASCIIZ).
+; Out: RAX = 0 on success, -1 on error. CF=0 on success, 1 on error.
+ext4_delete_file:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r12
+    push r13
+    push r14
+
+    mov r14, rsi
+
+    ; Strip leading slashes to get basename
+.df_strip:
+    mov al, [rsi]
+    inc rsi
+    test al, al
+    jz .df_strip_done
+    cmp al, '/'
+    jne .df_strip
+    mov r14, rsi
+    jmp .df_strip
+.df_strip_done:
+
+    cmp byte [r14], 0
+    je .df_err
+
+    ; 1. Lookup file to get inode
+    mov rsi, r14
+    call ext4_lookup
+    test eax, eax
+    jz .df_err
+    cmp eax, 11                             ; protect reserved inodes 1..10
+    jb .df_err
+    mov r12d, eax                           ; r12d = inode number to delete
+
+    ; 2. Load target inode
+    mov eax, r12d
+    call ext4_inode_load
+    jc .df_err
+
+    ; 3. Free extents/blocks associated with this file
+    cmp word [r15 + ext4_inode - kmain + IN_OFF_BLOCK], EH_MAGIC
+    jne .df_no_extents
+    movzx ecx, word [r15 + ext4_inode - kmain + IN_OFF_BLOCK + 2] ; eh_entries
+    test ecx, ecx
+    jz .df_no_extents
+
+    xor ebx, ebx                            ; extent index
+.df_free_extents:
+    cmp ebx, ecx
+    jae .df_extents_done
+    mov r8d, ebx
+    imul r8d, 12
+    add r8d, IN_OFF_BLOCK + 12              ; r8d = offset of extent in ext4_inode
+    movzx esi, word  [r15 + ext4_inode - kmain + r8 + 4] ; ee_len
+    mov   edi, dword [r15 + ext4_inode - kmain + r8 + 8] ; ee_start_lo
+    push rcx
+    push rbx
+    call ext4_free_blocks
+    pop rbx
+    pop rcx
+    inc ebx
+    jmp .df_free_extents
+
+.df_extents_done:
+.df_no_extents:
+
+    ; 4. Free the inode
+    mov edi, r12d
+    call ext4_free_inode
+    jc .df_err
+
+    ; 5. Find and remove directory entry in parent directory
+    ; Load root directory (inode 2)
+    mov eax, 2
+    call ext4_inode_load
+    jc .df_err
+    xor eax, eax
+    call ext4_map
+    cmp rax, -1
+    je .df_err
+    mov ebx, eax                            ; ebx = dir block
+
+    ; Read directory block into ext4_wbuf
+    mov eax, ebx
+    lea rsi, [r15 + ext4_wbuf - kmain]
+    call ext4_blk_read
+    jc .df_err
+
+    ; Scan directory entries in ext4_wbuf
+    xor r8d, r8d                            ; byte offset in directory block
+.df_scan_dir:
+    cmp r8d, 1024
+    jae .df_dir_done                        ; not found in root dir block
+
+    mov eax, dword [r15 + ext4_wbuf - kmain + r8] ; entry inode
+    cmp eax, r12d
+    je .df_found_slot
+
+    movzx eax, word [r15 + ext4_wbuf - kmain + r8 + 4] ; rec_len
+    test ax, ax
+    jz .df_dir_done
+    add r8d, eax
+    jmp .df_scan_dir
+
+.df_found_slot:
+    ; Set entry inode to 0 to mark as unused / free slot
+    mov dword [r15 + ext4_wbuf - kmain + r8], 0
+
+    ; Write modified directory block back to disk
+    mov eax, ebx
+    lea rsi, [r15 + ext4_wbuf - kmain]
+    call ext4_blk_write
+    jc .df_err
+
+    call disk_flush_cache
+
+    xor eax, eax                            ; return 0 on success
+    clc
+.df_pop:
+    pop r14
+    pop r13
+    pop r12
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+.df_dir_done:
+    ; Even if dir entry wasn't found in block 0, inode & blocks were freed
+    call disk_flush_cache
+    xor eax, eax
+    clc
+    jmp .df_pop
+
+.df_err:
+    mov rax, -1
+    stc
+    jmp .df_pop
 
 ; ================= create new empty file =================
 ; RSI = filename (ASCIIZ). Out: RAX = inode or -1.
@@ -394,13 +878,33 @@ ext4_create_file:
     push rdx
     push rsi
     push rdi
+    push r8
+    push r9
+    push r10
     push r12
     push r13
     push r14
 
-    mov r14, rsi                            ; r14 = filename
+    mov r14, rsi                            ; r14 = filename / path
+
+    ; Strip any leading directory path / slashes to isolate base filename
+    mov rsi, r14
+.cf_strip:
+    mov al, [rsi]
+    inc rsi
+    test al, al
+    jz .cf_strip_done
+    cmp al, '/'
+    jne .cf_strip
+    mov r14, rsi
+    jmp .cf_strip
+.cf_strip_done:
+
+    cmp byte [r14], 0
+    je .cf_fail_A
 
     ; 1. Check if file already exists
+    mov rsi, r14
     call ext4_lookup
     test eax, eax
     jnz .cf_exists
@@ -408,7 +912,7 @@ ext4_create_file:
     ; 2. Allocate free inode
     call ext4_alloc_inode
     cmp eax, -1
-    je .cf_fail
+    je .cf_fail_B
     mov r12d, eax                           ; r12d = new inode
 
     ; 3. Initialize ext4_inode buffer for new file
@@ -435,60 +939,93 @@ ext4_create_file:
     ; Save new inode to disk!
     mov eax, r12d
     call ext4_inode_save
-    jc .cf_fail
+    jc .cf_fail_C
 
-    ; 4. Add entry to root directory (block 20)
-    mov eax, 20
+    ; 4. Add entry to root directory (load inode 2 and map block 0)
+    mov eax, 2
+    call ext4_inode_load
+    jc .cf_fail_D
+    xor eax, eax
+    call ext4_map
+    cmp rax, -1
+    je .cf_fail_E
+    mov ebx, eax                            ; ebx = root dir physical block
+
+    ; Read root directory block into ext4_wbuf
+    mov eax, ebx
     lea rsi, [r15 + ext4_wbuf - kmain]
     call ext4_blk_read
-    jc .cf_fail
+    jc .cf_fail_F
 
-    ; Find last entry in block 20
-    xor r8d, r8d                            ; r8d = offset
-.cf_dir_scan:
-    movzx eax, word [r15 + ext4_wbuf - kmain + r8 + 4] ; rec_len
-    test ax, ax
-    jz .cf_fail
-    lea edx, [r8d + eax]
-    cmp edx, 1024
-    jae .cf_found_last
-    mov r8d, edx
-    jmp .cf_dir_scan
-
-.cf_found_last:
-    ; Compute minimal rec_len needed for existing entry: (8 + name_len + 3) & ~3
-    movzx ecx, byte [r15 + ext4_wbuf - kmain + r8 + 6] ; name_len
-    add ecx, 8 + 3
-    and ecx, not 3                          ; ecx = trimmed rec_len
-
-    ; Compute needed size for new entry
+    ; Compute needed size for new entry: (8 + name_len + 3) & ~3
     mov rsi, r14
     xor edx, edx
 .cf_nlen:
     cmp byte [rsi + rdx], 0
     je .cf_nlen_done
     inc edx
-    jmp .cf_nlen
+    cmp edx, 255
+    jb .cf_nlen
 .cf_nlen_done:
+    test edx, edx
+    jz .cf_fail_G
     mov r13d, edx                           ; r13d = new name_len
 
     lea eax, [edx + 8 + 3]
-    and eax, not 3                          ; eax = new entry needed size
+    and eax, not 3
+    mov r10d, eax                           ; r10d = needed bytes for new entry
 
-    ; Check if enough space in remaining block
-    movzx edx, word [r15 + ext4_wbuf - kmain + r8 + 4] ; old rec_len
-    sub edx, ecx                            ; edx = available space
-    cmp edx, eax
-    jb .cf_fail                             ; directory block full!
+    ; Scan directory block for space
+    xor r8d, r8d                            ; r8d = offset in ext4_wbuf
+.cf_dir_scan:
+    cmp r8d, 1024
+    jae .cf_fail_H
 
-    ; Shrink existing entry
+    movzx eax, word [r15 + ext4_wbuf - kmain + r8 + 4] ; rec_len
+    test ax, ax
+    jz .cf_fail_I
+
+    ; Check if unused slot (inode == 0)
+    cmp dword [r15 + ext4_wbuf - kmain + r8], 0
+    jne .cf_check_split
+    cmp eax, r10d
+    jae .cf_use_slot
+
+.cf_check_split:
+    ; Minimal size of current entry: (8 + entry_name_len + 3) & ~3
+    movzx ecx, byte [r15 + ext4_wbuf - kmain + r8 + 6]
+    add ecx, 8 + 3
+    and ecx, not 3                          ; ecx = min rec_len for current entry
+
+    ; Available spare space in current entry = rec_len - ecx
+    mov edx, eax
+    sub edx, ecx
+    cmp edx, r10d
+    jae .cf_split_entry
+
+    add r8d, eax
+    jmp .cf_dir_scan
+
+.cf_split_entry:
+    ; Shrink current entry to ecx
     mov word [r15 + ext4_wbuf - kmain + r8 + 4], cx
+    add r8d, ecx
+    ; edx is available size for new entry (at least r10d)
+    jmp .cf_fill_new_entry
 
-    ; New entry starts at r8d + ecx
-    add r8, rcx
+.cf_use_slot:
+    mov edx, eax
+
+.cf_fill_new_entry:
+    ; M1 Mitigation: Verify new directory entry fits entirely within 1024-byte wbuf
+    lea eax, [r8d + 8]
+    add eax, r13d
+    cmp eax, 1024
+    ja .cf_fail_J
+
     lea rdi, [r15 + ext4_wbuf - kmain + r8]
     mov dword [rdi + 0], r12d               ; new inode
-    mov word  [rdi + 4], dx                 ; rec_len absorbs rest of 1024-byte block
+    mov word  [rdi + 4], dx                 ; rec_len absorbs available space
     mov byte  [rdi + 6], r13b               ; name_len
     mov byte  [rdi + 7], 1                  ; file_type = EXT4_FT_REG_FILE (1)
 
@@ -499,11 +1036,11 @@ ext4_create_file:
     cld
     rep movsb
 
-    ; Write block 20 back to disk!
-    mov eax, 20
+    ; Write root dir block back to disk!
+    mov eax, ebx
     lea rsi, [r15 + ext4_wbuf - kmain]
     call ext4_blk_write
-    jc .cf_fail
+    jc .cf_fail_J
 
     call disk_flush_cache
 
@@ -513,6 +1050,9 @@ ext4_create_file:
     pop r14
     pop r13
     pop r12
+    pop r10
+    pop r9
+    pop r8
     pop rdi
     pop rsi
     pop rdx
@@ -524,20 +1064,55 @@ ext4_create_file:
     clc
     jmp .cf_pop
 
-.cf_fail:
+.cf_fail_A:
+    mov al, 'A'
+    jmp .cf_fail_print
+.cf_fail_B:
+    mov al, 'B'
+    jmp .cf_fail_print
+.cf_fail_C:
+    mov al, 'C'
+    jmp .cf_fail_print
+.cf_fail_D:
+    mov al, 'D'
+    jmp .cf_fail_print
+.cf_fail_E:
+    mov al, 'E'
+    jmp .cf_fail_print
+.cf_fail_F:
+    mov al, 'F'
+    jmp .cf_fail_print
+.cf_fail_G:
+    mov al, 'G'
+    jmp .cf_fail_print
+.cf_fail_H:
+    mov al, 'H'
+    jmp .cf_fail_print
+.cf_fail_I:
+    mov al, 'I'
+    jmp .cf_fail_print
+.cf_fail_J:
+    mov al, 'J'
+    jmp .cf_fail_print
+
+.cf_fail_print:
+    call serial_putc
     mov rax, -1
     stc
     jmp .cf_pop
 
 ; ================= write data to file =================
 ; RAX = inode number, RSI = data_buffer, RDX = count.
-; Out: RAX = bytes written (or -1 on error).
+; Out: RAX = bytes written (or -1 on error). CF=0 on success, 1 on error.
 ext4_write_file:
     push rbx
     push rcx
     push rdx
     push rsi
     push rdi
+    push r8
+    push r9
+    push r10
     push r12
     push r13
     push r14
@@ -547,60 +1122,163 @@ ext4_write_file:
     mov r13, rsi                            ; r13 = data buffer
     mov r14, rdx                            ; r14 = count
 
-    ; Clamp write size to 1024 bytes (1 block) for v1
-    cmp r14, 1024
-    jbe @f
-    mov r14, 1024
-@@:
-
     ; Load target inode
     mov eax, r12d
     call ext4_inode_load
     jc .wf_fail
 
-    ; Check if file already has an allocated block in extent 0
-    movzx eax, word [r15 + ext4_inode - kmain + IN_OFF_BLOCK + 2] ; eh_entries
-    test eax, eax
-    jnz .wf_have_block
+    ; Calculate num_blocks needed = (r14 + 1023) / 1024
+    mov rax, r14
+    add rax, 1023
+    shr rax, 10
+    mov ebx, eax                            ; ebx = num_blocks needed
 
-    ; Need to allocate a block!
-    call ext4_alloc_block
+    ; Check extent 0 in inode
+    movzx edx, word [r15 + ext4_inode - kmain + IN_OFF_BLOCK + 2] ; eh_entries
+    test edx, edx
+    jz .wf_no_extent
+
+    ; Existing extent 0
+    movzx ecx, word  [r15 + ext4_inode - kmain + IN_OFF_BLOCK + 16] ; ecx = old ee_len
+    mov r8d,   dword [r15 + ext4_inode - kmain + IN_OFF_BLOCK + 20] ; r8d = old ee_start_lo
+
+    cmp ebx, ecx
+    je .wf_write_blocks                     ; exactly same number of blocks: reuse!
+
+    jb .wf_shrink                           ; ebx < ecx: file shrunk!
+
+    ; ebx > ecx: file grew!
+    ; Free old blocks and allocate new chunk
+    push rbx
+    mov edi, r8d
+    mov esi, ecx
+    call ext4_free_blocks
+    pop rbx
+
+    mov edi, ebx
+    call ext4_alloc_blocks
     cmp rax, -1
     je .wf_fail
-    mov ebx, eax                            ; ebx = allocated physical block
+    mov r8d, eax                            ; r8d = new physical start block
 
-    ; Populate extent 0 in inode
-    mov word  [r15 + ext4_inode - kmain + IN_OFF_BLOCK + 2], 1    ; eh_entries = 1
-    mov dword [r15 + ext4_inode - kmain + IN_OFF_BLOCK + 12], 0   ; ee_block = 0
-    mov word  [r15 + ext4_inode - kmain + IN_OFF_BLOCK + 16], 1   ; ee_len = 1
-    mov word  [r15 + ext4_inode - kmain + IN_OFF_BLOCK + 18], 0   ; ee_start_hi = 0
-    mov dword [r15 + ext4_inode - kmain + IN_OFF_BLOCK + 20], ebx ; ee_start_lo = ebx
-    jmp .wf_write_data
+    ; Update extent 0
+    mov word  [r15 + ext4_inode - kmain + IN_OFF_BLOCK + 16], bx
+    mov dword [r15 + ext4_inode - kmain + IN_OFF_BLOCK + 20], r8d
+    jmp .wf_write_blocks
 
-.wf_have_block:
-    ; Existing physical block in extent 0
-    mov ebx, dword [r15 + ext4_inode - kmain + IN_OFF_BLOCK + 20]
+.wf_shrink:
+    ; ebx < ecx
+    test ebx, ebx
+    jz .wf_shrink_to_zero
 
-.wf_write_data:
-    ; Prepare 1024-byte block in ext4_wbuf
+    ; Free tail blocks starting at r8d + ebx, count = ecx - ebx
+    push rbx
+    push r8
+    mov edi, r8d
+    add edi, ebx
+    mov esi, ecx
+    sub esi, ebx
+    call ext4_free_blocks
+    pop r8
+    pop rbx
+
+    mov word [r15 + ext4_inode - kmain + IN_OFF_BLOCK + 16], bx
+    jmp .wf_write_blocks
+
+.wf_shrink_to_zero:
+    ; Free all old blocks
+    mov edi, r8d
+    mov esi, ecx
+    call ext4_free_blocks
+    mov word [r15 + ext4_inode - kmain + IN_OFF_BLOCK + 2], 0 ; eh_entries = 0
+    jmp .wf_update_meta
+
+.wf_no_extent:
+    test ebx, ebx
+    jz .wf_update_meta                      ; 0 bytes written to empty file
+
+    mov edi, ebx
+    call ext4_alloc_blocks
+    cmp rax, -1
+    je .wf_fail
+    mov r8d, eax                            ; r8d = physical start block
+
+    ; Setup extent root header in i_block
+    mov word  [r15 + ext4_inode - kmain + IN_OFF_BLOCK + 0], EH_MAGIC ; 0xF30A
+    mov word  [r15 + ext4_inode - kmain + IN_OFF_BLOCK + 2], 1        ; eh_entries = 1
+    mov word  [r15 + ext4_inode - kmain + IN_OFF_BLOCK + 4], 4        ; eh_max = 4
+    mov word  [r15 + ext4_inode - kmain + IN_OFF_BLOCK + 6], 0        ; eh_depth = 0
+    mov dword [r15 + ext4_inode - kmain + IN_OFF_BLOCK + 8], 0        ; eh_generation = 0
+
+    ; Setup extent 0
+    mov dword [r15 + ext4_inode - kmain + IN_OFF_BLOCK + 12], 0       ; ee_block = 0
+    mov word  [r15 + ext4_inode - kmain + IN_OFF_BLOCK + 16], bx      ; ee_len = ebx
+    mov word  [r15 + ext4_inode - kmain + IN_OFF_BLOCK + 18], 0       ; ee_start_hi = 0
+    mov dword [r15 + ext4_inode - kmain + IN_OFF_BLOCK + 20], r8d     ; ee_start_lo = r8d
+
+.wf_write_blocks:
+    ; r8d = starting physical block
+    ; ebx = total blocks to write
+    ; r13 = user data pointer
+    ; r14 = total byte count
+    xor r9d, r9d                            ; r9d = current block index (0 .. ebx - 1)
+
+.wf_blk_loop:
+    cmp r9d, ebx
+    jae .wf_update_meta
+
+    ; Calculate remaining bytes: rem = r14 - r9 * 1024
+    mov rax, r9
+    shl rax, 10                             ; rax = r9 * 1024
+    mov rcx, r14
+    sub rcx, rax                            ; rcx = remaining bytes
+
+    mov eax, r8d
+    add eax, r9d                            ; eax = physical block to write
+
+    cmp rcx, 1024
+    jb .wf_write_tail
+
+    ; Full 1024-byte block: write directly from user buffer
+    mov rsi, r9
+    shl rsi, 10
+    add rsi, r13
+    mov eax, r8d
+    add eax, r9d
+    call ext4_blk_write
+    jc .wf_fail
+    inc r9d
+    jmp .wf_blk_loop
+
+.wf_write_tail:
+    ; Partial block (< 1024 bytes) in ext4_wbuf
+    push rax
     lea rdi, [r15 + ext4_wbuf - kmain]
     mov ecx, 1024 / 8
     xor eax, eax
     cld
     rep stosq
+    pop rax
 
-    ; Copy r14 bytes from r13 into ext4_wbuf
+    ; Copy remaining bytes into ext4_wbuf
+    push rax
+    mov rax, r9
+    shl rax, 10
+    lea rsi, [r13 + rax]
+    mov rcx, r14
+    sub rcx, rax
     lea rdi, [r15 + ext4_wbuf - kmain]
-    mov rsi, r13
-    mov ecx, r14d
+    cld
     rep movsb
+    pop rax
 
-    ; Write block ebx to disk!
-    mov eax, ebx
     lea rsi, [r15 + ext4_wbuf - kmain]
     call ext4_blk_write
     jc .wf_fail
+    inc r9d
+    jmp .wf_blk_loop
 
+.wf_update_meta:
     ; Update inode metadata
     mov qword [r15 + ext4_inode - kmain + IN_OFF_SIZE], r14
     mov eax, r14d
@@ -608,7 +1286,7 @@ ext4_write_file:
     shr eax, 9                              ; sectors = (size + 511) / 512
     mov dword [r15 + ext4_inode - kmain + IN_OFF_BLOCKS], eax
 
-    ; Save updated inode!
+    ; Save updated inode
     mov eax, r12d
     call ext4_inode_save
     jc .wf_fail
@@ -622,12 +1300,16 @@ ext4_write_file:
     pop r14
     pop r13
     pop r12
+    pop r10
+    pop r9
+    pop r8
     pop rdi
     pop rsi
     pop rdx
     pop rcx
     pop rbx
     ret
+
 .wf_fail:
     mov rax, -1
     stc
@@ -642,6 +1324,8 @@ ext4_inode_load:
     push rdi
     cmp dword [r15 + ext4_ipg - kmain], 0
     je .err
+    test eax, eax
+    jle .err
     dec eax
     xor edx, edx
     div dword [r15 + ext4_ipg - kmain]      ; eax = group, edx = index
@@ -759,6 +1443,7 @@ ext4_map:
     mov eax, r9d
     sub eax, edx                            ; off = L - ee_block
     mov edx, [rdi + 8]                      ; ee_start_lo (32-bit)
+    sub ecx, eax                            ; ecx = remaining contiguous blocks in extent
     add rax, rdx                            ; phys = start_lo + off
     jmp .done
 .leaf_next:
@@ -767,13 +1452,14 @@ ext4_map:
     jnz .map_scan_leaf
 .none:
     mov rax, -1
+    xor ecx, ecx
 .done:
     pop r9
     pop r8
     pop rdi
     pop rsi
     pop rdx
-    pop rcx
+    add rsp, 8                              ; preserve rcx return value
     pop rbx
     ret
 
@@ -1126,16 +1812,39 @@ ext4_read_file_to_mem:
     mov rbx, r12
     sub rbx, r13                    ; rbx = bytes left to read
 
-    ; If bytes left >= block size, read directly into [rdi + r13]
+    ; If bytes left < block size, read tail block
     cmp rbx, r14
     jb .rf_tail
 
-    ; Direct read into destination!
+    ; Bulk read contiguous blocks from extent
+    test rcx, rcx
+    jnz @f
+    mov rcx, 1
+@@:
+    push rax                        ; save phys block
+    mov rax, rbx
+    xor edx, edx
+    div r14                         ; rax = full blocks needed
+    cmp rax, rcx
+    jbe @f
+    mov rax, rcx                    ; clamp to extent contiguous blocks
+@@:
+    mov r8, rax                     ; r8 = blocks to read (>= 1)
+    pop rax                         ; restore phys block
+
+    ; Direct bulk read into user buffer!
     lea rsi, [rdi + r13]
-    call ext4_blk_read
+    mov rcx, r8
+    call ext4_blks_read
     jc .rf_err_pop
-    add r13, r14
-    inc dword [r15 + e4t_lb - kmain]
+
+    ; Advance bytes read: r13 += r8 * r14
+    mov rax, r8
+    mul r14
+    add r13, rax
+
+    ; Advance logical block: e4t_lb += r8
+    add dword [r15 + e4t_lb - kmain], r8d
     jmp .rf_blk_loop
 
 .rf_tail:
@@ -1524,6 +2233,7 @@ ext4_ipg    dd 0
 ext4_isize  dd 0
 ext4_fdb    dd 0
 ext4_gdtb   dd 0
+ext4_groups_count dd 1
 e4t_group   dd 0
 e4t_index   dd 0
 e4t_itable  dd 0

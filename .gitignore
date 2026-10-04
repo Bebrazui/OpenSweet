@@ -11,3 +11,8 @@ build/_kolibri_ext.inc
 tools/w64devkit/
 tools/*.exe
 
+# Scratch & debug dumps
+scratch/
+*.jsonl
+*.ppm
+

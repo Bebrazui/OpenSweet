@@ -208,6 +208,11 @@ int main(void) {
         if (has_event) {
             if (ev.type == OS_EVENT_WIN_CLOSE) {
                 break;
+            } else if (ev.type == OS_EVENT_WIN_MAXIMIZE) {
+                win.width = ev.x;
+                win.height = ev.y;
+                win.client_w = ev.x;
+                win.client_h = ev.y > 33 ? ev.y - 33 : 0;
             } else if (ev.type == OS_EVENT_MOUSE_MOVE) {
                 /* Check hover row */
                 int my = ev.y;
@@ -238,6 +243,8 @@ int main(void) {
                         if (is_elf) {
                             os_spawn(path);
                         } else {
+                            /* Store selected file path so Notepad opens it automatically */
+                            os_write_file("/last_opened.txt", path, os_strlen(path));
                             os_spawn("/notepad.elf");
                         }
                     }
@@ -253,11 +260,11 @@ int main(void) {
                     }
                 }
             }
+            render_explorer(&win);
+            os_update_window(&win);
         }
 
-        render_explorer(&win);
-        os_update_window(&win);
-        os_sleep(16);
+        os_sleep(25);
     }
 
     os_close_window(&win);

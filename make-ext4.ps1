@@ -17,11 +17,11 @@ $BS = 1024                                  # block size
 
 # ---- superblock @ byte 1024 ----
 $sb = 1024
-PutU32 ($sb + 0x00) 64                      # inodes_count
+PutU32 ($sb + 0x00) 128                     # inodes_count (64 * 2 groups)
 PutU32 ($sb + 0x04) 16384                   # blocks_count_lo
 PutU32 ($sb + 0x14) 1                       # first_data_block (1KB blocks)
 PutU32 ($sb + 0x18) 0                       # log_block_size = 0 -> 1024
-PutU32 ($sb + 0x20) 16384                   # blocks_per_group (one group)
+PutU32 ($sb + 0x20) 8192                    # blocks_per_group (standard 8192 blocks per group)
 PutU32 ($sb + 0x28) 64                      # inodes_per_group
 PutU16 ($sb + 0x36) 1                       # state = clean
 PutU16 ($sb + 0x38) 0xEF53                  # magic
@@ -32,11 +32,16 @@ PutU32 ($sb + 0x5C) 0                       # feature_compat
 PutU32 ($sb + 0x60) 0x42                    # incompatible: FILETYPE|EXTENTS
 PutU32 ($sb + 0x64) 0                       # ro_compat
 
-# ---- GDT @ block 2: one group descriptor ----
+# ---- GDT @ block 2: two group descriptors ----
 $gdt = 2 * $BS
+# Group 0:
 PutU32 ($gdt + 0)  3                        # bg_block_bitmap
 PutU32 ($gdt + 4)  4                        # bg_inode_bitmap
-PutU32 ($gdt + 8)  10                       # bg_inode_table (blocks 10..13)
+PutU32 ($gdt + 8)  10                       # bg_inode_table (blocks 10..17, 8 blocks)
+# Group 1:
+PutU32 ($gdt + 32 + 0) 8192                 # bg_block_bitmap
+PutU32 ($gdt + 32 + 4) 8193                 # bg_inode_bitmap
+PutU32 ($gdt + 32 + 8) 8194                 # bg_inode_table (blocks 8194..8201)
 
 # ---- helper: write an extents-root inode into inode table ----
 function ExtentLeaf([long]$inoOff, [long]$fsBlock, [int]$len, [int]$size, [int]$mode) {
@@ -66,13 +71,17 @@ ExtentLeaf ($itable + 10 * 128) 21 1 26 0x81A4
 # inode 12 = big.txt -> blocks 22..25 (extent len 4)
 ExtentLeaf ($itable + 11 * 128) 22 4 4096 0x81A4
 
-$wallPath = Join-Path $PSScriptRoot "build\wallpaper.png"
+$wallPath = Join-Path $PSScriptRoot "build\wallpaper.qoi"
+if (-not (Test-Path $wallPath)) {
+    $wallPath = Join-Path $PSScriptRoot "build\wallpaper.png"
+}
 $hasWall = Test-Path $wallPath
 $wallBlocks = 0
+$wallName = if ($wallPath.EndsWith(".qoi")) { "wallpaper.qoi" } else { "wallpaper.png" }
 if ($hasWall) {
     $wallBytes = [IO.File]::ReadAllBytes($wallPath)
     $wallBlocks = [int][Math]::Ceiling($wallBytes.Length / 1024.0)
-    # inode 13 = wallpaper.png -> blocks 26..(26 + wallBlocks - 1)
+    # inode 13 = wallpaper -> blocks 26..(26 + wallBlocks - 1)
     ExtentLeaf ($itable + 12 * 128) 26 $wallBlocks $wallBytes.Length 0x81A4
 }
 
@@ -194,6 +203,32 @@ if ($hasFiles) {
     ExtentLeaf ($itable + 18 * 128) $filesStartBlock $filesBlocks $filesBytes.Length 0x81ED
 }
 
+$includeDoom = $true
+$doomElf = Join-Path $PSScriptRoot "build\doom.elf"
+if ($includeDoom -and (-not (Test-Path $doomElf))) {
+    & cmd.exe /c "build_doom.cmd"
+}
+$hasDoom = $includeDoom -and (Test-Path $doomElf)
+$doomBlocks = 0
+$doomStartBlock = $filesStartBlock + $filesBlocks
+if ($hasDoom) {
+    $doomBytes = [IO.File]::ReadAllBytes($doomElf)
+    $doomBlocks = [int][Math]::Ceiling($doomBytes.Length / 1024.0)
+    # inode 21 = doom.elf -> blocks doomStartBlock..(doomStartBlock + doomBlocks - 1)
+    ExtentLeaf ($itable + 20 * 128) $doomStartBlock $doomBlocks $doomBytes.Length 0x81ED
+}
+
+$wadPath = Join-Path $PSScriptRoot "user\doomgeneric\doom1.wad"
+$hasWad = $includeDoom -and (Test-Path $wadPath)
+$wadBlocks = 0
+$wadStartBlock = 8202
+if ($hasWad) {
+    $wadBytes = [IO.File]::ReadAllBytes($wadPath)
+    $wadBlocks = [int][Math]::Ceiling($wadBytes.Length / 1024.0)
+    # inode 20 = doom1.wad -> blocks wadStartBlock..(wadStartBlock + wadBlocks - 1)
+    ExtentLeaf ($itable + 19 * 128) $wadStartBlock $wadBlocks $wadBytes.Length 0x81A4
+}
+
 # ---- root dir data @ block 20 ----
 $d = 20 * $BS
 function DirEntry([long]$off, [int]$ino, [string]$name, [byte]$type, [int]$reclen) {
@@ -211,7 +246,7 @@ DirEntry ($d + 44) 12 'big.txt'   1 20
 
 $curOff = $d + 64
 if ($hasWall) {
-    DirEntry $curOff 13 'wallpaper.png' 1 24
+    DirEntry $curOff 13 $wallName 1 24
     $curOff += 24
 }
 if ($hasElf) {
@@ -235,7 +270,17 @@ if ($hasTerm) {
     $curOff += 24
 }
 if ($hasFiles) {
-    DirEntry $curOff 19 'files.elf' 1 ($d + 1024 - $curOff)
+    $rec = if ($hasDoom -or $hasWad) { 20 } else { $d + 1024 - $curOff }
+    DirEntry $curOff 19 'files.elf' 1 $rec
+    $curOff += 20
+}
+if ($hasDoom) {
+    $rec = if ($hasWad) { 20 } else { $d + 1024 - $curOff }
+    DirEntry $curOff 21 'doom.elf' 1 $rec
+    $curOff += 20
+}
+if ($hasWad) {
+    DirEntry $curOff 20 'doom1.wad' 1 ($d + 1024 - $curOff)
 }
 
 # ---- file data ----
@@ -246,7 +291,7 @@ for ($i = 0; $i -lt 4096; $i++) { $img[(22 * $BS) + $i] = $pat[$i % $pat.Length]
 
 if ($hasWall) {
     Put (26 * $BS) $wallBytes
-    echo "Added wallpaper.png ($($wallBytes.Length) bytes, $wallBlocks blocks) to disk image"
+    echo "Added $wallName ($($wallBytes.Length) bytes, $wallBlocks blocks) to disk image"
 }
 if ($hasElf) {
     Put ($elfStartBlock * $BS) $elfBytes
@@ -272,36 +317,72 @@ if ($hasFiles) {
     Put ($filesStartBlock * $BS) $filesBytes
     echo "Added files.elf ($($filesBytes.Length) bytes, $filesBlocks blocks) to disk image"
 }
+if ($hasDoom) {
+    Put ($doomStartBlock * $BS) $doomBytes
+    echo "Added doom.elf ($($doomBytes.Length) bytes, $doomBlocks blocks) to disk image"
+}
+if ($hasWad) {
+    Put ($wadStartBlock * $BS) $wadBytes
+    echo "Added doom1.wad ($($wadBytes.Length) bytes, $wadBlocks blocks) to disk image"
+}
 
 # ---- populate block and inode bitmaps and free counts ----
-$totalAllocatedBlocks = $filesStartBlock + $filesBlocks
+$totalAllocatedBlocksGrp0 = if ($hasDoom) {
+    $doomStartBlock + $doomBlocks
+} elseif ($hasFiles) {
+    $filesStartBlock + $filesBlocks
+} else {
+    26
+}
 
-# Block bitmap at block 3 (mark blocks 0..totalAllocatedBlocks-1 as used)
-for ($b = 0; $b -lt $totalAllocatedBlocks; $b++) {
+# Block bitmap at block 3 (mark blocks 0..totalAllocatedBlocksGrp0-1 in group 0 as used)
+$grp0Blocks = [Math]::Min($totalAllocatedBlocksGrp0, 8192)
+for ($b = 0; $b -lt $grp0Blocks; $b++) {
     $byteIdx = $b -shr 3
     $bitIdx  = $b -band 7
     $img[(3 * $BS) + $byteIdx] = $img[(3 * $BS) + $byteIdx] -bor (1 -shl $bitIdx)
 }
 
-# Inode bitmap at block 4 (inodes 1..19 are used)
-for ($ino = 1; $ino -le 19; $ino++) {
+# Inode bitmap at block 4 (inodes 1..lastIno are used)
+$lastIno = if ($hasDoom) { 21 } elseif ($hasWad) { 20 } elseif ($hasFiles) { 19 } else { 12 }
+[Array]::Clear($img, 4 * $BS, $BS)
+for ($ino = 1; $ino -le $lastIno; $ino++) {
     $bit = $ino - 1
     $byteIdx = $bit -shr 3
     $bitIdx  = $bit -band 7
     $img[(4 * $BS) + $byteIdx] = $img[(4 * $BS) + $byteIdx] -bor (1 -shl $bitIdx)
 }
 
-$freeBlocks = 16384 - $totalAllocatedBlocks
-$freeInodes = 64 - 19
+# Group 1 block bitmap at block 8192:
+# Mark 10 metadata blocks of Group 1 + wadBlocks
+$grp1Blocks = if ($hasWad) { 10 + $wadBlocks } else { 10 }
+for ($b = 0; $b -lt $grp1Blocks; $b++) {
+    $byteIdx = $b -shr 3
+    $bitIdx  = $b -band 7
+    $img[(8192 * $BS) + $byteIdx] = $img[(8192 * $BS) + $byteIdx] -bor (1 -shl $bitIdx)
+}
 
-PutU32 ($sb + 0x0C) $freeBlocks             # s_free_blocks_count_lo
-PutU32 ($sb + 0x10) $freeInodes             # s_free_inodes_count
+$freeBlocksGrp0 = 8192 - $grp0Blocks
+$freeBlocksGrp1 = 8192 - $grp1Blocks
+$freeBlocksTotal = $freeBlocksGrp0 + $freeBlocksGrp1
 
-PutU16 ($gdt + 0x0C) $freeBlocks            # bg_free_blocks_count_lo
-PutU16 ($gdt + 0x0E) $freeInodes            # bg_free_inodes_count_lo
+$freeInodesGrp0 = 64 - $lastIno
+$freeInodesGrp1 = 64
+$freeInodesTotal = $freeInodesGrp0 + $freeInodesGrp1
+
+PutU32 ($sb + 0x0C) $freeBlocksTotal        # s_free_blocks_count_lo
+PutU32 ($sb + 0x10) $freeInodesTotal        # s_free_inodes_count
+
+# Group 0 descriptor:
+PutU16 ($gdt + 0x0C) $freeBlocksGrp0        # bg_free_blocks_count_lo
+PutU16 ($gdt + 0x0E) $freeInodesGrp0        # bg_free_inodes_count_lo
 PutU16 ($gdt + 0x10) 1                      # bg_used_dirs_count_lo
 
-[IO.File]::WriteAllBytes('build\disk.img', $img)
-echo "Build OK: build\disk.img (minimal ext4, 1KB blocks)"
+# Group 1 descriptor:
+PutU16 ($gdt + 32 + 0x0C) $freeBlocksGrp1   # bg_free_blocks_count_lo
+PutU16 ($gdt + 32 + 0x0E) $freeInodesGrp1   # bg_free_inodes_count_lo
+$diskOut = Join-Path $PSScriptRoot 'build\disk.img'
+[IO.File]::WriteAllBytes($diskOut, $img)
+echo "Build OK: $diskOut (minimal 2-group ext4, 1KB blocks)"
 
 
