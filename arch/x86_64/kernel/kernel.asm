@@ -797,10 +797,10 @@ kmain:
     mov ebx, eax                      ; ebx = slot ID (1..7)
     ; r9 = phys_code, r10 = phys_stack
 
-    ; Zero out private physical code (2MB) and stack (2MB)
+    ; Zero out private physical code (4MB) and stack (2MB)
     push rdi
     mov rdi, r9
-    mov ecx, (2 * 1024 * 1024) / 8
+    mov ecx, (4 * 1024 * 1024) / 8
     xor eax, eax
     rep stosq
     mov rdi, r10
@@ -818,7 +818,7 @@ kmain:
     ; 2. Finalize and launch Ring 3 user task
     lea rsi, [r15 + str_name_user - kmain]
     mov rdx, 0x400000                 ; User RIP entry
-    mov r8,  0x7FFF00                 ; User RSP stack
+    mov r8,  0x1FFFFF00                ; User RSP stack (top of PD[255] slot)
     call task_finalize_user
 
     lea rsi, [r15 + str_ring3_ok - kmain]

@@ -1,6 +1,6 @@
 ; ==============================================================================
 ; Opensweet OS - First 64-bit Ring 3 User Application (kernel/test_user.inc)
-; Assembled for execution at virtual address 0x400000 with user stack at 0x7FFF00.
+; Assembled for execution at virtual address 0x400000 with user stack at 0x1FFFFF00.
 ; Uses 100% pure syscall / sysret interface!
 ; ==============================================================================
 
@@ -49,7 +49,7 @@ user_app_bin:
 
 .msg_welcome:
     db 10, "[Ring 3 User Mode] Process started successfully! (CPL=3)", 10
-    db "[Ring 3 User Mode] Memory mapped @ 0x400000, Stack @ 0x7FFF00", 10, 0
+    db "[Ring 3 User Mode] Memory mapped @ 0x400000, Stack @ 0x1FFFFF00", 10, 0
 .msg_welcome_len = $ - .msg_welcome - 1
 
 .msg_beat:

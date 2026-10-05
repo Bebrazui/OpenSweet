@@ -370,9 +370,9 @@ elf_load_exec:
     ; [rsp + 40] = phentsize
     ; [rsp + 48] = phoff
 
-    ; Zero out private physical code (2MB) and stack (2MB)
+    ; Zero out private physical code (4MB) and stack (2MB)
     mov rdi, [rsp + 16]               ; phys_code
-    mov ecx, (2 * 1024 * 1024) / 8
+    mov ecx, (4 * 1024 * 1024) / 8
     xor eax, eax
     cld
     rep stosq
@@ -504,7 +504,7 @@ elf_load_exec:
 
     ; 9. Setup AMD64 System V ABI User Stack
     ; Vector (argc/argv/envp/auxv) lives at phys_stack + 0x1FFE00 (virtual
-    ; 0x7FFE00); 512 bytes are reserved so auxv can never run past the end
+    ; 0x1FFFFE00); 512 bytes are reserved so auxv can never run past the end
     ; of the stack slot (old base 0x1FFF00 overflowed by up to 0xA0 bytes).
     ; Physical address = phys_stack + 0x1FFE00
     mov r9, [r15 + sys_spawn_argv_ptr - kmain]
@@ -519,9 +519,9 @@ elf_load_exec:
     pop rbx
     jc .fallback_args
 
-    ; Copy arguments into phys_stack + 0x1FF800 (virtual 0x7FF800)
+    ; Copy arguments into phys_stack + 0x1FF800 (virtual 0x1FFFF800)
     lea r12, [r10 + 0x1FF800]          ; physical destination
-    mov r13, 0x7FF800                  ; virtual destination
+    mov r13, 0x1FFFF800                ; virtual destination
     xor ecx, ecx                       ; ecx = argc
 
 .copy_argv_loop:
@@ -585,7 +585,7 @@ elf_load_exec:
     mov [r10 + 0x1FFE00], rcx                  ; [0x00] = argc
     mov qword [r10 + 0x1FFE00 + 8 + rcx*8], 0  ; argv[argc] = NULL
 
-    ; Setup standard POSIX environment strings at phys_stack + 0x1FF500 (virtual 0x7FF500)
+    ; Setup standard POSIX environment strings at phys_stack + 0x1FF500 (virtual 0x1FFFF500)
     lea rdi, [r10 + 0x1FF500]
     mov dword [rdi + 0], "PATH"
     mov dword [rdi + 4], "=/bi"
@@ -607,17 +607,17 @@ elf_load_exec:
 
     ; Populate envp pointers
     lea rdi, [r10 + 0x1FFE00 + 8 + rcx*8 + 8]
-    mov qword [rdi + 0*8], 0x7FF500
-    mov qword [rdi + 1*8], 0x7FF500 + 16
-    mov qword [rdi + 2*8], 0x7FF500 + 32
-    mov qword [rdi + 3*8], 0x7FF500 + 48
-    mov qword [rdi + 4*8], 0x7FF500 + 80
+    mov qword [rdi + 0*8], 0x1FFFF500
+    mov qword [rdi + 1*8], 0x1FFFF500 + 16
+    mov qword [rdi + 2*8], 0x1FFFF500 + 32
+    mov qword [rdi + 3*8], 0x1FFFF500 + 48
+    mov qword [rdi + 4*8], 0x1FFFF500 + 80
     mov qword [rdi + 5*8], 0
     lea rdi, [rdi + 6*8]
     jmp .args_done
 
 .fallback_args:
-    ; Fallback: 1 argument (process name string at virtual 0x7FFF80)
+    ; Fallback: 1 argument (process name string at virtual 0x1FFFFF80)
     push rdi
     push rsi
     mov rsi, r14                      ; process name
@@ -636,17 +636,17 @@ elf_load_exec:
     pop rsi
     pop rdi
 
-    ; Stack layout at phys_stack + 0x1FFE00 (virtual 0x7FFE00):
+    ; Stack layout at phys_stack + 0x1FFE00 (virtual 0x1FFFFE00):
     ; [0x00] = 1 (argc)
-    ; [0x08] = 0x7FFF80 (argv[0])
+    ; [0x08] = 0x1FFFFF80 (argv[0])
     ; [0x10] = 0 (argv[1] = NULL)
     ; [0x18..] = envp
     lea rdi, [r10 + 0x1FFE00]
     mov qword [rdi + 0x00], 1
-    mov qword [rdi + 0x08], 0x7FFF80
+    mov qword [rdi + 0x08], 0x1FFFFF80
     mov qword [rdi + 0x10], 0
 
-    ; Setup standard POSIX environment strings at phys_stack + 0x1FF500 (virtual 0x7FF500)
+    ; Setup standard POSIX environment strings at phys_stack + 0x1FF500 (virtual 0x1FFFF500)
     lea rdi, [r10 + 0x1FF500]
     mov dword [rdi + 0], "PATH"
     mov dword [rdi + 4], "=/bi"
@@ -667,11 +667,11 @@ elf_load_exec:
     mov word  [rdi + 88], "h"
 
     lea rdi, [r10 + 0x1FFE00 + 0x18]
-    mov qword [rdi + 0*8], 0x7FF500
-    mov qword [rdi + 1*8], 0x7FF500 + 16
-    mov qword [rdi + 2*8], 0x7FF500 + 32
-    mov qword [rdi + 3*8], 0x7FF500 + 48
-    mov qword [rdi + 4*8], 0x7FF500 + 80
+    mov qword [rdi + 0*8], 0x1FFFF500
+    mov qword [rdi + 1*8], 0x1FFFF500 + 16
+    mov qword [rdi + 2*8], 0x1FFFF500 + 32
+    mov qword [rdi + 3*8], 0x1FFFF500 + 48
+    mov qword [rdi + 4*8], 0x1FFFF500 + 80
     mov qword [rdi + 5*8], 0
     lea rdi, [rdi + 6*8]              ; RDI points after NULL envp
 
@@ -714,9 +714,9 @@ elf_load_exec:
     ; [11] AT_SECURE (23) = 0
     mov qword [rdi + 22*8], 23
     mov qword [rdi + 23*8], 0
-    ; [12] AT_RANDOM (25) = pointer to 16 random bytes (use 0x7FF580)
+    ; [12] AT_RANDOM (25) = pointer to 16 random bytes (use 0x1FFFF500)
     mov qword [rdi + 24*8], 25
-    mov qword [rdi + 25*8], 0x7FF500
+    mov qword [rdi + 25*8], 0x1FFFF500
     ; [13] AT_NULL (0) = 0
     mov qword [rdi + 26*8], 0
     mov qword [rdi + 27*8], 0
@@ -770,10 +770,10 @@ end if
     ; EBX = slot ID
     ; RSI = process name (r14)
     ; RDX = entry point (r8)
-    ; R8  = user stack top (0x7FFE00 = start of the argv/envp/auxv vector)
+    ; R8  = user stack top (0x1FFFFE00 = start of the argv/envp/auxv vector)
     mov rsi, r14
     mov rdx, r8                       ; entry RIP
-    mov r8,  0x7FFE00                 ; user RSP
+    mov r8,  0x1FFFFE00               ; user RSP
     call task_finalize_user
     cmp eax, -1
     jne .spawn_ok

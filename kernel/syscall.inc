@@ -579,10 +579,19 @@ sys_validate_user_ptr:
     add rax, rsi
     jc .invalid                       ; 64-bit integer overflow
 
-    ; Range A: slot code/data/heap/stack [0x400000, 0x04000000)
+    ; Range A: slot code/data/heap [0x400000, 0x04000000)
     cmp rdi, 0x00400000
-    jb .check_mmap
+    jb .check_stack
     cmp rax, 0x04000000               ; must END <= 64MB
+    jbe .valid
+
+.check_stack:
+    ; Range C: per-task stack slot [0x1FE00000, 0x20000000)
+    ; (each task maps this to its own private stack page; the guard is the
+    ; page table itself - nothing else lives at that VA)
+    cmp rdi, 0x1FE00000
+    jb .check_mmap
+    cmp rax, 0x20000000               ; must END <= 512MB (mmap zone starts here)
     jbe .valid
 
 .check_mmap:

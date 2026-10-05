@@ -14,8 +14,8 @@ TASK_SLEEPING   = 3
 TASK_DEAD       = 4
 
 USER_PAGE_TABLES_BASE = 0x00200000    ; 2MB: Physical base for per-process page tables (96KB for 8 slots)
-USER_PHYS_BASE        = 0x05000000    ; 80MB: Physical base for per-process code/stack (28MB for 7 slots)
-USER_MEM_STRIDE       = 0x00400000    ; 4MB physical stride per task slot (2MB code + 2MB stack)
+USER_PHYS_BASE        = 0x05000000    ; 80MB: Physical base for per-process code/stack (42MB for 7 slots)
+USER_MEM_STRIDE       = 0x00600000    ; 6MB physical stride per task slot (4MB code + 2MB stack)
 
 ; TCB offsets (608 bytes per TCB, 16-byte aligned)
 TCB_RSP         = 0x00                ; uint64: Saved stack pointer
@@ -336,7 +336,7 @@ task_setup_pagetables:
     jb .fill_pd_loop
 
     ; Customize user-accessible entries in PD:
-    ; Entry 2 (virtual 0x00400000..0x005FFFFF): User Code/Data/BSS
+    ; Entries 2..3 (virtual 0x00400000..0x007FFFFF): User Code/Data/BSS (4MB)
     ; Map to slot's private physical code: USER_PHYS_BASE + (ebx - 1) * USER_MEM_STRIDE
     lea eax, [ebx - 1]
     imul eax, USER_MEM_STRIDE
@@ -344,15 +344,21 @@ task_setup_pagetables:
     or eax, 0x87                      ; Present | Writable | User | Huge
     mov [r10 + 2*8], eax
     mov dword [r10 + 2*8 + 4], 0
-
-    ; Entry 3 (virtual 0x00600000..0x007FFFFF): User Stack (0x7FFF00)
-    ; Map to slot's private physical stack: USER_PHYS_BASE + (ebx - 1) * USER_MEM_STRIDE + 0x00200000
-    lea eax, [ebx - 1]
-    imul eax, USER_MEM_STRIDE
-    add eax, USER_PHYS_BASE + 0x00200000
-    or eax, 0x87                      ; Present | Writable | User | Huge
+    add eax, 0x00200000               ; second 2MB of the code slot
     mov [r10 + 3*8], eax
     mov dword [r10 + 3*8 + 4], 0
+
+    ; Entry 255 (virtual 0x1FE00000..0x1FFFFFFF): User Stack (top 0x1FFFFF00),
+    ; parked just below the Linux mmap zone. Moving it out of 0x600000..0x800000
+    ; gives the code slot the full 4MB at 0x400000..0x7FFFFF (brk heap owns
+    ; 16..64MB, canvases own 8..16MB - there was nowhere else to grow).
+    ; Map to slot's private physical stack: phys_code + 0x00400000
+    lea eax, [ebx - 1]
+    imul eax, USER_MEM_STRIDE
+    add eax, USER_PHYS_BASE + 0x00400000
+    or eax, 0x87                      ; Present | Writable | User | Huge
+    mov [r10 + 255*8], eax
+    mov dword [r10 + 255*8 + 4], 0
 
     ; Entries 4..7 (virtual 0x00800000..0x00E00000): Window Canvases (8MB..16MB)
     ; Give user access (0x87) so user app can render to canvas
@@ -450,7 +456,7 @@ task_alloc_user_slot:
     imul eax, USER_MEM_STRIDE
     add eax, USER_PHYS_BASE
     mov r9d, eax                      ; r9  = phys_code
-    lea r10d, [r9d + 0x00200000]      ; r10 = phys_stack
+    lea r10d, [r9d + 0x00400000]      ; r10 = phys_stack (4MB code slot + 2MB)
 
     mov eax, ebx                      ; return slot ID in EAX and EBX
 
@@ -464,7 +470,7 @@ task_alloc_user_slot:
 ; EBX = slot ID (1..MAX_TASKS-1)
 ; RSI = name string (ASCIIZ)
 ; RDX = user RIP entry point (e.g. 0x400000)
-; R8  = user RSP initial stack top (e.g. 0x7FFF00)
+; R8  = user RSP initial stack top (e.g. 0x1FFFFF00)
 ; Returns: EAX = task ID
 ; ==============================================================================
 task_finalize_user:
@@ -626,7 +632,7 @@ task_finalize_user:
 ; task_create_user: Legacy wrapper to create a Ring 3 user task
 ; RSI = name string (ASCIIZ)
 ; RDX = user RIP entry point (e.g. 0x400000)
-; R8  = user RSP initial stack top (e.g. 0x7FFF00)
+; R8  = user RSP initial stack top (e.g. 0x1FFFFF00)
 ; Returns: EAX = task ID (or -1 on error)
 ; ==============================================================================
 task_create_user:
