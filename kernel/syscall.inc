@@ -32,18 +32,22 @@ SYS_WAITPID        = 29
 SYS_GETCWD         = 30
 SYS_CHDIR          = 31
 SYS_SPAWN_STDIO    = 32
+SYS_MKDIR          = 33
+SYS_RMDIR          = 34
 
 align 16
 sys_user_rsp       dq 0
 sys_kernel_stack   dq 0
 sys_spawn_arg_buf  rb 128                ; Global buffer for launch argument/file path
 sys_spawn_argv_ptr dq 0                  ; Global pointer to user argv array (or 0)
+sys_spawn_abi    dq 0                    ; Pending TCB_ABI_TYPE for next finalize (0/1)
 sys_spawn_in_fd    dd -1                 ; Redirected stdin fd for child (-1 = default console)
 sys_spawn_out_fd   dd -1                 ; Redirected stdout fd for child (-1 = default console)
 sys_spawn_err_fd   dd -1                 ; Redirected stderr fd for child (-1 = default console)
 
 align 16
-sys_kstack_pool:   rb 8192
+; Dedicated per-task kernel syscall stacks (8 tasks * 8192 bytes = 64KB)
+sys_kstack_pool:   rb (8 * 8192)
 sys_kstack_top:
 
 str_sys_crash      db 10, "[Kernel] Ring 3 user task crashed. Terminating task.", 10, 0
@@ -57,8 +61,8 @@ syscall_init:
     push rcx
     push rdx
 
-    ; Set initial dedicated syscall kernel stack
-    lea rax, [sys_kstack_top]
+    ; Set initial dedicated syscall kernel stack for Task 0
+    lea rax, [sys_kstack_pool + 8192]
     mov [sys_kernel_stack], rax
 
     ; 1. Enable SCE (System Call Enable, bit 0) in IA32_EFER (0xC0000080)
@@ -144,7 +148,18 @@ syscall_entry:
     ; 4. Re-enable interrupts for kernel syscall execution
     sti
 
-    ; 5. Dispatch syscall by number in RAX
+    ; Check process ABI type (Native vs Linux)
+if defined CONFIG_LINUX_COMPAT
+    push rax
+    mov eax, [r15 + sched_curr_task - kmain]
+    imul eax, TCB_SIZE
+    lea rbx, [r15 + task_table - kmain + rax]
+    cmp dword [rbx + TCB_ABI_TYPE], 1
+    pop rax
+    je .do_linux_abi
+end if
+
+    ; 5. Dispatch native syscall by number in RAX
     cmp eax, SYS_EXIT
     je .do_exit
     cmp eax, SYS_WRITE
@@ -201,10 +216,35 @@ syscall_entry:
     je .do_chdir
     cmp eax, SYS_SPAWN_STDIO
     je .do_spawn_stdio
+    cmp eax, SYS_MKDIR
+    je .do_mkdir
+    cmp eax, SYS_RMDIR
+    je .do_rmdir
 
+if defined CONFIG_LINUX_COMPAT
+    ; Fallback to Linux ABI for undeclared syscall numbers (marked distinctly
+    ; so traces show which calls bypassed the ABI check)
+    push rax
+    push rsi
+    lea rsi, [r15 + str_l_fb_log - kmain]
+    call puts
+    mov rax, [rsp + 8]
+    call putdec64
+    mov al, 10
+    call putc
+    pop rsi
+    pop rax
+    call linux_syscall_dispatch
+    jmp .syscall_ret
+
+.do_linux_abi:
+    call linux_syscall_dispatch
+    jmp .syscall_ret
+else
     ; Unimplemented syscall
     mov rax, -1
     jmp .syscall_ret
+end if
 
 .do_exit:
     ; RDI = exit code
@@ -355,6 +395,22 @@ syscall_entry:
     popfq
     jmp .syscall_ret
 
+.do_mkdir:
+    ; RDI = path
+    pushfq
+    cli
+    call sys_handler_mkdir
+    popfq
+    jmp .syscall_ret
+
+.do_rmdir:
+    ; RDI = path
+    pushfq
+    cli
+    call sys_handler_rmdir
+    popfq
+    jmp .syscall_ret
+
 .do_get_time:
     ; Read CMOS RTC Real Time Clock with timeout guard
     mov ecx, 100000
@@ -433,8 +489,10 @@ syscall_entry:
     ; RDI = user buffer (os_sysinfo_t)
     mov rsi, 160
     call sys_validate_user_ptr
-    test eax, eax
-    jz .sysinfo_valid
+    jc .sysinfo_err
+    jmp .sysinfo_valid
+
+.sysinfo_err:
     mov rax, -1
     jmp .syscall_ret
 
@@ -517,18 +575,24 @@ sys_validate_user_ptr:
     test rsi, rsi
     jz .invalid
 
-    ; Must be >= 0x00400000 (User space base)
-    cmp rdi, 0x00400000
-    jb .invalid
-
     mov rax, rdi
     add rax, rsi
     jc .invalid                       ; 64-bit integer overflow
 
-    ; Must end <= 0x04000000 (User space ceiling: 64MB)
-    cmp rax, 0x04000000
+    ; Range A: slot code/data/heap/stack [0x400000, 0x04000000)
+    cmp rdi, 0x00400000
+    jb .check_mmap
+    cmp rax, 0x04000000               ; must END <= 64MB
+    jbe .valid
+
+.check_mmap:
+    ; Range B: Linux mmap zone [0x20000000, 0x40000000)
+    cmp rdi, 0x20000000
+    jb .invalid
+    cmp rax, 0x40000000               ; must END <= 1GB
     ja .invalid
 
+.valid:
     clc
     ret
 .invalid:
@@ -880,13 +944,15 @@ sys_handler_spawn_core:
     test rdi, rdi
     jz .sp_err
 
-    ; Store user argv pointer globally for elf_load_exec
-    mov [r15 + sys_spawn_argv_ptr - kmain], rsi
-
-    ; Validate user pointer
+    ; Validate path pointer
+    push rsi
     mov rsi, 64
     call sys_validate_user_ptr
+    pop rsi
     jc .sp_err
+
+    ; Store user argv pointer globally for elf_load_exec
+    mov [r15 + sys_spawn_argv_ptr - kmain], rsi
 
     ; Copy string into local kernel buffer on stack and global spawn arg
     mov rsi, rdi
@@ -910,7 +976,8 @@ sys_handler_spawn_core:
     lea rsi, [rsp]
     call elf_load_from_ext4
 
-    ; Reset redirection fds
+    ; Reset redirection fds and argv pointer
+    mov qword [r15 + sys_spawn_argv_ptr - kmain], 0
     mov dword [r15 + sys_spawn_in_fd - kmain], -1
     mov dword [r15 + sys_spawn_out_fd - kmain], -1
     mov dword [r15 + sys_spawn_err_fd - kmain], -1
@@ -928,7 +995,8 @@ sys_handler_spawn_core:
     ret
 
 .sp_err:
-    ; Reset redirection fds
+    ; Reset redirection fds and argv pointer
+    mov qword [r15 + sys_spawn_argv_ptr - kmain], 0
     mov dword [r15 + sys_spawn_in_fd - kmain], -1
     mov dword [r15 + sys_spawn_out_fd - kmain], -1
     mov dword [r15 + sys_spawn_err_fd - kmain], -1
@@ -1033,8 +1101,15 @@ sys_handler_chdir:
 .cd_cp_done:
 
     lea rsi, [rsp]
+    pushfq
+    cli
     call ext4_cd
-    jc .cd_err
+    ; popfq restores RFLAGS and destroys the CF set by ext4_cd, so capture
+    ; the carry flag first: chdir always reported success before this fix.
+    setc bl
+    popfq
+    test bl, bl
+    jnz .cd_err
 
     xor eax, eax                        ; success = 0
     add rsp, 64
@@ -1538,6 +1613,144 @@ sys_handler_unlink:
     ret
 
 .ul_err:
+    add rsp, 64
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    mov rax, -1
+    ret
+
+; ==============================================================================
+; sys_handler_mkdir: Create directory in ext4 filesystem
+; RDI = user path pointer
+; Returns: RAX = 0 on success, or -1 on error
+; ==============================================================================
+sys_handler_mkdir:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r12
+    push r13
+    push r14
+    push r15
+    sub rsp, 64
+
+    test rdi, rdi
+    jz .md_err
+
+    mov rsi, 64
+    call sys_validate_user_ptr
+    jc .md_err
+
+    mov rsi, [rsp + 64 + 32]
+    lea rdi, [rsp]
+    mov ecx, 63
+.md_cp_path:
+    lodsb
+    stosb
+    test al, al
+    jz .md_cp_done
+    dec ecx
+    jnz .md_cp_path
+    mov byte [rdi], 0
+.md_cp_done:
+
+    lea rsi, [rsp]
+    call ext4_mkdir
+    cmp rax, -1
+    je .md_err
+
+    xor eax, eax
+    add rsp, 64
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+.md_err:
+    add rsp, 64
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    mov rax, -1
+    ret
+
+; ==============================================================================
+; sys_handler_rmdir: Remove empty directory from ext4 filesystem
+; RDI = user path pointer
+; Returns: RAX = 0 on success, or -1 on error
+; ==============================================================================
+sys_handler_rmdir:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r12
+    push r13
+    push r14
+    push r15
+    sub rsp, 64
+
+    test rdi, rdi
+    jz .rd_err
+
+    mov rsi, 64
+    call sys_validate_user_ptr
+    jc .rd_err
+
+    mov rsi, [rsp + 64 + 32]
+    lea rdi, [rsp]
+    mov ecx, 63
+.rd_cp_path:
+    lodsb
+    stosb
+    test al, al
+    jz .rd_cp_done
+    dec ecx
+    jnz .rd_cp_path
+    mov byte [rdi], 0
+.rd_cp_done:
+
+    lea rsi, [rsp]
+    call ext4_rmdir
+    cmp rax, -1
+    je .rd_err
+
+    xor eax, eax
+    add rsp, 64
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+.rd_err:
     add rsp, 64
     pop r15
     pop r14

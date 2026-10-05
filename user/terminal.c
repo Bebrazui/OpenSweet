@@ -50,6 +50,13 @@ static int         input_len = 0;
 static int         blink_cnt = 0;
 static int         curr_blink_state = 1;
 
+/* Smooth Animation State (VS Code / Neovide style smooth caret and scrolling) */
+static int         anim_active = 0;
+static int         anim_cur_x_fp = 0;    /* 8.8 fixed-point */
+static int         anim_cur_y_fp = 0;    /* 8.8 fixed-point */
+static int         anim_inited = 0;
+static int         anim_scroll_y_fp = 0; /* 8.8 fixed-point scroll offset */
+
 static void term_scroll_up(void) {
     for (int r = 0; r < TERM_ROWS - 1; r++) {
         lines[r] = lines[r + 1];
@@ -233,7 +240,10 @@ static void execute_command(const char *cmd) {
         term_print_line("  echo <text>   Print text to console", OS_COLOR_SLATE_300);
         term_print_line("  cat <file>    Display file contents from ext4", OS_COLOR_SLATE_300);
         term_print_line("  write <f> <t> Write/create file on ext4 filesystem", OS_COLOR_SLATE_300);
+        term_print_line("  touch <file>  Create an empty file on ext4", OS_COLOR_SLATE_300);
         term_print_line("  rm <file>     Delete a file from ext4 filesystem", OS_COLOR_SLATE_300);
+        term_print_line("  mkdir <dir>   Create a directory on ext4 filesystem", OS_COLOR_SLATE_300);
+        term_print_line("  rmdir <dir>   Remove an empty directory from ext4", OS_COLOR_SLATE_300);
         term_print_line("  pwd           Print current working directory", OS_COLOR_SLATE_300);
         term_print_line("  cd <path>     Change current working directory", OS_COLOR_SLATE_300);
         term_print_line("  memtest       Test dynamic memory allocation (malloc/free)", OS_COLOR_SLATE_300);
@@ -296,10 +306,41 @@ static void execute_command(const char *cmd) {
                         term_print_line("FAIL: os_read_fd returned 0 or error", OS_COLOR_ROSE);
                     }
                     os_delete_file("/vfs_test.txt");
-                    term_print_line("PASS: All POSIX File Descriptor tests passed!", OS_COLOR_CYAN_NEON);
+
+                    /* Subdirectory & Nested Path Test */
+                    int mr = os_mkdir("/testdir", 0755);
+                    if (mr < 0) {
+                        term_print_line("FAIL: os_mkdir(/testdir) returned error", OS_COLOR_ROSE);
+                    } else {
+                        term_print_line("PASS: os_mkdir(/testdir) created successfully", OS_COLOR_EMERALD_LT);
+                        int nfd = os_open("/testdir/nested.txt", O_CREAT | O_WRONLY | O_TRUNC, 0644);
+                        if (nfd < 0) {
+                            term_print_line("FAIL: os_open(/testdir/nested.txt, O_CREAT) failed", OS_COLOR_ROSE);
+                        } else {
+                            const char *ndata = "Nested ext4 write OK\n";
+                            os_write_fd(nfd, ndata, os_strlen(ndata));
+                            os_close(nfd);
+
+                            char nbuf[64];
+                            int nrfd = os_open("/testdir/nested.txt", O_RDONLY, 0);
+                            if (nrfd >= 0) {
+                                ssize_t nr = os_read_fd(nrfd, nbuf, sizeof(nbuf) - 1);
+                                os_close(nrfd);
+                                if (nr > 0) {
+                                    nbuf[nr] = '\0';
+                                    term_print_line("PASS: Nested file read back:", OS_COLOR_EMERALD_LT);
+                                    term_print_line(nbuf, OS_COLOR_WHITE);
+                                }
+                            }
+                            os_delete_file("/testdir/nested.txt");
+                        }
+                        os_rmdir("/testdir");
+                        term_print_line("PASS: All POSIX & ext4 Subdirectory tests passed!", OS_COLOR_CYAN_NEON);
+                    }
                 }
             }
         }
+
     } else if (os_strcmp(cmd, "testpipe") == 0) {
         term_print_line("Testing POSIX Anonymous Pipes & dup2...", OS_COLOR_CYAN_NEON);
         int pfd[2];
@@ -619,6 +660,58 @@ static void execute_command(const char *cmd) {
                 term_print_line(res, OS_COLOR_EMERALD_LT);
             }
         }
+    } else if (cmd[0] == 'm' && cmd[1] == 'k' && cmd[2] == 'd' && cmd[3] == 'i' && cmd[4] == 'r' && cmd[5] == ' ') {
+        const char *p = cmd + 6;
+        while (*p == ' ') p++;
+        if (*p == '\0') {
+            term_print_line("Usage: mkdir <dirname>", OS_COLOR_ROSE);
+        } else {
+            int ret = os_mkdir(p, 0755);
+            if (ret < 0) {
+                term_print_line("Error: cannot create directory (already exists or invalid path)", OS_COLOR_ROSE);
+            } else {
+                char res[96];
+                os_strcpy(res, "Created directory '");
+                os_strcpy(res + os_strlen(res), p);
+                os_strcpy(res + os_strlen(res), "'");
+                term_print_line(res, OS_COLOR_EMERALD_LT);
+            }
+        }
+    } else if (cmd[0] == 'r' && cmd[1] == 'm' && cmd[2] == 'd' && cmd[3] == 'i' && cmd[4] == 'r' && cmd[5] == ' ') {
+        const char *p = cmd + 6;
+        while (*p == ' ') p++;
+        if (*p == '\0') {
+            term_print_line("Usage: rmdir <dirname>", OS_COLOR_ROSE);
+        } else {
+            int ret = os_rmdir(p);
+            if (ret < 0) {
+                term_print_line("Error: cannot remove directory (not empty or not found)", OS_COLOR_ROSE);
+            } else {
+                char res[96];
+                os_strcpy(res, "Removed directory '");
+                os_strcpy(res + os_strlen(res), p);
+                os_strcpy(res + os_strlen(res), "'");
+                term_print_line(res, OS_COLOR_EMERALD_LT);
+            }
+        }
+    } else if (cmd[0] == 't' && cmd[1] == 'o' && cmd[2] == 'u' && cmd[3] == 'c' && cmd[4] == 'h' && cmd[5] == ' ') {
+        const char *p = cmd + 6;
+        while (*p == ' ') p++;
+        if (*p == '\0') {
+            term_print_line("Usage: touch <filename>", OS_COLOR_ROSE);
+        } else {
+            int fd = os_open(p, O_CREAT | O_WRONLY, 0644);
+            if (fd < 0) {
+                term_print_line("Error: cannot touch file", OS_COLOR_ROSE);
+            } else {
+                os_close(fd);
+                char res[96];
+                os_strcpy(res, "Touched '");
+                os_strcpy(res + os_strlen(res), p);
+                os_strcpy(res + os_strlen(res), "'");
+                term_print_line(res, OS_COLOR_EMERALD_LT);
+            }
+        }
     } else if (os_strcmp(cmd, "exit") == 0) {
         os_exit(0);
     } else {
@@ -650,21 +743,39 @@ static void execute_command(const char *cmd) {
 
         const char *exe_name = argv[0];
         char exec_path[64];
+        int pfd[2] = { -1, -1 };
         int spawned = -1;
+
+        if (!run_bg) {
+            os_pipe(pfd);
+        }
+
         if (exe_name[0] == '/') {
             os_strcpy(exec_path, exe_name);
-            spawned = os_spawn_args(exec_path, (const char *const*)argv);
+            if (pfd[1] >= 0) {
+                spawned = os_spawn_stdio(exec_path, (const char *const*)argv, -1, pfd[1], pfd[1]);
+            } else {
+                spawned = os_spawn_args(exec_path, (const char *const*)argv);
+            }
         } else {
             /* Try "/<name>.elf" */
             os_strcpy(exec_path, "/");
             os_strcpy(exec_path + os_strlen(exec_path), exe_name);
             os_strcpy(exec_path + os_strlen(exec_path), ".elf");
-            spawned = os_spawn_args(exec_path, (const char *const*)argv);
+            if (pfd[1] >= 0) {
+                spawned = os_spawn_stdio(exec_path, (const char *const*)argv, -1, pfd[1], pfd[1]);
+            } else {
+                spawned = os_spawn_args(exec_path, (const char *const*)argv);
+            }
             if (spawned < 0) {
                 /* Try "/<name>" */
                 os_strcpy(exec_path, "/");
                 os_strcpy(exec_path + os_strlen(exec_path), exe_name);
-                spawned = os_spawn_args(exec_path, (const char *const*)argv);
+                if (pfd[1] >= 0) {
+                    spawned = os_spawn_stdio(exec_path, (const char *const*)argv, -1, pfd[1], pfd[1]);
+                } else {
+                    spawned = os_spawn_args(exec_path, (const char *const*)argv);
+                }
             }
         }
 
@@ -678,12 +789,42 @@ static void execute_command(const char *cmd) {
             os_strcpy(ok_msg + os_strlen(ok_msg), exec_path);
             term_print_line(ok_msg, OS_COLOR_EMERALD_LT);
 
-            /* If foreground: wait for process to finish using os_waitpid */
+            /* If foreground: read stdout/stderr from pipe and wait for child */
             if (!run_bg) {
+                if (pfd[1] >= 0) {
+                    os_close(pfd[1]);
+                }
+                char pipe_buf[128];
+                char line_buf[128];
+                int lpos = 0;
+                ssize_t n;
+                while ((n = os_read_fd(pfd[0], pipe_buf, sizeof(pipe_buf))) > 0) {
+                    for (int i = 0; i < n; i++) {
+                        char c = pipe_buf[i];
+                        if (c == '\n') {
+                            line_buf[lpos] = 0;
+                            term_print_line(line_buf, OS_COLOR_SLATE_200);
+                            lpos = 0;
+                        } else if (c != '\r') {
+                            if (lpos < (int)sizeof(line_buf) - 1) {
+                                line_buf[lpos++] = c;
+                            }
+                        }
+                    }
+                }
+                if (lpos > 0) {
+                    line_buf[lpos] = 0;
+                    term_print_line(line_buf, OS_COLOR_SLATE_200);
+                }
+                if (pfd[0] >= 0) {
+                    os_close(pfd[0]);
+                }
                 int status = 0;
                 os_waitpid(spawned, &status, 0);
             }
         } else {
+            if (pfd[0] >= 0) os_close(pfd[0]);
+            if (pfd[1] >= 0) os_close(pfd[1]);
             char err[80];
             os_strcpy(err, "Command not found: '");
             os_strcpy(err + os_strlen(err), exe_name);
@@ -945,15 +1086,56 @@ static void draw_powerline_prompt(os_window_t *win, int start_x, int py, const c
         os_draw_text_mono_aa(win, input_start_x, py + 3, cmd_text, 0xFFFFFFFF);
     }
 
-    /* Very thin white vertical cursor '|' (2px wide, pure white / soft silver pulse) */
+    /* Smooth animated cursor (VS Code / Neovide style smooth caret physics & trail) */
     if (is_active) {
-        int cursor_x = input_start_x + input_len * OS_FONT_MONO_W;
+        int target_cx = input_start_x + input_len * OS_FONT_MONO_W;
+        int target_cy = py;
+
+        if (!anim_inited) {
+            anim_cur_x_fp = target_cx << 8;
+            anim_cur_y_fp = target_cy << 8;
+            anim_inited = 1;
+        }
+
+        int dx = (target_cx << 8) - anim_cur_x_fp;
+        int dy = (target_cy << 8) - anim_cur_y_fp;
+
+        if (dx > -32 && dx < 32) {
+            anim_cur_x_fp = target_cx << 8;
+        } else {
+            anim_cur_x_fp += (dx * 9) / 16;
+            anim_active = 1;
+        }
+
+        if (dy > -32 && dy < 32) {
+            anim_cur_y_fp = target_cy << 8;
+        } else {
+            anim_cur_y_fp += (dy * 9) / 16;
+            anim_active = 1;
+        }
+
+        int render_cx = anim_cur_x_fp >> 8;
+        int render_cy = anim_cur_y_fp >> 8;
+
+        int trail_x = render_cx;
+        int trail_w = 2;
+        if (dx > 256) {
+            int stretch = (dx >> 9);
+            if (stretch > 6) stretch = 6;
+            trail_x -= stretch;
+            trail_w += stretch;
+        } else if (dx < -256) {
+            int stretch = ((-dx) >> 9);
+            if (stretch > 6) stretch = 6;
+            trail_w += stretch;
+        }
+
         uint32_t cursor_clr = curr_blink_state ? 0xFFFFFFFF : 0xFFA0A0B0;
-        os_fill_rect(win, cursor_x, py + 2, 2, 16, cursor_clr);
+        os_fill_rect(win, trail_x, render_cy + 2, trail_w, 16, cursor_clr);
     }
 }
 
-/* Render complete terminal UI */
+/* Render complete terminal UI with smooth buffer scrolling */
 static void render_terminal(os_window_t *win) {
     int cw = win->client_w;
     int ch = win->client_h;
@@ -966,15 +1148,44 @@ static void render_terminal(os_window_t *win) {
     if (max_visible < 1) max_visible = 1;
     int start_r = (cur_row + 1 > max_visible) ? (cur_row + 1 - max_visible) : 0;
 
-    int y = TOP_H + 4;
-    for (int r = start_r; r < cur_row; r++) {
-        if (lines[r].is_prompt) {
-            draw_powerline_prompt(win, 14, y, lines[r].cwd, lines[r].time, lines[r].text, 0);
-        } else if (lines[r].text[0] != '\0') {
-            term_draw_line(win, 14, y, lines[r].text, lines[r].color);
+    static int last_start_r = 0;
+    if (start_r > last_start_r) {
+        int diff = start_r - last_start_r;
+        anim_scroll_y_fp += diff * (LINE_H << 8);
+        if (anim_scroll_y_fp > (LINE_H << 10)) anim_scroll_y_fp = (LINE_H << 10);
+        last_start_r = start_r;
+    } else if (start_r < last_start_r) {
+        last_start_r = start_r;
+        anim_scroll_y_fp = 0;
+    }
+
+    if (anim_scroll_y_fp > 0) {
+        int step = (anim_scroll_y_fp * 7) / 16;
+        if (step < 32) step = anim_scroll_y_fp;
+        anim_scroll_y_fp -= step;
+        anim_active = 1;
+    }
+
+    int scroll_offset = anim_scroll_y_fp >> 8;
+    int render_start_r = start_r;
+    if (scroll_offset > 0 && render_start_r > 0) {
+        render_start_r--;
+    }
+
+    int y = TOP_H + 4 - scroll_offset;
+    for (int r = render_start_r; r < cur_row; r++) {
+        if (y + LINE_H > TOP_H && y < ch - BOT_H) {
+            if (lines[r].is_prompt) {
+                draw_powerline_prompt(win, 14, y, lines[r].cwd, lines[r].time, lines[r].text, 0);
+            } else if (lines[r].text[0] != '\0') {
+                term_draw_line(win, 14, y, lines[r].text, lines[r].color);
+            }
         }
         y += LINE_H;
     }
+
+    /* Top padding strip cleans up any scrolled line content above header */
+    os_fill_rect(win, 0, 0, cw, TOP_H + 2, 0xFF181825);
 
     /* 3. Current Active Prompt Line with Pastel Powerline Interlocking Chevron Ribbon */
     if (y + LINE_H <= ch - BOT_H + 8) {
@@ -1036,6 +1247,11 @@ int main(int argc, char **argv) {
             needs_redraw = 1;
         }
 
+        if (anim_active) {
+            needs_redraw = 1;
+            anim_active = 0;
+        }
+
         while (os_poll_event(&win, &ev)) {
             needs_redraw = 1;
             blink_cnt = 0;
@@ -1055,6 +1271,7 @@ int main(int argc, char **argv) {
                 blink_cnt = 0;
                 curr_blink_state = 1;
             } else if (ev.type == OS_EVENT_KEY_DOWN) {
+                anim_active = 1;
                 uint32_t key = ev.param;
                 if (key == 10 || key == 13) {
                     /* Enter: commit command with full Powerline prompt preservation */
@@ -1066,6 +1283,7 @@ int main(int argc, char **argv) {
                     input_buf[0] = '\0';
 
                     execute_command(cmd_copy);
+                    needs_redraw = 1;
                 } else if (key == 8) {
                     /* Backspace */
                     if (input_len > 0) {

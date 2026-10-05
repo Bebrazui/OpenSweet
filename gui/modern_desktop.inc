@@ -13,11 +13,15 @@ MD_TERM_COLS = 64
 
 ; State Variables
 align 16
-md_mouse_x      dd 512
-md_mouse_y      dd 384
-md_mouse_prev_x dd 0
-md_mouse_prev_y dd 0
-md_term_dirty   db 1
+md_mouse_x        dd 512
+md_mouse_y        dd 384
+md_mouse_prev_x   dd 0
+md_mouse_prev_y   dd 0
+md_mouse_fp_x     dd (512 shl 16)
+md_mouse_fp_y     dd (384 shl 16)
+md_mouse_vx       dd 0
+md_mouse_vy       dd 0
+md_term_dirty     db 1
 
 md_dock_x       dd 800
 md_dock_y       dd 996

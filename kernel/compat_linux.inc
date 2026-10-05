@@ -1,0 +1,659 @@
+; ==============================================================================
+; Opensweet OS - Linux ABI Compatibility Layer (kernel/compat_linux.inc)
+; Provides drop-in modular binary compatibility for Linux x86_64 executables.
+; Can be fully toggled via CONFIG_LINUX_COMPAT.
+; ==============================================================================
+
+CONFIG_LINUX_COMPAT = 1
+
+; Linux x86_64 Syscall Numbers
+LINUX_SYS_READ        = 0
+LINUX_SYS_WRITE       = 1
+LINUX_SYS_OPEN        = 2
+LINUX_SYS_CLOSE       = 3
+LINUX_SYS_STAT        = 4
+LINUX_SYS_FSTAT       = 5
+LINUX_SYS_LSTAT       = 6
+LINUX_SYS_POLL        = 7
+LINUX_SYS_LSEEK       = 8
+LINUX_SYS_MMAP        = 9
+LINUX_SYS_MPROTECT    = 10
+LINUX_SYS_MUNMAP      = 11
+LINUX_SYS_BRK         = 12
+LINUX_SYS_IOCTL       = 16
+LINUX_SYS_WRITEV      = 20
+LINUX_SYS_ACCESS      = 21
+LINUX_SYS_PIPE        = 22
+LINUX_SYS_DUP         = 32
+LINUX_SYS_DUP2        = 33
+LINUX_SYS_NANOSLEEP   = 35
+LINUX_SYS_GETPID      = 39
+LINUX_SYS_CLONE       = 56
+LINUX_SYS_FORK        = 57
+LINUX_SYS_EXECVE      = 59
+LINUX_SYS_EXIT        = 60
+LINUX_SYS_WAIT4       = 61
+LINUX_SYS_UNAME       = 63
+LINUX_SYS_FCNTL       = 72
+LINUX_SYS_GETCWD      = 79
+LINUX_SYS_CHDIR       = 80
+LINUX_SYS_MKDIR       = 83
+LINUX_SYS_RMDIR       = 84
+LINUX_SYS_UNLINK      = 87
+LINUX_SYS_GETUID      = 102
+LINUX_SYS_GETGID      = 104
+LINUX_SYS_GETEUID     = 107
+LINUX_SYS_GETEGID     = 108
+LINUX_SYS_ARCH_PRCTL  = 158
+LINUX_SYS_GETTID      = 186
+LINUX_SYS_FUTEX       = 202
+LINUX_SYS_SET_TID_ADDR= 218
+LINUX_SYS_EXIT_GROUP  = 231
+LINUX_SYS_OPENAT      = 257
+LINUX_SYS_MKDIRAT     = 258
+LINUX_SYS_UNLINKAT    = 263
+
+; Linux Error Codes (negative return values in RAX)
+LINUX_EPERM   = -1
+LINUX_ENOENT  = -2
+LINUX_ESRCH   = -3
+LINUX_EINTR   = -4
+LINUX_EIO     = -5
+LINUX_EBADF   = -9
+LINUX_ENOMEM  = -12
+LINUX_EACCES  = -13
+LINUX_EFAULT  = -14
+LINUX_EEXIST  = -17
+LINUX_ENODEV  = -19
+LINUX_ENOTDIR = -20
+LINUX_EISDIR  = -21
+LINUX_EINVAL  = -22
+LINUX_ENFILE  = -23
+LINUX_EMFILE  = -24
+LINUX_ENOTTY = -25
+LINUX_EPIPE  = -32
+LINUX_ENOSYS  = -38
+
+; ==============================================================================
+; linux_syscall_dispatch: Dispatch Linux x86_64 syscall
+; In: RAX = syscall number
+;     RDI = arg1, RSI = arg2, RDX = arg3, R10 = arg4, R8 = arg5, R9 = arg6
+; Out: RAX = result code (or negative error code)
+; ==============================================================================
+align 16
+linux_syscall_dispatch:
+    push rax
+    push rsi
+    lea rsi, [r15 + str_l_call_log - kmain]
+    call puts
+    mov rax, [rsp + 8]
+    call putdec64
+    mov al, 10
+    call putc
+    pop rsi
+    pop rax
+    cmp eax, LINUX_SYS_READ
+    je .l_read
+    cmp eax, LINUX_SYS_POLL
+    je .l_poll
+    cmp eax, LINUX_SYS_WRITE
+    je .l_write
+    cmp eax, LINUX_SYS_WRITEV
+    je .l_writev
+    cmp eax, LINUX_SYS_IOCTL
+    je .l_ioctl
+    cmp eax, LINUX_SYS_OPEN
+    je .l_open
+    cmp eax, LINUX_SYS_CLOSE
+    je .l_close
+    cmp eax, LINUX_SYS_LSEEK
+    je .l_lseek
+    cmp eax, LINUX_SYS_MMAP
+    je .l_mmap
+    cmp eax, LINUX_SYS_MUNMAP
+    je .l_munmap
+    cmp eax, LINUX_SYS_MPROTECT
+    je .l_mprotect
+    cmp eax, LINUX_SYS_BRK
+    je .l_brk
+    cmp eax, LINUX_SYS_DUP2
+    je .l_dup2
+    cmp eax, LINUX_SYS_GETPID
+    je .l_getpid
+    cmp eax, LINUX_SYS_EXIT
+    je .l_exit
+    cmp eax, LINUX_SYS_EXIT_GROUP
+    je .l_exit
+    cmp eax, LINUX_SYS_UNAME
+    je .l_uname
+    cmp eax, LINUX_SYS_GETCWD
+    je .l_getcwd
+    cmp eax, LINUX_SYS_CHDIR
+    je .l_chdir
+    cmp eax, LINUX_SYS_MKDIR
+    je .l_mkdir
+    cmp eax, LINUX_SYS_RMDIR
+    je .l_rmdir
+    cmp eax, LINUX_SYS_UNLINK
+    je .l_unlink
+    cmp eax, LINUX_SYS_ARCH_PRCTL
+    je .l_arch_prctl
+    cmp eax, LINUX_SYS_SET_TID_ADDR
+    je .l_set_tid_address
+    cmp eax, LINUX_SYS_GETUID
+    je .l_zero_id
+    cmp eax, LINUX_SYS_GETGID
+    je .l_zero_id
+    cmp eax, LINUX_SYS_GETEUID
+    je .l_zero_id
+    cmp eax, LINUX_SYS_GETEGID
+    je .l_zero_id
+
+    ; Unhandled Linux syscall: log to serial and return -ENOSYS
+    push rax
+    push rsi
+    lea rsi, [r15 + str_l_unimpl - kmain]
+    call puts
+    mov rax, [rsp + 8]
+    call putdec64
+    mov al, 10
+    call putc
+    pop rsi
+    pop rax
+    mov rax, LINUX_ENOSYS
+    ret
+
+.l_read:
+    ; RDI = fd, RSI = buf, RDX = count
+    call vfs_read_fd
+    cmp rax, -1
+    jne .l_read_ret
+    mov eax, [r15 + vfs_last_err - kmain]   ; positive errno from vfs
+    neg rax                                 ; Linux ABI wants -errno
+.l_read_ret:
+    ret
+
+.l_write:
+    ; RDI = fd, RSI = buf, RDX = count
+    call vfs_write_fd
+    cmp rax, -1
+    jne .l_write_ret
+    mov eax, [r15 + vfs_last_err - kmain]   ; positive errno from vfs
+    neg rax                                 ; Linux ABI wants -errno
+.l_write_ret:
+    ret
+
+.l_writev:
+    ; RDI = fd, RSI = const struct iovec *iov, RDX = int iovcnt
+    push rbx
+    push r12
+    push r13
+    push r14
+    push rbp
+    mov r12, rdi                ; r12 = fd
+    mov r13, rsi                ; r13 = iov
+    mov r14, rdx                ; r14 = iovcnt
+    xor ebp, ebp                ; ebp = total written
+    ; H-L6: zero count = zero bytes, clamp iovcnt and validate the iovec array
+    test r14, r14
+    jz .l_wv_done
+    cmp r14, 1024               ; IOV_MAX clamp (no r14*16 overflow)
+    ja .l_wv_einval
+    mov rdi, r13
+    mov rsi, r14
+    shl rsi, 4                  ; iovcnt * sizeof(struct iovec)
+    call sys_validate_user_ptr
+    jc .l_wv_efault
+.l_wv_loop:
+    test r14, r14
+    jz .l_wv_done
+    mov rdi, r12                ; fd
+    mov rsi, [r13 + 0]          ; iov_base
+    mov rdx, [r13 + 8]          ; iov_len
+    test rdx, rdx
+    jz .l_wv_next
+    call vfs_write_fd
+    test rax, rax
+    js .l_wv_err
+    add rbp, rax
+.l_wv_next:
+    add r13, 16                 ; sizeof(struct iovec) = 16
+    dec r14
+    jmp .l_wv_loop
+.l_wv_done:
+    mov rax, rbp
+    pop rbp
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.l_wv_err:
+    test rbp, rbp
+    jnz .l_wv_done
+    mov eax, [r15 + vfs_last_err - kmain]   ; positive errno from vfs
+    neg rax                                 ; Linux ABI wants -errno
+    pop rbp
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.l_wv_einval:
+    mov rax, LINUX_EINVAL
+    jmp .l_wv_pop
+.l_wv_efault:
+    mov rax, LINUX_EFAULT
+.l_wv_pop:
+    pop rbp
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+.l_ioctl:
+    ; RDI = fd, RSI = request, RDX = arg
+    ; For TIOCGWINSZ (0x5413), fill 80x25 or return ENOTTY (-25)
+    mov rax, -25                ; -ENOTTY
+    ret
+
+.l_open:
+    ; RDI = pathname, RSI = flags, RDX = mode
+    call vfs_open
+    ret
+
+.l_close:
+    ; RDI = fd
+    call vfs_close
+    cmp rax, -1
+    jne .l_close_ret
+    mov rax, LINUX_EBADF                   ; vfs_close only fails on a bad fd
+.l_close_ret:
+    ret
+
+.l_lseek:
+    ; RDI = fd, RSI = offset, RDX = whence
+    call vfs_lseek
+    ret
+
+.l_brk:
+    ; RDI = new brk
+    call sys_handler_brk
+    ret
+
+.l_dup2:
+    ; RDI = oldfd, RSI = newfd
+    call vfs_dup2
+    ret
+
+.l_getpid:
+    mov eax, [r15 + sched_curr_task - kmain]
+    inc eax                     ; 1-based PID
+    ret
+
+.l_exit:
+    ; RDI = exit code
+    push rdi
+    lea rsi, [r15 + str_l_exit_log - kmain]
+    call puts
+    pop rdi
+    mov rax, rdi
+    call putdec64
+    mov al, 10
+    call putc
+    call task_exit
+    ret
+
+.l_uname:
+    ; RDI = struct utsname pointer (65 bytes per field: sysname, nodename, release, version, machine)
+    test rdi, rdi
+    jz .l_uname_err
+    push rdi
+    push rcx
+    push rax
+    ; C-L3: validate the full 390-byte output range before writing
+    mov rsi, 390
+    call sys_validate_user_ptr
+    jc .l_uname_bad
+    ; Zero out 390 bytes (6 * 65)
+    mov rcx, 390 / 8
+    xor eax, eax
+    rep stosq
+    pop rax
+    pop rcx
+    pop rdi
+
+    ; sysname: "Linux"
+    mov dword [rdi + 0], 'Linu'
+    mov byte  [rdi + 4], 'x'
+    ; nodename: "opensweet"
+    mov dword [rdi + 65], 'open'
+    mov dword [rdi + 69], 'swee'
+    mov byte  [rdi + 73], 't'
+    ; release: "6.1.0-opensweet"
+    mov dword [rdi + 130], '6.1.'
+    mov dword [rdi + 134], '0-op'
+    mov dword [rdi + 138], 'ensw'
+    mov word  [rdi + 142], 'ee'
+    mov byte  [rdi + 144], 't'
+    ; machine: "x86_64"
+    mov dword [rdi + 260], 'x86_'
+    mov word  [rdi + 264], '64'
+    xor eax, eax
+    ret
+.l_uname_bad:
+    pop rax
+    pop rcx
+    pop rdi
+    jmp .l_uname_err
+.l_uname_err:
+    mov rax, LINUX_EFAULT
+    ret
+
+.l_getcwd:
+    ; RDI = buf, RSI = size
+    call sys_handler_getcwd
+    ret
+
+.l_chdir:
+    ; RDI = path
+    call sys_handler_chdir
+    ret
+
+.l_mkdir:
+    ; RDI = path, RSI = mode
+    call sys_handler_mkdir
+    ret
+
+.l_rmdir:
+    ; RDI = path
+    call sys_handler_rmdir
+    ret
+
+.l_unlink:
+    ; RDI = path
+    call sys_handler_unlink
+    ret
+
+.l_arch_prctl:
+    ; RDI = code (ARCH_SET_FS = 0x1002, ARCH_GET_FS = 0x1003)
+    ; RSI = address
+    cmp edi, 0x1002             ; ARCH_SET_FS
+    je .l_set_fs
+    cmp edi, 0x1003             ; ARCH_GET_FS
+    je .l_get_fs
+    mov rax, LINUX_EINVAL
+    ret
+
+.l_set_fs:
+    ; Update current task's TCB_FS_BASE and write MSR 0xC0000100
+    push rdx
+    push rcx
+    push rbx
+    push rax
+    mov eax, [r15 + sched_curr_task - kmain]
+    imul eax, TCB_SIZE
+    lea rbx, [r15 + task_table - kmain + rax]
+    mov [rbx + TCB_FS_BASE], rsi
+    pop rax
+    pop rbx
+
+    mov rax, rsi
+    mov rdx, rsi
+    shr rdx, 32
+    mov ecx, 0xC0000100         ; IA32_FS_BASE
+    wrmsr
+    pop rcx
+    pop rdx
+    xor eax, eax
+    ret
+
+.l_get_fs:
+    ; C-L4: validate the 8-byte out-pointer before writing
+    test rsi, rsi
+    jz .l_uname_err
+    push rdx
+    push rcx
+    push rsi                       ; save user address
+    mov rdi, rsi
+    mov rsi, 8
+    call sys_validate_user_ptr
+    jc .l_get_fs_bad
+    mov ecx, 0xC0000100
+    rdmsr
+    shl rdx, 32
+    or rax, rdx
+    pop rdi                        ; user address
+    mov [rdi], rax
+    pop rcx
+    pop rdx
+    xor eax, eax
+    ret
+.l_get_fs_bad:
+    pop rsi
+    pop rcx
+    pop rdx
+    jmp .l_uname_err
+
+
+; Global allocator pointer for anonymous mmap (0x20000000 = 512MB)
+
+.l_mprotect:
+    ; Mock mprotect: always succeed
+    xor eax, eax
+    ret
+
+.l_mmap:
+    ; Linux x86_64 mmap(addr=RDI, length=RSI, prot=RDX, flags=R10, fd=R8, offset=R9)
+    ; Validate length
+    test rsi, rsi
+    jz .l_mmap_einval
+    cmp rsi, 0x20000000             ; C-L1: cap length at the zone size (512MB)
+    ja .l_mmap_einval
+
+    ; Loop over length in 4KB pages and map with vmm_map
+    push r12
+    push r13
+    push r14
+    push r15
+    push rbx
+
+    xor r14d, r14d                  ; r14 = bump-mode flag (addr == 0)
+    test rdi, rdi
+    jnz .l_mmap_base_ok
+    mov rdi, [r15 + linux_mmap_next - kmain]
+    inc r14d
+.l_mmap_base_ok:
+    ; Align addr to 4KB
+    and rdi, -4096
+    ; C-L1: only the managed Linux zone [0x20000000, 0x40000000) may be mapped.
+    ; Rejects kernel/identity addresses, code/stack/heap slots and zone overflow.
+    cmp rdi, 0x20000000
+    jb .l_mmap_einval_p
+    mov rax, rsi
+    add rax, 0xFFF
+    and rax, -4096                  ; page-rounded length
+    add rax, rdi                    ; base + rounded length
+    jc .l_mmap_einval_p             ; addr + len overflow
+    cmp rax, 0x40000000
+    ja .l_mmap_einval_p             ; runs past the zone end
+
+    mov rbx, rdi                ; rbx = original virt base address
+    mov r12, rdi                ; r12 = current virt addr
+    mov r13, rsi                ; r13 = remaining length
+    mov r15, 0xFFFF800000010000
+
+.l_mmap_page_loop:
+    test r13, r13
+    jz .l_mmap_done
+
+    ; Allocate zeroed physical page
+    call pmm_alloc_zero
+    test rax, rax
+    jz .l_mmap_enomem
+
+    ; Map virtual page r12 to physical page rax
+    ; Flags: Present (1) | Writable (2) | User (4) = 7
+    mov rdi, r12
+    mov r11b, 7
+    call vmm_map
+
+    add r12, 4096
+    sub r13, 4096
+    ja .l_mmap_page_loop
+
+.l_mmap_done:
+    test r14d, r14d
+    jz .l_mmap_ret
+    ; Bump mode only: commit [base, r12) now that every page is mapped, so a
+    ; failed mapping can never leave linux_mmap_next past half-mapped VA.
+    mov rax, r12
+    sub rax, rbx
+    add [r15 + linux_mmap_next - kmain], rax
+.l_mmap_ret:
+    mov rax, rbx                ; Return original base in RAX
+    pop rbx
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    ret
+
+.l_mmap_enomem:
+    ; Roll back pages already mapped in [rbx, r12): unmap them and give the
+    ; physical pages back to the PMM (no leak, no VA reserved for a mapping
+    ; that never happened).
+    mov r14, rbx
+.l_mmap_rb:
+    cmp r14, r12
+    jae .l_mmap_rb_done
+    mov rdi, r14
+    call vmm_unmap                 ; RAX = physical page (0 = nothing)
+    test rax, rax
+    jz .l_mmap_rb_next
+    cmp rax, 0x10000000            ; only PMM pages (bitmap range) get freed;
+    jae .l_mmap_rb_next            ; identity zone pages are not ours to free
+    mov rdi, rax
+    call pmm_free
+.l_mmap_rb_next:
+    add r14, 4096
+    jmp .l_mmap_rb
+.l_mmap_rb_done:
+    pop rbx
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    mov rax, LINUX_ENOMEM
+    ret
+
+.l_mmap_einval_p:
+    pop rbx
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+.l_mmap_einval:
+    mov rax, LINUX_EINVAL
+    ret
+
+.l_munmap:
+    ; Linux x86_64 munmap(addr=RDI, length=RSI)
+    test rsi, rsi
+    jz .l_munmap_done
+    and rdi, -4096
+    ; C-L2: only the managed Linux mmap zone [0x20000000, 0x40000000) may be
+    ; unmapped; never kernel tables, identity map or the task's own code/stack.
+    cmp rdi, 0x20000000
+    jb .l_munmap_einval
+    mov rax, rdi
+    add rax, rsi
+    jc .l_munmap_einval
+    cmp rax, 0x40000000
+    ja .l_munmap_einval
+    push r12
+    push r13
+    mov r12, rdi
+    mov r13, rsi
+.l_munmap_loop:
+    test r13, r13
+    jz .l_munmap_pop
+    mov rdi, r12
+    call vmm_unmap                 ; RAX = physical page that was mapped
+    test rax, rax
+    jz .l_munmap_next
+    ; PMM pages all live below 0x10000000 (8KB bitmap -> 256MB); pages that
+    ; merely carry the identity map of the zone (phys >= 0x20000000) are not
+    ; ours and must never reach pmm_free (it would scribble past the bitmap).
+    cmp rax, 0x10000000
+    jae .l_munmap_next
+    mov rdi, rax
+    call pmm_free
+.l_munmap_next:
+    add r12, 4096
+    sub r13, 4096
+    ja .l_munmap_loop
+.l_munmap_pop:
+    pop r13
+    pop r12
+.l_munmap_done:
+    xor eax, eax
+    ret
+.l_munmap_einval:
+    mov rax, LINUX_EINVAL
+    ret
+
+.l_set_tid_address:
+    ; RDI = tidptr (mock: return current PID)
+    mov eax, [r15 + sched_curr_task - kmain]
+    inc eax
+    ret
+
+.l_zero_id:
+    xor eax, eax
+    ret
+
+.l_poll:
+    ; struct pollfd *fds = RDI, nfds_t nfds = RSI, int timeout = RDX
+    ; Mock: each fd is ready for POLLIN | POLLOUT (revents = events)
+    test rdi, rdi
+    jz .poll_ret_zero
+    test rsi, rsi
+    jz .poll_ret_zero
+    ; C-L5: clamp nfds and validate the whole pollfd array (nfds * 8 bytes)
+    cmp rsi, 4096
+    ja .poll_einval
+    push rsi
+    shl rsi, 3                   ; nfds * sizeof(struct pollfd)
+    call sys_validate_user_ptr
+    pop rsi
+    jc .poll_efault
+    mov rcx, rsi
+    xor r8, r8                  ; r8 = ready count
+.poll_loop:
+    mov ax, [rdi + 4]           ; events
+    mov [rdi + 6], ax           ; revents = events
+    inc r8
+    add rdi, 8                  ; sizeof(struct pollfd) = 8
+    dec rcx
+    jnz .poll_loop
+    mov rax, r8
+    ret
+.poll_ret_zero:
+    xor eax, eax
+    ret
+.poll_einval:
+    mov rax, LINUX_EINVAL
+    ret
+.poll_efault:
+    mov rax, LINUX_EFAULT
+    ret
+
+str_l_unimpl db "[Linux ABI] Unhandled syscall: #", 0
+str_l_call_log db "[Linux ABI] Call: #", 0
+str_l_fb_log db "[Linux ABI] fallback: #", 0
+str_l_exit_log db "[Linux ABI] Exit with code: ", 0
+
+align 8
+linux_mmap_next dq 0x20000000

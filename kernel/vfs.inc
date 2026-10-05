@@ -110,6 +110,8 @@ vfs_get_fd_ptr:
 ; Returns: EAX = fd (3..15), or -1 on error
 ; ==============================================================================
 vfs_open:
+    pushfq
+    cli
     push rbx
     push rcx
     push rdx
@@ -169,14 +171,8 @@ vfs_open:
     mov byte [rdx], 0
 .cp_p_done:
 
-    ; Skip leading '/'
-    lea rsi, [rsp]
-    cmp byte [rsi], '/'
-    jne @f
-    inc rsi
-@@:
-
     ; Check if file exists in ext4
+    lea rsi, [rsp]
     call ext4_lookup
     test eax, eax
     jnz .have_inode
@@ -186,6 +182,7 @@ vfs_open:
     jz .open_fail
 
     ; Create new file
+    lea rsi, [rsp]
     call ext4_create_file
     cmp eax, -1
     je .open_fail
@@ -201,10 +198,15 @@ vfs_open:
     mov rax, qword [r15 + ext4_inode - kmain + IN_OFF_SIZE]
     mov dword [r14 + 8], eax            ; file size
 
-    ; Check O_TRUNC (0x200): reset size to 0
+    ; Check O_TRUNC (0x200): truncate file to 0 on disk
     test r13d, O_TRUNC
     jz @f
-    mov dword [r14 + 8], 0
+    push rax
+    movzx eax, word [r14 + 2]           ; inode
+    xor edx, edx                        ; new size = 0
+    call ext4_truncate_file
+    pop rax
+    mov dword [r14 + 8], 0              ; reset cached size
 @@:
 
     ; Initial offset: 0 (or size if O_APPEND)
@@ -231,6 +233,7 @@ vfs_open:
     pop rdx
     pop rcx
     pop rbx
+    popfq
     ret
 
 .open_fail:
@@ -244,6 +247,7 @@ vfs_open:
     pop rdx
     pop rcx
     pop rbx
+    popfq
     mov rax, -1
     ret
 
@@ -253,6 +257,8 @@ vfs_open:
 ; Returns: EAX = 0 on success, -1 on error
 ; ==============================================================================
 vfs_close:
+    pushfq
+    cli
     cmp edi, MAX_FDS_PER_TASK
     jae .close_err
 
@@ -292,13 +298,16 @@ vfs_close:
 .close_normal:
     mov byte [rax + 0], FD_TYPE_UNUSED
     xor eax, eax
+    popfq
     ret
 
 .close_ok:
     xor eax, eax
+    popfq
     ret
 
 .close_err:
+    popfq
     mov rax, -1
     ret
 
@@ -308,6 +317,8 @@ vfs_close:
 ; Returns: RAX = new offset, or -1 on error
 ; ==============================================================================
 vfs_lseek:
+    pushfq
+    cli
     push rbx
     call vfs_get_fd_ptr
     test rax, rax
@@ -343,12 +354,21 @@ vfs_lseek:
     js .lseek_err                       ; negative offset not allowed
     mov [rbx + 4], eax                  ; update offset
     pop rbx
+    popfq
     ret
 
 .lseek_err:
     pop rbx
+    popfq
     mov rax, -1
     ret
+
+; ==============================================================================
+; Last failure code of vfs_read_fd/vfs_write_fd: a *positive* POSIX errno
+; (EBADF, EFAULT, EPIPE, EIO).  The Linux compat layer negates it into the
+; -errno form ring3 expects; native syscalls keep returning plain -1.
+; ==============================================================================
+vfs_last_err: dd 5
 
 ; ==============================================================================
 ; vfs_read_fd: Read bytes from fd
@@ -356,21 +376,46 @@ vfs_lseek:
 ; Returns: RAX = bytes read, 0 on EOF, -1 on error
 ; ==============================================================================
 vfs_read_fd:
+    pushfq
+    cli
     push rbx
     push rcx
     push rdx
     push rsi
     push rdi
 
+    ; Fast path for count == 0
+    test rdx, rdx
+    jz .rfd_zero
+
+    ; Clamp count to max 64KB (65536)
+    cmp rdx, 65536
+    jbe @f
+    mov rdx, 65536
+@@:
+
+    ; Validate user buffer [rsi .. rsi + rdx]
+    push rdi
+    push rsi
+    mov rdi, rsi                        ; rdi = user buffer
+    mov rsi, rdx                        ; rsi = count
+    call sys_validate_user_ptr
+    pop rsi
+    pop rdi
+    jc .rfd_err_fault
+
     call vfs_get_fd_ptr
     test rax, rax
-    jz .rfd_err
+    jz .rfd_err_badfd
 
     mov rbx, rax                        ; rbx = fd_entry
 
     cmp byte [rbx + 0], FD_TYPE_CONSOLE
     jne @f
+    popfq                               ; restore IF for console read
     call sys_handler_read
+    pushfq
+    cli
     jmp .rfd_done
 @@:
 
@@ -378,7 +423,7 @@ vfs_read_fd:
     je .rfd_pipe
 
     cmp byte [rbx + 0], FD_TYPE_FILE
-    jne .rfd_err
+    jne .rfd_err_badfd
 
     ; Check EOF
     mov eax, [rbx + 4]                  ; current offset
@@ -395,41 +440,41 @@ vfs_read_fd:
     test rdx, rdx
     jz .rfd_eof
 
-    ; Read chunk using ext4
-    movzx eax, word [rbx + 2]           ; inode
-    call ext4_inode_load
-    jc .rfd_err
-
-    ; Read file content into user buffer
+    ; Read chunk using ext4_read_file_chunk_inode starting from file offset [rbx + 4]
     push rsi
     push rdx
     mov rdi, rsi                        ; rdi = user buffer
-    mov rcx, rdx                        ; rcx = max bytes
-    lea rsi, [rbx + 12]                 ; rsi = file path from fd_entry (+12)
-    call ext4_read_file_to_mem          ; reads into memory buffer
+    mov rcx, rdx                        ; rcx = max bytes to read
+    mov edx, [rbx + 4]                  ; rdx = current file offset
+    movzx eax, word [rbx + 2]           ; eax = file inode from fd_entry (+2)
+    call ext4_read_file_chunk_inode     ; reads chunk starting at offset rdx directly by inode
     pop rdx
     pop rsi
-    jc .rfd_err
+    jc .rfd_err_io
 
-    ; Advance offset
+    ; Advance offset by bytes actually read
     add [rbx + 4], eax
     jmp .rfd_done
 
 .rfd_pipe:
     movzx eax, word [rbx + 2]
     cmp eax, MAX_PIPES
-    jae .rfd_err
+    jae .rfd_err_badfd
     imul eax, eax, PIPE_STRUCT_SIZE
     lea r8, [r15 + pipe_table - kmain + rax]
 
     mov ecx, [r8 + 8]
     test ecx, ecx
     jnz .rfd_p_data
-    ; Buffer empty: if writers == 0 -> EOF
+    ; Buffer empty: writers == 0 -> EOF
     cmp word [r8 + 14], 0
     je .rfd_eof
-    xor eax, eax
-    jmp .rfd_done
+    ; Empty pipe with live writers: POSIX read blocks until data or EOF
+    sti
+    mov ecx, 2
+    call task_sleep           ; preserves rax/rbx; context switch preserves the rest
+    cli
+    jmp .rfd_pipe
 
 .rfd_p_data:
     cmp rdx, rcx
@@ -459,10 +504,22 @@ vfs_read_fd:
     mov rax, rdx
     jmp .rfd_done
 
+.rfd_zero:
+    xor eax, eax
+    jmp .rfd_done
+
 .rfd_eof:
     xor eax, eax
     jmp .rfd_done
 
+.rfd_err_fault:
+    mov dword [r15 + vfs_last_err - kmain], 14      ; EFAULT
+    jmp .rfd_err
+.rfd_err_badfd:
+    mov dword [r15 + vfs_last_err - kmain], 9       ; EBADF
+    jmp .rfd_err
+.rfd_err_io:
+    mov dword [r15 + vfs_last_err - kmain], 5       ; EIO
 .rfd_err:
     mov rax, -1
 
@@ -472,6 +529,7 @@ vfs_read_fd:
     pop rdx
     pop rcx
     pop rbx
+    popfq
     ret
 
 ; ==============================================================================
@@ -480,16 +538,37 @@ vfs_read_fd:
 ; Returns: RAX = bytes written, -1 on error
 ; ==============================================================================
 vfs_write_fd:
+    pushfq
+    cli
     push rbx
     push rcx
     push rdx
     push rsi
     push rdi
 
+    ; Fast path for count == 0
+    test rdx, rdx
+    jz .wfd_zero
+
+    ; Clamp count to max 64KB (65536)
+    cmp rdx, 65536
+    jbe @f
+    mov rdx, 65536
+@@:
+
+    ; Validate user buffer [rsi .. rsi + rdx]
+    push rdi
+    push rsi
+    mov rdi, rsi                        ; rdi = user buffer
+    mov rsi, rdx                        ; rsi = count
+    call sys_validate_user_ptr
+    pop rsi
+    pop rdi
+    jc .wfd_err_fault
+
     call vfs_get_fd_ptr
     test rax, rax
-    jz .wfd_err
-
+    jz .wfd_err_badfd
     mov rbx, rax
 
     cmp byte [rbx + 0], FD_TYPE_CONSOLE
@@ -502,13 +581,17 @@ vfs_write_fd:
     je .wfd_pipe
 
     cmp byte [rbx + 0], FD_TYPE_FILE
-    jne .wfd_err
+    jne .wfd_err_badfd
 
-    ; Write via ext4_write_file
+    ; Write via ext4_write_file_chunk at current offset [rbx + 4]
+    push rdx                            ; rdx = count
     movzx eax, word [rbx + 2]           ; inode
-    call ext4_write_file
+    mov edx, [rbx + 4]                  ; current file offset
+    pop rcx                             ; rcx = count
+    ; rsi = user buffer
+    call ext4_write_file_chunk
     cmp rax, -1
-    je .wfd_err
+    je .wfd_err_io
 
     ; Advance offset and size
     add [rbx + 4], eax
@@ -522,18 +605,26 @@ vfs_write_fd:
 .wfd_pipe:
     movzx eax, word [rbx + 2]
     cmp eax, MAX_PIPES
-    jae .wfd_err
+    jae .wfd_err_badfd
     imul eax, eax, PIPE_STRUCT_SIZE
     lea r8, [r15 + pipe_table - kmain + rax]
 
+    ; POSIX: write blocks while the buffer is full and fails only when the
+    ; readers are gone (was: a full pipe returned 0, which makes
+    ; busybox-style full_write loops spin forever).
+.wfd_p_wait:
     cmp word [r8 + 12], 0              ; any readers left?
-    je .wfd_err
-
+    je .wfd_err_epipe
     mov ecx, PIPE_BUF_SIZE
     sub ecx, [r8 + 8]
     test ecx, ecx
-    jle .wfd_pipe_full
-
+    jg .wfd_p_room
+    sti                                 ; full: sleep until the reader drains
+    mov ecx, 2
+    call task_sleep                     ; preserves rax/rbx; ctx switch the rest
+    cli
+    jmp .wfd_p_wait
+.wfd_p_room:
     cmp rdx, rcx
     jbe @f
     mov rdx, rcx
@@ -561,10 +652,21 @@ vfs_write_fd:
     mov rax, rdx
     jmp .wfd_done
 
-.wfd_pipe_full:
+.wfd_zero:
     xor eax, eax
     jmp .wfd_done
 
+.wfd_err_epipe:
+    mov dword [r15 + vfs_last_err - kmain], 32      ; EPIPE
+    jmp .wfd_err
+.wfd_err_fault:
+    mov dword [r15 + vfs_last_err - kmain], 14      ; EFAULT
+    jmp .wfd_err
+.wfd_err_badfd:
+    mov dword [r15 + vfs_last_err - kmain], 9       ; EBADF
+    jmp .wfd_err
+.wfd_err_io:
+    mov dword [r15 + vfs_last_err - kmain], 5       ; EIO
 .wfd_err:
     mov rax, -1
 
@@ -574,6 +676,7 @@ vfs_write_fd:
     pop rdx
     pop rcx
     pop rbx
+    popfq
     ret
 
 ; ==============================================================================
@@ -582,6 +685,8 @@ vfs_write_fd:
 ; Returns: EAX = 0 on success, -1 on error
 ; ==============================================================================
 vfs_pipe:
+    pushfq
+    cli
     push rbx
     push rcx
     push rdx
@@ -691,6 +796,7 @@ vfs_pipe:
     pop rdx
     pop rcx
     pop rbx
+    popfq
     ret
 
 ; ==============================================================================
@@ -699,6 +805,8 @@ vfs_pipe:
 ; Returns: EAX = newfd, or -1 on error
 ; ==============================================================================
 vfs_dup2:
+    pushfq
+    cli
     push rbx
     push rcx
     push rdx
@@ -770,6 +878,7 @@ vfs_dup2:
     pop rdx
     pop rcx
     pop rbx
+    popfq
     ret
 
 ; ==============================================================================
@@ -782,7 +891,28 @@ vfs_cleanup_task_fds:
 .clean_loop:
     cmp edi, MAX_FDS_PER_TASK
     jae .clean_done
-    call vfs_close
+    ; If it is a pipe, decrement pipe refcount
+    call vfs_get_fd_ptr
+    test rax, rax
+    jz .clean_next
+    cmp byte [rax + 0], FD_TYPE_PIPE
+    jne @f
+    movzx ecx, word [rax + 2]
+    imul ecx, ecx, PIPE_STRUCT_SIZE
+    lea rdx, [r15 + pipe_table - kmain + rcx]
+    cmp byte [rax + 1], O_RDONLY
+    jne .clean_pipe_wr
+    cmp word [rdx + 12], 0
+    je @f
+    dec word [rdx + 12]
+    jmp @f
+.clean_pipe_wr:
+    cmp word [rdx + 14], 0
+    je @f
+    dec word [rdx + 14]
+@@:
+    mov byte [rax + 0], FD_TYPE_UNUSED
+.clean_next:
     inc edi
     jmp .clean_loop
 .clean_done:
@@ -829,8 +959,10 @@ vfs_redirect_child_fd:
 
     ; Copy FD_ENTRY_SIZE bytes
     push rcx
+    push rdi                 ; save entry start: rep movsd advances rdi by 48,
     mov ecx, FD_ENTRY_SIZE / 4
-    rep movsd
+    rep movsd                ; and the pipe check below must see the COPY,
+    pop rdi                  ; not the following (unused) fd entry
     pop rcx
 
     ; If pipe, increment reader/writer refcount

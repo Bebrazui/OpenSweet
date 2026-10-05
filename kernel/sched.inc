@@ -34,9 +34,11 @@ TCB_HEAP_BRK    = 0x4C                ; uint32: Current heap brk virtual address
 TCB_PARENT_ID   = 0x50                ; uint32: Parent task ID (who spawned this process)
 TCB_EXIT_CODE   = 0x54                ; uint32: Process exit status code
 TCB_WAIT_TID    = 0x58                ; int32: Target child TID being waited on (-1 if none)
-TCB_PAD         = 0x5C                ; uint32: 16-byte alignment padding
-TCB_FXSAVE      = 0x60                ; 512 bytes: 16-byte aligned FXSAVE/FXRSTOR area
-TCB_SIZE        = 608                 ; 0x60 + 512 = 608 bytes (multiple of 16)
+TCB_ABI_TYPE    = 0x5C                ; uint32: ABI type (0 = ABI_NATIVE, 1 = ABI_LINUX)
+TCB_FS_BASE     = 0x60                ; uint64: Thread-local storage base (FS_BASE for Linux / TLS)
+TCB_PAD         = 0x68                ; uint64: alignment padding
+TCB_FXSAVE      = 0x70                ; 512 bytes: 16-byte aligned FXSAVE/FXRSTOR area
+TCB_SIZE        = 624                 ; 0x60 + 512 = 608 bytes (multiple of 16)
 
 TASK_STACK_SIZE = 8192                ; 8 KB stack per task
 
@@ -95,6 +97,8 @@ sched_init:
     ; Stack 0 uses initial boot stack 0x90000
     mov qword [rbx + TCB_STACK_BASE], 0x80000
     mov qword [rbx + TCB_STACK_TOP],  0x90000
+    mov dword [rbx + TCB_ABI_TYPE],   0
+    mov qword [rbx + TCB_FS_BASE],    0
 
     ; Initialize syscall stack to Task 0's stack top
     mov rax, 0x90000
@@ -184,6 +188,8 @@ task_create:
     mov [rdi + TCB_STACK_BASE], r8
     add r8, TASK_STACK_SIZE
     mov [rdi + TCB_STACK_TOP], r8
+    mov dword [rdi + TCB_ABI_TYPE], 0
+    mov qword [rdi + TCB_FS_BASE], 0
 
     ; Initialize stack frame to simulate hardware interrupt return (iretq)
     ; Hardware frame: SS, RSP, RFLAGS, CS, RIP
@@ -489,6 +495,12 @@ task_finalize_user:
     mov dword [rdi + TCB_PARENT_ID], eax
     mov dword [rdi + TCB_EXIT_CODE], 0
     mov dword [rdi + TCB_WAIT_TID], -1
+    ; ABI type staged by the caller (elf spawn detection) BEFORE finalize:
+    ; the task is marked READY below and may start running immediately.
+    mov eax, dword [r15 + sys_spawn_abi - kmain]
+    mov dword [rdi + TCB_ABI_TYPE], eax
+    mov qword [r15 + sys_spawn_abi - kmain], 0
+    mov qword [rdi + TCB_FS_BASE], 0
     mov [rdi + TCB_USER_RSP], r11
 
     ; Copy name (up to 7 chars)
@@ -515,6 +527,7 @@ task_finalize_user:
     mov [rdi + TCB_STACK_BASE], r8
     add r8, TASK_STACK_SIZE
     mov [rdi + TCB_STACK_TOP], r8
+    mov qword [rdi + TCB_FS_BASE], 0
 
     ; Initialize kernel stack frame for iretq transition to Ring 3
     mov r9, r8
@@ -752,8 +765,13 @@ sched_tick:
     mov dword [rsi + TCB_STATE], TASK_READY
 
 .find_next:
-    ; Save current task RSP and FPU/SSE state
+    ; Save current task RSP, FS_BASE, and FPU/SSE state
     mov [rsi + TCB_RSP], rsp
+    mov ecx, 0xC0000100
+    rdmsr
+    shl rdx, 32
+    or rax, rdx
+    mov [rsi + TCB_FS_BASE], rax
     fxsave [rsi + TCB_FXSAVE]
 
     ; Pick next task in circular order
@@ -801,6 +819,13 @@ sched_tick:
     mov cr3, rax
 .tick_cr3_done:
 
+    ; Restore FS_BASE (MSR 0xC0000100) for thread-local storage
+    mov rax, [rdi + TCB_FS_BASE]
+    mov rdx, rax
+    shr rdx, 32
+    mov ecx, 0xC0000100
+    wrmsr
+
     ; Restore incoming task's FPU/SSE context
     fxrstor [rdi + TCB_FXSAVE]
 
@@ -832,11 +857,16 @@ isr_yield:
     push r15
     mov r15, 0xFFFF800000010000 ; Establish kernel image base in R15
 
-    ; Save current task RSP and FPU/SSE state
+    ; Save current task RSP, FS_BASE, and FPU/SSE state
     mov eax, [r15 + sched_curr_task - kmain]
     imul eax, TCB_SIZE
     lea rsi, [r15 + task_table - kmain + rax]
     mov [rsi + TCB_RSP], rsp
+    mov ecx, 0xC0000100
+    rdmsr
+    shl rdx, 32
+    or rax, rdx
+    mov [rsi + TCB_FS_BASE], rax
     fxsave [rsi + TCB_FXSAVE]
 
     ; If current task was RUNNING, set to READY (if SLEEPING, leave as SLEEPING)
@@ -888,6 +918,13 @@ isr_yield:
     je .yield_cr3_done
     mov cr3, rax
 .yield_cr3_done:
+
+    ; Restore FS_BASE (MSR 0xC0000100) for thread-local storage
+    mov rax, [rdi + TCB_FS_BASE]
+    mov rdx, rax
+    shr rdx, 32
+    mov ecx, 0xC0000100
+    wrmsr
 
     ; Restore incoming task's FPU/SSE context
     fxrstor [rdi + TCB_FXSAVE]

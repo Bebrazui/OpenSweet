@@ -58,6 +58,7 @@ str_elf_bytes         db " bytes)...", 10, 0
 str_elf_entry_log     db "[ELF] Entry point: 0x", 0
 str_elf_segs_log      db ", loaded segments: ", 0
 str_elf_spawned       db 10, "[ELF] Ring 3 process spawned! TID=", 0
+str_elf_abi_log       db "[ELF] ABI detect -> ", 0
 str_elf_nl            db 10, 0
 
 str_elf_err_fnf       db "[ELF] Error: File not found on ext4 filesystem.", 10, 0
@@ -202,7 +203,6 @@ elf_load_from_ext4:
     call puts
     jmp .elff_ret
 @@:
-
     ; 8. Extract basename from path for process name
     mov rsi, r14
     call elf_get_basename
@@ -413,22 +413,22 @@ elf_load_exec:
     cmp rbp, r13
     ja .next_phdr
 
-    ; C1 Mitigation: Validate segment virtual address and memory bounds
-    ; Segment must fall completely within the 2MB user code slot [0x400000, 0x600000)
+    ; Validate segment virtual address and memory bounds
+    ; Segment must fall within the user code/data/bss slot [0x400000, 0x800000) (4MB)
     cmp rdi, 0x400000
     jb .next_phdr
     cmp rax, r8                       ; filesz <= memsz
     ja .next_phdr
-    cmp r8, 0x200000                  ; memsz <= 2MB
+    cmp r8, 0x400000                  ; memsz <= 4MB
     ja .next_phdr
 
     mov rbp, rdi
     sub rbp, 0x400000
     add rbp, r8                       ; (vaddr - 0x400000) + memsz
-    cmp rbp, 0x200000
+    cmp rbp, 0x400000
     ja .next_phdr
 
-    ; Map virtual address (0x400000..) to slot's private physical code memory
+    ; Map virtual address (0x400000..) to slot's private physical memory
     sub rdi, 0x400000
     add rdi, [rsp + 16]               ; [rsp + 16] = phys_code
 
@@ -502,16 +502,19 @@ elf_load_exec:
     pop r8
     pop rbx
 
-    ; 9. Setup AMD64 System V ABI User Stack at virtual 0x7FFF00
-    ; Physical address = phys_stack + 0x1FFF00
+    ; 9. Setup AMD64 System V ABI User Stack
+    ; Vector (argc/argv/envp/auxv) lives at phys_stack + 0x1FFE00 (virtual
+    ; 0x7FFE00); 512 bytes are reserved so auxv can never run past the end
+    ; of the stack slot (old base 0x1FFF00 overflowed by up to 0xA0 bytes).
+    ; Physical address = phys_stack + 0x1FFE00
     mov r9, [r15 + sys_spawn_argv_ptr - kmain]
     test r9, r9
     jz .fallback_args
 
-    ; Validate argv array pointer
+    ; Validate argv array pointer (up to 16 entries * 8 bytes = 128 bytes)
     push rbx
     mov rdi, r9
-    mov rsi, 8
+    mov rsi, 128
     call sys_validate_user_ptr
     pop rbx
     jc .fallback_args
@@ -528,20 +531,29 @@ elf_load_exec:
     test rsi, rsi
     jz .argv_copied
 
-    ; Validate string pointer
+    ; Validate string pointer (up to 128 bytes string buffer)
     push rcx
     push r9
     push rbx
-    mov rdi, rsi
-    mov rsi, 1
+    push rsi                          ; save user string ptr: the validator is
+    mov rdi, rsi                      ; called with rsi = length, which would
+    mov rsi, 128                      ; otherwise leave the copy reading [128]
     call sys_validate_user_ptr
+    pop rsi
     pop rbx
     pop r9
     pop rcx
     jc .argv_copied
 
+    ; H-L7: keep argv strings below the vector at 0x1FFE00 (leave 256 bytes
+    ; of slack for the current string); drop remaining args instead of
+    ; overwriting the argc/argv/envp/auxv vector or the next task's memory.
+    lea rax, [r10 + 0x1FFE00 - 0x100]
+    cmp r12, rax
+    jae .argv_copied
+
     ; Store virtual address in argv[rcx] table
-    mov [r10 + 0x1FFF00 + 8 + rcx*8], r13
+    mov [r10 + 0x1FFE00 + 8 + rcx*8], r13
 
     ; Copy string characters
     mov edx, 127                       ; max 127 bytes per arg
@@ -570,8 +582,8 @@ elf_load_exec:
     jz .fallback_args
 
     ; Successfully copied arguments
-    mov [r10 + 0x1FFF00], rcx                  ; [0x00] = argc
-    mov qword [r10 + 0x1FFF00 + 8 + rcx*8], 0  ; argv[argc] = NULL
+    mov [r10 + 0x1FFE00], rcx                  ; [0x00] = argc
+    mov qword [r10 + 0x1FFE00 + 8 + rcx*8], 0  ; argv[argc] = NULL
 
     ; Setup standard POSIX environment strings at phys_stack + 0x1FF500 (virtual 0x7FF500)
     lea rdi, [r10 + 0x1FF500]
@@ -594,13 +606,14 @@ elf_load_exec:
     mov word  [rdi + 88], "h"
 
     ; Populate envp pointers
-    lea rdi, [r10 + 0x1FFF00 + 16 + rcx*8]
+    lea rdi, [r10 + 0x1FFE00 + 8 + rcx*8 + 8]
     mov qword [rdi + 0*8], 0x7FF500
     mov qword [rdi + 1*8], 0x7FF500 + 16
     mov qword [rdi + 2*8], 0x7FF500 + 32
     mov qword [rdi + 3*8], 0x7FF500 + 48
     mov qword [rdi + 4*8], 0x7FF500 + 80
     mov qword [rdi + 5*8], 0
+    lea rdi, [rdi + 6*8]
     jmp .args_done
 
 .fallback_args:
@@ -623,12 +636,12 @@ elf_load_exec:
     pop rsi
     pop rdi
 
-    ; Stack layout at phys_stack + 0x1FFF00 (virtual 0x7FFF00):
+    ; Stack layout at phys_stack + 0x1FFE00 (virtual 0x7FFE00):
     ; [0x00] = 1 (argc)
     ; [0x08] = 0x7FFF80 (argv[0])
     ; [0x10] = 0 (argv[1] = NULL)
     ; [0x18..] = envp
-    lea rdi, [r10 + 0x1FFF00]
+    lea rdi, [r10 + 0x1FFE00]
     mov qword [rdi + 0x00], 1
     mov qword [rdi + 0x08], 0x7FFF80
     mov qword [rdi + 0x10], 0
@@ -653,25 +666,114 @@ elf_load_exec:
     mov dword [rdi + 84], "L=/s"
     mov word  [rdi + 88], "h"
 
-    lea rdi, [r10 + 0x1FFF00 + 0x18]
+    lea rdi, [r10 + 0x1FFE00 + 0x18]
     mov qword [rdi + 0*8], 0x7FF500
     mov qword [rdi + 1*8], 0x7FF500 + 16
     mov qword [rdi + 2*8], 0x7FF500 + 32
     mov qword [rdi + 3*8], 0x7FF500 + 48
     mov qword [rdi + 4*8], 0x7FF500 + 80
     mov qword [rdi + 5*8], 0
+    lea rdi, [rdi + 6*8]              ; RDI points after NULL envp
 
 .args_done:
+    ; Setup AMD64 System V / Linux Auxiliary Vector (auxv) at RDI:
+    ; [0] AT_PHDR (3) = 0x400040 (load_addr + phoff)
+    mov qword [rdi + 0*8], 3
+    mov qword [rdi + 1*8], 0x400040
+    ; [1] AT_PHENT (4) = 56
+    mov qword [rdi + 2*8], 4
+    mov qword [rdi + 3*8], 56
+    ; [2] AT_PHNUM (5) = [rsp + 0] (saved phnum on stack or read from elf)
+    mov qword [rdi + 4*8], 5
+    movzx rax, word [r12 + EHDR_OFF_PHNUM]
+    mov [rdi + 5*8], rax
+    ; [3] AT_PAGESZ (6) = 4096
+    mov qword [rdi + 6*8], 6
+    mov qword [rdi + 7*8], 4096
+    ; [4] AT_BASE (7) = 0
+    mov qword [rdi + 8*8], 7
+    mov qword [rdi + 9*8], 0
+    ; [5] AT_FLAGS (8) = 0
+    mov qword [rdi + 10*8], 8
+    mov qword [rdi + 11*8], 0
+    ; [6] AT_ENTRY (9) = entry RIP (r8)
+    mov qword [rdi + 12*8], 9
+    mov [rdi + 13*8], r8
+    ; [7] AT_UID (11) = 0
+    mov qword [rdi + 14*8], 11
+    mov qword [rdi + 15*8], 0
+    ; [8] AT_EUID (12) = 0
+    mov qword [rdi + 16*8], 12
+    mov qword [rdi + 17*8], 0
+    ; [9] AT_GID (13) = 0
+    mov qword [rdi + 18*8], 13
+    mov qword [rdi + 19*8], 0
+    ; [10] AT_EGID (14) = 0
+    mov qword [rdi + 20*8], 14
+    mov qword [rdi + 21*8], 0
+    ; [11] AT_SECURE (23) = 0
+    mov qword [rdi + 22*8], 23
+    mov qword [rdi + 23*8], 0
+    ; [12] AT_RANDOM (25) = pointer to 16 random bytes (use 0x7FF580)
+    mov qword [rdi + 24*8], 25
+    mov qword [rdi + 25*8], 0x7FF500
+    ; [13] AT_NULL (0) = 0
+    mov qword [rdi + 26*8], 0
+    mov qword [rdi + 27*8], 0
+
     mov qword [r15 + sys_spawn_argv_ptr - kmain], 0
 
-    ; 10. Finalize Ring 3 User Task!
+    ; 10. Detect process ABI BEFORE finalize: task_finalize_user marks the
+    ; task READY (and does vfs fd I/O) before returning, so on SMP the task
+    ; may already run its first syscalls by the time we return here. The
+    ; result is staged in sys_spawn_abi and picked up by task_finalize_user
+    ; while it fills the TCB (setting TCB_ABI_TYPE afterwards raced: the
+    ; first linux syscalls fell into the native dispatcher).
+if defined CONFIG_LINUX_COMPAT
+    push rdi
+    push rsi
+    push rax
+    mov qword [r15 + sys_spawn_abi - kmain], 0
+    mov rsi, r14
+    mov rdi, r14                     ; candidate basename start
+.abi_scan:
+    mov al, [rsi]
+    test al, al
+    jz .abi_scan_done
+    inc rsi
+    cmp al, '/'
+    jne .abi_scan
+    mov rdi, rsi                     ; restart basename after the last slash
+    jmp .abi_scan
+.abi_scan_done:
+    cmp dword [rdi], 'linu'          ; basename starts with "linu"?
+    je .abi_is_linux
+    cmp dword [rdi], 'busy'          ; basename starts with "busy"?
+    jne .abi_not_linux
+.abi_is_linux:
+    mov qword [r15 + sys_spawn_abi - kmain], 1
+.abi_not_linux:
+    push rsi
+    lea rsi, [r15 + str_elf_abi_log - kmain]
+    call puts
+    mov rax, [r15 + sys_spawn_abi - kmain]
+    call putdec64
+    mov al, 10
+    call putc
+    pop rsi
+    pop rax
+    pop rsi
+    pop rdi
+end if
+
+    ; 11. Finalize Ring 3 User Task!
     ; EBX = slot ID
     ; RSI = process name (r14)
     ; RDX = entry point (r8)
-    ; R8  = user stack top (0x7FFF00)
+    ; R8  = user stack top (0x7FFE00 = start of the argv/envp/auxv vector)
     mov rsi, r14
     mov rdx, r8                       ; entry RIP
-    mov r8,  0x7FFF00                 ; user RSP
+    mov r8,  0x7FFE00                 ; user RSP
     call task_finalize_user
     cmp eax, -1
     jne .spawn_ok
@@ -680,7 +782,6 @@ elf_load_exec:
     call puts
     mov eax, ELF_ERR_SPAWN_FAIL
     jmp .exec_fail
-
 
 .spawn_ok:
     ; Print success
@@ -721,19 +822,26 @@ elf_load_exec:
 ; elf_get_basename: Extract filename component from path
 ; RSI = path string (ASCIIZ)
 ; Returns: RAX = pointer to start of basename within or after slashes
+; NOTE: the candidate pointer is tracked in RCX, not RAX: lodsb overwrites
+; AL on every character, which used to leave the returned pointer with a
+; zeroed low byte (address with bits 0..7 = 0) instead of the real basename
+; address — process names and the linux ABI detection read garbage there.
 ; ==============================================================================
 elf_get_basename:
     push rsi
-    mov rax, rsi
+    push rcx
+    mov rcx, rsi                      ; candidate: start of path
 .gb_loop:
     lodsb
     test al, al
     jz .gb_done
     cmp al, '/'
     jne .gb_loop
-    mov rax, rsi                      ; update to character after '/'
+    mov rcx, rsi                      ; candidate: character after '/'
     jmp .gb_loop
 .gb_done:
+    mov rax, rcx
+    pop rcx
     pop rsi
     ret
 

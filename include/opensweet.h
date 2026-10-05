@@ -66,6 +66,8 @@ typedef _Bool bool;
 #define SYS_GETCWD         30
 #define SYS_CHDIR          31
 #define SYS_SPAWN_STDIO    32
+#define SYS_MKDIR          33
+#define SYS_RMDIR          34
 
 #define WNOHANG            1
 #define WIFEXITED(s)       (((s) & 0x7f) == 0)
@@ -376,6 +378,18 @@ static inline ssize_t os_read_file(const char *path, void *buf, size_t max_count
 static inline int os_delete_file(const char *path) {
     if (!path) return -1;
     return (int)os_syscall1(SYS_UNLINK, (int64_t)path);
+}
+
+/* Create a new directory on ext4 filesystem */
+static inline int os_mkdir(const char *path, uint32_t mode) {
+    if (!path) return -1;
+    return (int)os_syscall2(SYS_MKDIR, (int64_t)path, (int64_t)mode);
+}
+
+/* Remove an empty directory from ext4 filesystem */
+static inline int os_rmdir(const char *path) {
+    if (!path) return -1;
+    return (int)os_syscall1(SYS_RMDIR, (int64_t)path);
 }
 
 /* =============================================================================
@@ -774,6 +788,18 @@ static inline int chdir(const char *path) {
         setenv("PWD", os_cwd, 1);
     }
     return res;
+}
+
+static inline int mkdir(const char *pathname, uint32_t mode) {
+    return os_mkdir(pathname, mode);
+}
+
+static inline int rmdir(const char *pathname) {
+    return os_rmdir(pathname);
+}
+
+static inline int unlink(const char *pathname) {
+    return os_delete_file(pathname);
 }
 
 /* 2. Standard POSIX File Descriptors (0=stdin, 1=stdout, 2=stderr, 3..15=files) */

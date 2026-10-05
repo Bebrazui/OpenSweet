@@ -706,11 +706,100 @@ wm_handle_mouse:
     push r11
     push r12
 
-    ; 1. Bounds-clamped mouse coordinates directly from mouse driver
+    ; 1. Mouse physics & momentum integration
     mov eax, [r15 + mouse_x - kmain]
-    mov [r15 + md_mouse_x - kmain], eax
     mov edx, [r15 + mouse_y - kmain]
+
+    ; Check if mouse button is down / clicked
+    movzx ebx, byte [r15 + mouse_buttons - kmain]
+    and ebx, 1
+    test ebx, ebx
+    jnz .wm_mouse_snap              ; Snapping when clicking ensures pixel-perfect targeting
+
+    ; Delta in 16.16 fixed-point
+    shl eax, 16
+    sub eax, [r15 + md_mouse_fp_x - kmain]  ; eax = diff_x (16.16)
+    shl edx, 16
+    sub edx, [r15 + md_mouse_fp_y - kmain]  ; edx = diff_y (16.16)
+
+    ; Calculate abs(diff_x)
+    mov r8d, eax
+    test r8d, r8d
+    jns @f
+    neg r8d
+@@:
+    mov r9d, edx
+    test r9d, r9d
+    jns @f
+    neg r9d
+@@:
+    cmp r8d, 0x00018000             ; ~1.5 pixels threshold
+    ja .wm_mouse_physics
+    cmp r9d, 0x00018000
+    ja .wm_mouse_physics
+
+.wm_mouse_snap:
+    mov eax, [r15 + mouse_x - kmain]
+    mov edx, [r15 + mouse_y - kmain]
+    mov [r15 + md_mouse_x - kmain], eax
     mov [r15 + md_mouse_y - kmain], edx
+    shl eax, 16
+    shl edx, 16
+    mov [r15 + md_mouse_fp_x - kmain], eax
+    mov [r15 + md_mouse_fp_y - kmain], edx
+    mov dword [r15 + md_mouse_vx - kmain], 0
+    mov dword [r15 + md_mouse_vy - kmain], 0
+    jmp .wm_mouse_done
+
+.wm_mouse_physics:
+    ; Momentum lerp: Vx = (Vx * 3 + diff_x) / 4
+    mov ecx, [r15 + md_mouse_vx - kmain]
+    lea ecx, [ecx + ecx*2]
+    add ecx, eax
+    sar ecx, 2
+    mov [r15 + md_mouse_vx - kmain], ecx
+
+    ; Vy = (Vy * 3 + diff_y) / 4
+    mov r8d, [r15 + md_mouse_vy - kmain]
+    lea r8d, [r8d + r8d*2]
+    add r8d, edx
+    sar r8d, 2
+    mov [r15 + md_mouse_vy - kmain], r8d
+
+    ; Position += Velocity
+    mov eax, [r15 + md_mouse_fp_x - kmain]
+    add eax, ecx
+    mov [r15 + md_mouse_fp_x - kmain], eax
+    sar eax, 16
+
+    mov edx, [r15 + md_mouse_fp_y - kmain]
+    add edx, r8d
+    mov [r15 + md_mouse_fp_y - kmain], edx
+    sar edx, 16
+
+    ; Clamp X to [0, R2D_SCREEN_W - 20]
+    test eax, eax
+    jns @f
+    xor eax, eax
+@@:
+    cmp eax, R2D_SCREEN_W - 20
+    jle @f
+    mov eax, R2D_SCREEN_W - 20
+@@:
+    mov [r15 + md_mouse_x - kmain], eax
+
+    ; Clamp Y to [0, R2D_SCREEN_H - 20]
+    test edx, edx
+    jns @f
+    xor edx, edx
+@@:
+    cmp edx, R2D_SCREEN_H - 20
+    jle @f
+    mov edx, R2D_SCREEN_H - 20
+@@:
+    mov [r15 + md_mouse_y - kmain], edx
+
+.wm_mouse_done:
 
     ; 2. Check mouse button transitions
     movzx ebx, byte [r15 + mouse_buttons - kmain]

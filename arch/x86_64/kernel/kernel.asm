@@ -2475,6 +2475,18 @@ vmm_map:
     push rdi
     push rax
     push r11
+    push rbx
+    ; Defense-in-depth: a user-accessible mapping may only be created inside
+    ; user space ([0x400000, 0x0000800000000000)); the identity/kernel areas
+    ; are never mappable with the user bit set.
+    test r11b, 4
+    jz .vm_no_guard
+    cmp rdi, 0x00400000
+    jb .vm_fail
+    mov rax, rdi
+    shr rax, 47
+    jnz .vm_fail             ; only user-canonical addresses (bits 63:47 == 0)
+.vm_no_guard:
     mov rdx, rdi
     shr rdx, 39
     and edx, 511              ; PML4 idx
@@ -2487,13 +2499,18 @@ vmm_map:
     mov r10, rdi
     shr r10, 12
     and r10d, 511             ; PT idx
-    mov rsi, 0x1000           ; PML4 (linear == phys)
-
-.lvl_pdpt:
-    test r11b, 4
-    jz @f
-    or byte [rsi + rdx*8], 4
+    mov rsi, cr3
+    and rsi, 0xFFFFFFFFFFFFF000
+    test rsi, rsi
+    jnz @f
+    mov rsi, 0x1000           ; fallback to boot kernel PML4
 @@:
+
+    ; NB: the User bit (or byte ..., 4) is set only AFTER an entry is known to
+    ; be a real table pointer. Never OR it into a zero entry (it would fake
+    ; "present" and walk through physical address 0) nor into a huge page
+    ; (it would grant Ring 3 access to identity-mapped physical memory).
+.lvl_pdpt:
     mov rbx, [rsi + rdx*8]
     test rbx, rbx
     jnz .have_pdpt
@@ -2503,15 +2520,16 @@ vmm_map:
     or cl, 3
     or al, cl
     mov [rsi + rdx*8], rax
+    mov rbx, rax
 .have_pdpt:
-    mov rsi, [rsi + rdx*8]
+    test r11b, 4
+    jz @f
+    or byte [rsi + rdx*8], 4
+@@:
+    mov rsi, rbx
     and esi, 0xFFFFF000
 
 .lvl_pd:
-    test r11b, 4
-    jz @f
-    or byte [rsi + r8*8], 4
-@@:
     mov rbx, [rsi + r8*8]
     test rbx, rbx
     jnz .have_pd
@@ -2521,15 +2539,18 @@ vmm_map:
     or cl, 3
     or al, cl
     mov [rsi + r8*8], rax
+    mov rbx, rax
 .have_pd:
-    mov rsi, [rsi + r8*8]
+    test bl, 0x80              ; 1GB huge page at PDPT level: unsupported here
+    jnz .vm_fail               ; (Linux mmap zone stays below 1GB, PDPT[0])
+    test r11b, 4
+    jz @f
+    or byte [rsi + r8*8], 4
+@@:
+    mov rsi, rbx
     and esi, 0xFFFFF000
 
 .lvl_pt:
-    test r11b, 4
-    jz @f
-    or byte [rsi + r9*8], 4
-@@:
     mov rbx, [rsi + r9*8]
     test rbx, rbx
     jnz .have_pt
@@ -2539,19 +2560,84 @@ vmm_map:
     or cl, 3
     or al, cl
     mov [rsi + r9*8], rax
+    mov rbx, rax
 .have_pt:
-    mov rsi, [rsi + r9*8]
+    test bl, 0x80              ; 2MB huge identity page (sched.inc fills the
+    jnz .split_2m              ; low-GB PD with them): split it first, else
+                               ; the huge entry is misread as a table pointer
+.have_pt_ok:
+    test r11b, 4
+    jz @f
+    or byte [rsi + r9*8], 4
+@@:
+    mov rsi, rbx
     and esi, 0xFFFFF000
 
+    pop rbx
     pop r11
     pop rax
     pop rdi
     and rax, -4096
     or rax, r11               ; final PTE
     mov [rsi + r10*8], rax
+    ; Reload CR3 so stale TLB entries for this page are flushed
+    push rax
+    mov rax, cr3
+    mov cr3, rax
+    pop rax
+    ret
+
+; --- split a 2MB huge page into a 4KB page table --------------------------
+; IN: RBX = huge PD entry (bit7 set), RSI = PD base, R9 = PD index
+; The other 511 pages of the 2MB block keep their original translation
+; (supervisor unless the huge entry already had U), so Ring 0 identity
+; access is preserved; only bit7 is dropped in the new 4KB PTEs.
+.split_2m:
+    call pmm_alloc_zero        ; RAX = fresh zeroed PT page (0 = OOM)
+    test rax, rax
+    jz .vm_fail                ; stack still balanced: no extra pushes yet
+    push rsi                   ; save PD base
+    mov rcx, rax               ; RCX = new PT (phys)
+    mov rdx, rbx
+    and rdx, 0xFFFFFFFFFFE00000 ; RDX = 2MB physical base
+    mov rsi, rbx
+    and esi, 0xFFF                ; P/W/U/PCD/A/D of the huge entry
+    btr rsi, 7                    ; clear PS: these are 4KB PTEs now
+    test rbx, rbx                 ; propagate NX (bit 63) if set
+    jns @f
+    bts rsi, 63
+@@:
+    xor edi, edi               ; RDI value is dead (restored from stack)
+.f2m:
+    mov rax, rdx
+    or rax, rsi
+    mov [rcx + rdi*8], rax
+    add rdx, 4096
+    inc edi
+    cmp edi, 512
+    jb .f2m
+    pop rsi                    ; PD base
+    mov rax, rcx
+    mov cl, r11b               ; install: PT phys | (user ? 7 : 3)
+    and cl, 4
+    or cl, 3
+    or al, cl
+    mov [rsi + r9*8], rax
+    mov rbx, rax
+    jmp .have_pt_ok
+
+.vm_fail:
+    pop rbx
+    pop r11
+    pop rax
+    pop rdi
     ret
 
 ; vmm_unmap: RDI=virt (assumes fully populated path)
+; Out: RAX = physical page that was mapped there (0 = nothing to unmap)
+; Huge entries (bit7: 2MB/1GB identity maps) are refused: walking through
+; one as if it were a table pointer would scribble over foreign memory,
+; and clearing it would tear down the identity map the kernel relies on.
 vmm_unmap:
     mov rdx, rdi
     shr rdx, 39
@@ -2565,16 +2651,47 @@ vmm_unmap:
     mov r10, rdi
     shr r10, 12
     and r10d, 511
+    mov rsi, cr3
+    and rsi, 0xFFFFFFFFFFFFF000
+    test rsi, rsi
+    jnz @f
     mov rsi, 0x1000
-    mov rsi, [rsi + rdx*8]
+@@:
+    mov rax, [rsi + rdx*8]    ; PML4E (bit7 reserved: never huge here)
+    test rax, rax             ; absent table entry: nothing to unmap,
+    jz .um_none               ; do not walk/write through a NULL table ptr
+    mov rsi, rax
     and esi, 0xFFFFF000
-    mov rsi, [rsi + r8*8]
+
+    mov rax, [rsi + r8*8]     ; PDPTE
+    test rax, rax
+    jz .um_none
+    test al, 0x80             ; 1GB huge page: refuse
+    jnz .um_none
+    mov rsi, rax
     and esi, 0xFFFFF000
-    mov rsi, [rsi + r9*8]
+
+    mov rax, [rsi + r9*8]     ; PDE
+    test rax, rax
+    jz .um_none
+    test al, 0x80             ; 2MB huge page (identity PD): refuse
+    jnz .um_none
+    mov rsi, rax
     and esi, 0xFFFFF000
+
+    mov rax, [rsi + r10*8]    ; PTE
+    test rax, rax
+    jz .um_none
+    and rax, -4096            ; physical base
+    btr rax, 63               ; drop NX: PMM wants a plain phys address
     and qword [rsi + r10*8], 0
+    push rax
     mov rax, cr3
     mov cr3, rax              ; TLB flush
+    pop rax
+    ret
+.um_none:
+    xor eax, eax
     ret
 
 common_ex:
@@ -3241,6 +3358,7 @@ include 'D:\Opensweet\gui\modern_desktop.inc'
 include 'D:\Opensweet\kernel\sched.inc'
 include 'D:\Opensweet\kernel\heap.inc'
 include 'D:\Opensweet\kernel\vfs.inc'
+include 'D:\Opensweet\kernel\compat_linux.inc'
 include 'D:\Opensweet\kernel\syscall.inc'
 include 'D:\Opensweet\kernel\test_user.inc'
 include 'D:\Opensweet\kernel\elf.inc'

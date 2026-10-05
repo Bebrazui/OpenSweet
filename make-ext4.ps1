@@ -203,6 +203,37 @@ if ($hasFiles) {
     ExtentLeaf ($itable + 18 * 128) $filesStartBlock $filesBlocks $filesBytes.Length 0x81ED
 }
 
+$linuxTestSrc = Join-Path $PSScriptRoot "user\linux_test.c"
+$linuxTestExe = Join-Path $PSScriptRoot "build\linux_test.exe"
+$linuxTestElf = Join-Path $PSScriptRoot "build\linux_test.elf"
+if (Test-Path $linuxTestSrc) {
+    & $gccPath "-B$(Split-Path $gccPath)" -mabi=sysv -nostdlib "-Wl,--image-base=0x400000" -O2 $linuxTestSrc -o $linuxTestExe 2>$null
+    if (Test-Path $linuxTestExe) {
+        & $objcopyPath -O elf64-x86-64 $linuxTestExe $linuxTestElf
+        Remove-Item $linuxTestExe -ErrorAction SilentlyContinue
+    }
+}
+$hasLinuxTest = Test-Path $linuxTestElf
+$linuxTestBlocks = 0
+$linuxTestStartBlock = $filesStartBlock + $filesBlocks
+if ($hasLinuxTest) {
+    $linuxTestBytes = [IO.File]::ReadAllBytes($linuxTestElf)
+    $linuxTestBlocks = [int][Math]::Ceiling($linuxTestBytes.Length / 1024.0)
+    # inode 22 = linux_test.elf
+    ExtentLeaf ($itable + 21 * 128) $linuxTestStartBlock $linuxTestBlocks $linuxTestBytes.Length 0x81ED
+}
+
+$busyboxPath = Join-Path $PSScriptRoot "build\busybox"
+$hasBusybox = Test-Path $busyboxPath
+$busyboxBlocks = 0
+$busyboxStartBlock = if ($hasLinuxTest) { $linuxTestStartBlock + $linuxTestBlocks } else { $filesStartBlock + $filesBlocks }
+if ($hasBusybox) {
+    $busyboxBytes = [IO.File]::ReadAllBytes($busyboxPath)
+    $busyboxBlocks = [int][Math]::Ceiling($busyboxBytes.Length / 1024.0)
+    # inode 23 = busybox
+    ExtentLeaf ($itable + 22 * 128) $busyboxStartBlock $busyboxBlocks $busyboxBytes.Length 0x81ED
+}
+
 $includeDoom = $true
 $doomElf = Join-Path $PSScriptRoot "build\doom.elf"
 if ($includeDoom -and (-not (Test-Path $doomElf))) {
@@ -210,7 +241,7 @@ if ($includeDoom -and (-not (Test-Path $doomElf))) {
 }
 $hasDoom = $includeDoom -and (Test-Path $doomElf)
 $doomBlocks = 0
-$doomStartBlock = $filesStartBlock + $filesBlocks
+$doomStartBlock = if ($hasBusybox) { $busyboxStartBlock + $busyboxBlocks } elseif ($hasLinuxTest) { $linuxTestStartBlock + $linuxTestBlocks } else { $filesStartBlock + $filesBlocks }
 if ($hasDoom) {
     $doomBytes = [IO.File]::ReadAllBytes($doomElf)
     $doomBlocks = [int][Math]::Ceiling($doomBytes.Length / 1024.0)
@@ -270,8 +301,18 @@ if ($hasTerm) {
     $curOff += 24
 }
 if ($hasFiles) {
-    $rec = if ($hasDoom -or $hasWad) { 20 } else { $d + 1024 - $curOff }
+    $rec = if ($hasLinuxTest -or $hasBusybox -or $hasDoom -or $hasWad) { 20 } else { $d + 1024 - $curOff }
     DirEntry $curOff 19 'files.elf' 1 $rec
+    $curOff += 20
+}
+if ($hasLinuxTest) {
+    $rec = if ($hasBusybox -or $hasDoom -or $hasWad) { 24 } else { $d + 1024 - $curOff }
+    DirEntry $curOff 22 'linux_test.elf' 1 $rec
+    $curOff += 24
+}
+if ($hasBusybox) {
+    $rec = if ($hasDoom -or $hasWad) { 20 } else { $d + 1024 - $curOff }
+    DirEntry $curOff 23 'busybox' 1 $rec
     $curOff += 20
 }
 if ($hasDoom) {
@@ -317,6 +358,14 @@ if ($hasFiles) {
     Put ($filesStartBlock * $BS) $filesBytes
     echo "Added files.elf ($($filesBytes.Length) bytes, $filesBlocks blocks) to disk image"
 }
+if ($hasLinuxTest) {
+    Put ($linuxTestStartBlock * $BS) $linuxTestBytes
+    echo "Added linux_test.elf ($($linuxTestBytes.Length) bytes, $linuxTestBlocks blocks) to disk image"
+}
+if ($hasBusybox) {
+    Put ($busyboxStartBlock * $BS) $busyboxBytes
+    echo "Added busybox ($($busyboxBytes.Length) bytes, $busyboxBlocks blocks) to disk image"
+}
 if ($hasDoom) {
     Put ($doomStartBlock * $BS) $doomBytes
     echo "Added doom.elf ($($doomBytes.Length) bytes, $doomBlocks blocks) to disk image"
@@ -329,6 +378,10 @@ if ($hasWad) {
 # ---- populate block and inode bitmaps and free counts ----
 $totalAllocatedBlocksGrp0 = if ($hasDoom) {
     $doomStartBlock + $doomBlocks
+} elseif ($hasBusybox) {
+    $busyboxStartBlock + $busyboxBlocks
+} elseif ($hasLinuxTest) {
+    $linuxTestStartBlock + $linuxTestBlocks
 } elseif ($hasFiles) {
     $filesStartBlock + $filesBlocks
 } else {
@@ -344,7 +397,9 @@ for ($b = 0; $b -lt $grp0Blocks; $b++) {
 }
 
 # Inode bitmap at block 4 (inodes 1..lastIno are used)
-$lastIno = if ($hasDoom) { 21 } elseif ($hasWad) { 20 } elseif ($hasFiles) { 19 } else { 12 }
+# Must cover the HIGHEST inode actually written above (index+1), else a
+# free-but-used inode gets handed out by the allocator and corrupts a file.
+$lastIno = if ($hasBusybox) { 23 } elseif ($hasLinuxTest) { 22 } elseif ($hasDoom) { 21 } elseif ($hasWad) { 20 } elseif ($hasFiles) { 19 } elseif ($hasTerm) { 18 } elseif ($hasNote) { 17 } elseif ($hasCalc) { 16 } elseif ($hasGui) { 15 } elseif ($hasElf) { 14 } elseif ($hasWall) { 13 } else { 12 }
 [Array]::Clear($img, 4 * $BS, $BS)
 for ($ino = 1; $ino -le $lastIno; $ino++) {
     $bit = $ino - 1
