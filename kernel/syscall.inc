@@ -41,6 +41,11 @@ sys_kernel_stack   dq 0
 sys_spawn_arg_buf  rb 128                ; Global buffer for launch argument/file path
 sys_spawn_argv_ptr dq 0                  ; Global pointer to user argv array (or 0)
 sys_spawn_abi    dq 0                    ; Pending TCB_ABI_TYPE for next finalize (0/1)
+sys_spawn_exec_mode dq 0                 ; !=0: elf_load_exec targets the RUNNING slot (execve)
+sys_spawn_exec_entry dq 0                ; (out) entry point of the image loaded in exec mode
+exec_path_buf    rb 64                   ; execve: staged pathname (kernel memory)
+exec_argv_stage  rb 16 * 128             ; execve: staged argv strings
+exec_argv_ptrs   dq 16                   ; execve: staged argv pointer table
 sys_spawn_in_fd    dd -1                 ; Redirected stdin fd for child (-1 = default console)
 sys_spawn_out_fd   dd -1                 ; Redirected stdout fd for child (-1 = default console)
 sys_spawn_err_fd   dd -1                 ; Redirected stderr fd for child (-1 = default console)

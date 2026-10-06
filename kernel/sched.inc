@@ -497,8 +497,12 @@ task_finalize_user:
     mov qword [rdi + TCB_TICKS], 0
     mov dword [rdi + TCB_IS_USER], 1
     mov dword [rdi + TCB_HEAP_BRK], 0x01000000 ; Initial user heap base (16MB)
+    ; execve: PARENT_ID must survive (this is a re-exec, not a new child)
+    cmp qword [r15 + sys_spawn_exec_mode - kmain], 0
+    jne @f
     mov eax, [r15 + sched_curr_task - kmain]
     mov dword [rdi + TCB_PARENT_ID], eax
+@@:
     mov dword [rdi + TCB_EXIT_CODE], 0
     mov dword [rdi + TCB_WAIT_TID], -1
     ; ABI type staged by the caller (elf spawn detection) BEFORE finalize:
@@ -534,6 +538,11 @@ task_finalize_user:
     add r8, TASK_STACK_SIZE
     mov [rdi + TCB_STACK_TOP], r8
     mov qword [rdi + TCB_FS_BASE], 0
+
+    ; execve: the return path is the (patched) syscall frame, not an iretq
+    ; image — and the task is already RUNNING, so skip the frame build.
+    cmp qword [r15 + sys_spawn_exec_mode - kmain], 0
+    jne .fxsave_setup
 
     ; Initialize kernel stack frame for iretq transition to Ring 3
     mov r9, r8
@@ -571,6 +580,7 @@ task_finalize_user:
     mov [rdi + TCB_RSP], r9
 
     ; Initialize task FPU/SSE state from clean Task 0 state
+.fxsave_setup:
     push rsi
     push rdi
     push rcx
@@ -581,6 +591,11 @@ task_finalize_user:
     pop rcx
     pop rdi
     pop rsi
+
+    ; execve: state stays RUNNING, task counter and fd table are already in
+    ; place — jump straight to the return value.
+    cmp qword [r15 + sys_spawn_exec_mode - kmain], 0
+    jne .exec_done
 
     ; Mark task as READY
     mov dword [rdi + TCB_STATE], TASK_READY
@@ -614,6 +629,7 @@ task_finalize_user:
     call vfs_redirect_child_fd
 @@:
 
+.exec_done:
     mov eax, ebx                      ; return TID
 
     pop r12

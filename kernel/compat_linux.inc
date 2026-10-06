@@ -58,6 +58,7 @@ LINUX_SYS_GETPPID     = 110
 ; Linux Error Codes (negative return values in RAX)
 LINUX_EPERM   = -1
 LINUX_EAGAIN  = -11
+LINUX_ENOEXEC = -8
 LINUX_ENOENT  = -2
 LINUX_ESRCH   = -3
 LINUX_EINTR   = -4
@@ -161,6 +162,8 @@ linux_syscall_dispatch:
     je .l_wait4
     cmp eax, LINUX_SYS_GETPPID
     je .l_getppid
+    cmp eax, LINUX_SYS_EXECVE
+    je .l_execve
 
     ; Unhandled Linux syscall: log to serial and return -ENOSYS
     push rax
@@ -545,6 +548,144 @@ linux_syscall_dispatch:
     imul eax, TCB_SIZE
     mov eax, [r15 + task_table - kmain + rax + TCB_PARENT_ID]
     inc eax                           ; slot -> pid (slot 0 -> 1 = init)
+    ret
+
+; ------------------------------------------------------------------------------
+; .l_execve: replace the current process image (Linux #59).
+;   RDI = pathname (user), RSI = argv (user array), RDX = envp — IGNORED
+;   (the loader provides its fixed PATH/HOME/USER/TERM/SHELL environment).
+; The pathname and argv strings are staged in KERNEL memory first — the old
+; image is about to be overwritten. The ext4 loader then loads into the RUNNING
+; slot (exec mode: same pid, fds, parent and page tables), and on success the
+; syscall return frame is patched so sysretq lands at the new entry point with
+; a fresh stack. On any failure the old image and frame stay untouched.
+; ------------------------------------------------------------------------------
+.l_execve:
+    lea rbx, [rsp]                    ; syscall frame base (callee-saved)
+    mov r12, rdi                      ; pathname (user pointer)
+    mov r13, rsi                      ; argv array (user pointer or 0)
+
+    ; Validate + copy the pathname into a kernel buffer (max 63 chars)
+    test r12, r12
+    jz .l_execve_fault
+    mov rdi, r12
+    mov rsi, 128
+    call sys_validate_user_ptr        ; preserves all regs except RAX
+    jc .l_execve_fault
+    lea rdi, [r15 + exec_path_buf - kmain]
+    mov rsi, r12
+    mov ecx, 63
+.l_execve_cp:
+    lodsb
+    stosb
+    test al, al
+    jz .l_execve_cp_done
+    dec ecx
+    jnz .l_execve_cp
+    mov byte [rdi], 0
+.l_execve_cp_done:
+
+    ; Stage argv into kernel memory BEFORE the image is replaced (the strings
+    ; may live in the very .rodata/.text the new segments are about to wipe)
+    mov qword [r15 + sys_spawn_argv_ptr - kmain], 0     ; 0 -> loader fallback
+    test r13, r13
+    jz .l_execve_argv_done
+    mov rdi, r13
+    mov rsi, 16 * 8
+    call sys_validate_user_ptr
+    jc .l_execve_argv_done
+    xor ecx, ecx                      ; arg index
+.l_execve_arg_loop:
+    cmp ecx, 16
+    jae .l_execve_arg_stop
+    mov rsi, [r13 + rcx*8]
+    test rsi, rsi
+    jz .l_execve_arg_stop
+    mov rdi, rsi
+    mov rsi, 128
+    call sys_validate_user_ptr
+    jc .l_execve_arg_stop
+    mov rax, rcx                      ; dest = exec_argv_stage + idx*128
+    shl rax, 7
+    lea rdi, [r15 + exec_argv_stage - kmain]
+    add rdi, rax
+    mov rsi, [r13 + rcx*8]
+    mov edx, 127
+.l_execve_str:
+    mov al, [rsi]
+    mov [rdi], al
+    inc rsi
+    inc rdi
+    test al, al
+    jz .l_execve_str_done
+    dec edx
+    jnz .l_execve_str
+    mov byte [rdi - 1], 0
+.l_execve_str_done:
+    inc ecx
+    jmp .l_execve_arg_loop
+
+.l_execve_arg_stop:
+    test ecx, ecx
+    jz .l_execve_argv_done
+    xor eax, eax                      ; exec_argv_ptrs[i] = stage + i*128
+.l_execve_ptr_loop:
+    cmp eax, ecx
+    jae .l_execve_ptr_done
+    mov rsi, rax
+    shl rsi, 7
+    lea rdi, [r15 + exec_argv_stage - kmain]
+    add rsi, rdi
+    mov [r15 + exec_argv_ptrs - kmain + rax*8], rsi
+    inc rax
+    jmp .l_execve_ptr_loop
+.l_execve_ptr_done:
+    mov qword [r15 + exec_argv_ptrs - kmain + rax*8], 0
+    lea rax, [r15 + exec_argv_ptrs - kmain]
+    mov [r15 + sys_spawn_argv_ptr - kmain], rax
+.l_execve_argv_done:
+
+    ; Load the new image into the RUNNING slot
+    mov qword [r15 + sys_spawn_exec_mode - kmain], 1
+    lea rsi, [r15 + exec_path_buf - kmain]
+    call elf_load_from_ext4           ; EAX = slot (ok) or ELF_ERR_* (negative)
+    mov qword [r15 + sys_spawn_exec_mode - kmain], 0
+    mov qword [r15 + sys_spawn_argv_ptr - kmain], 0
+    test eax, eax
+    js .l_execve_errmap
+
+    ; Success: point the syscall return frame at the new program
+    mov rax, [r15 + sys_spawn_exec_entry - kmain]
+    mov [rbx + 112], rax              ; user RIP
+    mov qword [rbx + 120], 0x1FFFFE00 ; user RSP (argc/argv/envp/auxv vector)
+    xor eax, eax
+    ret
+
+.l_execve_errmap:
+    cmp eax, ELF_ERR_NOT_FOUND
+    je .l_execve_enoent
+    cmp eax, ELF_ERR_READ_FAIL
+    je .l_execve_eio
+    cmp eax, ELF_ERR_OOM
+    je .l_execve_enomem
+    cmp eax, ELF_ERR_SPAWN_FAIL
+    je .l_execve_eagain
+    mov rax, LINUX_ENOEXEC            ; header / segment errors
+    ret
+.l_execve_enoent:
+    mov rax, LINUX_ENOENT
+    ret
+.l_execve_eio:
+    mov rax, LINUX_EIO
+    ret
+.l_execve_enomem:
+    mov rax, LINUX_ENOMEM
+    ret
+.l_execve_eagain:
+    mov rax, LINUX_EAGAIN
+    ret
+.l_execve_fault:
+    mov rax, LINUX_EFAULT
     ret
 
 .l_uname:

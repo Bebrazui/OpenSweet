@@ -28,15 +28,15 @@ io_uring, raw-сокетов/netlink и мультипроцессорного S
 (это уже не «ABI», а разметка Linux). Критерий — бинарники из официального
 Debian amd64 запускаются и выполняют свою работу, а не «проходят тесты».
 
-## 2. Где мы сейчас: 33 / ~450
+## 2. Где мы сейчас: 34 / ~450
 
-Фактически реализовано (`compat_linux.inc:87`, неизвестные → ENOSYS из
-`compat_linux.inc:165`):
+Фактически реализовано (`compat_linux.inc:88`, неизвестные → ENOSYS из
+`compat_linux.inc:168`):
 
 ```
 read(0) write(1) open(2) close(3) lseek(8) poll(7) ioctl(16) writev(20)
 mmap(9) mprotect(10) munmap(11) brk(12) dup2(33) getpid(39)
-clone(56) fork(57) vfork(58) wait4(61) getppid(110)
+clone(56) fork(57) vfork(58) execve(59) wait4(61) getppid(110)
 exit(60) exit_group(231) uname(63) getcwd(79) chdir(80) mkdir(83)
 rmdir(84) unlink(87) arch_prctl(158) set_tid_address(218)
 getuid(102) getgid(104) geteuid(107) getegid(108)
@@ -46,7 +46,8 @@ getuid(102) getgid(104) geteuid(107) getegid(108)
 musl/glibc-кода → mmap-зона/brk/TLS → вывод через пайп в GUI-терминал →
 exit-код. Эмпирически подтверждено: `linux_test.elf`, `busybox echo …`,
 полный список апплетов `busybox`, цепочка `fork → child exit 42 →
-wait4 → status=0x2a00`.
+wait4 → status=0x2a00`, `fork → child execve('/busybox', …) →
+busybox печатает argv → parent wait4 → pid сохранён, status=0x0`.
 
 **Метод развития — покрытие таблицы, а не отдельные «фичи»:**
 - `docs/linux-syscalls.md` — матрица: номер → имя → статус
@@ -136,8 +137,31 @@ wait4 → status=0x2a00`.
       конвертации; status уже POSIX `(code&0xFF)<<8`, ожидает
       `sys_handler_waitpid`), `.l_getppid` = PARENT_ID+1.
       Проверено: `fork → child exit 42 → parent wait4 → status=0x2a00`.
-- [ ] **execve из ring3** (сейчас exec есть только через spawn терминала),
-      **waitid**, **setsid/getpgrp/setpgid** (job control шелла).
+- [x] **execve из ring3** — `.l_execve` (59): pathname + argv стейджятся
+      в ЯДРО (`exec_path_buf`/`exec_argv_stage`) ДО замены образа — строки
+      могут лежать в перезаписываемом .rodata/.text. Режим
+      `sys_spawn_exec_mode` переиспользует `elf_load_exec` для загрузки в
+      ТЕКУЩИЙ слот: тот же pid/fd-таблица/родитель/страницы; wipe 4MB+2MB
+      пропускается (неудачная загрузка не убивает работающий образ, stale
+      байты вне сегментов/BSS недостижимы), валидация argv пропускается для
+      ядрового стейджинга. `task_finalize_user` в exec-режиме сбрасывает
+      только per-exec поля (HEAP_BRK/FS_BASE/ABI/NAME/FXSAVE), PARENT_ID,
+      STATE, счётчик и fd не трогает. Успех → патч syscall-рамки
+      (RIP=e_entry, RSP=0x1FFFFE00) и sysretq прямо в новый образ; ошибки
+      загрузчика мапятся в Linux-errno (ENOENT/EIO/ENOEXEC/ENOMEM/EAGAIN,
+      невалидный ptr → EFAULT). envp игнорируется (loader даёт фиксированный
+      PATH/HOME/USER/TERM/SHELL).
+      Детект ABI дополнен content-based: **PT_GNU_STACK → Linux** (GNU ld
+      всегда ставит, PE-derived никогда) — произвольные Debian-бинарники
+      классифицируются без зависимости от имени; имя-эвристика — фолбэк.
+      Нюанс тестов: ядро отдаёт на входе RSP≡0 mod 16 (как Linux
+      `STACK_ROUND &~15`), а C `_start` скомпилирован под вызывающее
+      соглашение (≡8) — в тест добавлен asm-трамплин `_start: and; call`
+      (как crt1 в glibc/musl), без него `movaps` падал с #GP.
+      Проверено: `fork → child execve('/busybox', ['busybox','echo',
+      'hello-from-execve']) → печатает argv → parent wait4 → pid=6
+      сохранён, status=0x0`.
+- [ ] **waitid**, **setsid/getpgrp/setpgid** (job control шелла).
 - [ ] **Сигналы**: rt_sigaction/rt_sigprocmask/**sigreturn**, kill/tgkill,
       минимальный набор SIGINT/SIGTERM/SIGCHLD/SIGPIPE/SIGSEGV/SIGALRM;
       Ctrl+C терминала → SIGINT процессу; запись в пайп без readers → SIGPIPE

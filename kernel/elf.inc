@@ -339,6 +339,10 @@ elf_load_exec:
     push r11                          ; [rsp + 0]  = phnum
 
     ; 7. Allocate user task slot with private page tables and memory
+    ; execve mode: reuse the RUNNING task's slot — pid, fds and page tables
+    ; survive, only the image/stack/TCB-exec-state are replaced.
+    cmp qword [r15 + sys_spawn_exec_mode - kmain], 0
+    jne .slot_current
     call task_alloc_user_slot
     cmp eax, -1
     jne .slot_ok
@@ -348,6 +352,18 @@ elf_load_exec:
     call puts
     mov eax, ELF_ERR_SPAWN_FAIL
     jmp .exec_fail
+
+.slot_current:
+    mov ebx, [r15 + sched_curr_task - kmain]
+    mov eax, ebx
+    dec eax                           ; slot -> 0-based
+    imul eax, USER_MEM_STRIDE
+    add eax, USER_PHYS_BASE           ; phys_code of the current slot
+    mov r9, rax
+    add rax, 0x00400000
+    mov r10, rax                      ; phys_stack (phys_code + 4MB)
+    imul eax, ebx, TCB_SIZE
+    mov r8, [r15 + task_table - kmain + rax + TCB_CR3]
 
 .slot_ok:
     ; EBX = slot ID (1..MAX_TASKS-1)
@@ -371,6 +387,10 @@ elf_load_exec:
     ; [rsp + 48] = phoff
 
     ; Zero out private physical code (4MB) and stack (2MB)
+    ; execve: skip the wipe — a failed load must leave the RUNNING image
+    ; intact, and stale bytes outside the new segments/BSS are unreachable.
+    cmp qword [r15 + sys_spawn_exec_mode - kmain], 0
+    jne .skip_zero
     mov rdi, [rsp + 16]               ; phys_code
     mov ecx, (4 * 1024 * 1024) / 8
     xor eax, eax
@@ -381,6 +401,7 @@ elf_load_exec:
     mov ecx, (2 * 1024 * 1024) / 8
     xor eax, eax
     rep stosq
+.skip_zero:
 
     ; 8. Iterate program headers and load PT_LOAD segments
     xor ebx, ebx                      ; ebx = phdr index (0..phnum-1)
@@ -512,10 +533,17 @@ elf_load_exec:
     jz .fallback_args
 
     ; Validate argv array pointer (up to 16 entries * 8 bytes = 128 bytes)
+    ; execve: the table was staged in KERNEL memory before the old image was
+    ; overwritten — skip the user-range check (CF must be defined for the jc).
     push rbx
+    cmp qword [r15 + sys_spawn_exec_mode - kmain], 0
+    jne @f
     mov rdi, r9
     mov rsi, 128
     call sys_validate_user_ptr
+    jmp .argv_arr_checked
+@@: clc
+.argv_arr_checked:
     pop rbx
     jc .fallback_args
 
@@ -532,13 +560,20 @@ elf_load_exec:
     jz .argv_copied
 
     ; Validate string pointer (up to 128 bytes string buffer)
+    ; execve: staged kernel pointer — skip the user-range check.
     push rcx
     push r9
     push rbx
     push rsi                          ; save user string ptr: the validator is
+    cmp qword [r15 + sys_spawn_exec_mode - kmain], 0
+    je .str_validate
+    clc
+    jmp .str_checked
+.str_validate:
     mov rdi, rsi                      ; called with rsi = length, which would
     mov rsi, 128                      ; otherwise leave the copy reading [128]
     call sys_validate_user_ptr
+.str_checked:
     pop rsi
     pop rbx
     pop r9
@@ -734,6 +769,21 @@ if defined CONFIG_LINUX_COMPAT
     push rsi
     push rax
     mov qword [r15 + sys_spawn_abi - kmain], 0
+    ; Content scan first: GNU ld (Linux toolchains) always emits PT_GNU_STACK,
+    ; PE-derived ELFs (our native apps / mingw-built test bins) never do — so
+    ; arbitrary Debian binaries classify correctly regardless of file name.
+    mov rsi, [r12 + EHDR_OFF_PHOFF]
+    movzx ecx, word [r12 + EHDR_OFF_PHNUM]
+    movzx eax, word [r12 + EHDR_OFF_PHENTSIZE]
+.abi_ph_loop:
+    test ecx, ecx
+    jz .abi_name_check
+    cmp dword [r12 + rsi + PHDR_OFF_TYPE], 0x6474E551  ; PT_GNU_STACK
+    je .abi_is_linux
+    add rsi, rax
+    dec ecx
+    jmp .abi_ph_loop
+.abi_name_check:
     mov rsi, r14
     mov rdi, r14                     ; candidate basename start
 .abi_scan:
@@ -773,6 +823,7 @@ end if
     ; R8  = user stack top (0x1FFFFE00 = start of the argv/envp/auxv vector)
     mov rsi, r14
     mov rdx, r8                       ; entry RIP
+    mov qword [r15 + sys_spawn_exec_entry - kmain], r8 ; for execve frame patch
     mov r8,  0x1FFFFE00               ; user RSP
     call task_finalize_user
     cmp eax, -1

@@ -73,7 +73,19 @@ static void print_hex(unsigned long long v) {
 
 static const char msg[] = "[Linux ABI] Hello from native Linux x86_64 ELF!\n";
 
-void _start(void) {
+/* Entry trampoline: the kernel enters the process with a 16-byte-aligned RSP
+ * (exactly like Linux create_elf_tables/STACK_ROUND), but GCC compiles C
+ * functions under the CALL convention where RSP%16==8 on entry — otherwise
+ * SSE spills (movaps) die with #GP on the misaligned address. glibc/musl crt1
+ * do the same: align the stack, then CALL the C code. */
+__asm__(
+    ".global _start\n"
+    "_start:\n"
+    "    andq $-16, %rsp\n"
+    "    call os_main\n"
+);
+
+void os_main(void) {
     sys3(1, 1, (long long)msg, sizeof(msg) - 1);
 
     long long pid = sys1(57, 0);                 /* fork() */
@@ -97,6 +109,40 @@ void _start(void) {
     } else {
         print("[Linux ABI] fork failed: ");
         print_dec(pid);
+        print("\n");
+    }
+
+    /* execve test: the child replaces its image with /busybox echo ...
+     * xargv lives on the child's stack — the kernel must stage it before
+     * overwriting the old image. */
+    long long pid2 = sys1(57, 0);
+    if (pid2 == 0) {
+        static const char a0[] = "busybox";
+        static const char a1[] = "echo";
+        static const char a2[] = "hello-from-execve";
+        long long xargv[4];
+        xargv[0] = (long long)a0;
+        xargv[1] = (long long)a1;
+        xargv[2] = (long long)a2;
+        xargv[3] = 0;
+        long long er = sys3(59, (long long)"/busybox", (long long)xargv, 0);
+        print("[Linux ABI] execve failed: ");   /* reached only on error */
+        print_dec(er);
+        print("\n");
+        sys1(60, 1);
+    } else if (pid2 > 0) {
+        int st2 = 0;
+        long long w2 = sys_wait4(pid2, &st2);
+        print("[Linux ABI] execve parent: child=");
+        print_dec(pid2);
+        print(" wait=");
+        print_dec(w2);
+        print(" status=0x");
+        print_hex((unsigned long long)(unsigned int)st2);
+        print("\n");
+    } else {
+        print("[Linux ABI] fork2 failed: ");
+        print_dec(pid2);
         print("\n");
     }
 
