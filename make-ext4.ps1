@@ -207,7 +207,8 @@ $linuxTestSrc = Join-Path $PSScriptRoot "user\linux_test.c"
 $linuxTestExe = Join-Path $PSScriptRoot "build\linux_test.exe"
 $linuxTestElf = Join-Path $PSScriptRoot "build\linux_test.elf"
 if (Test-Path $linuxTestSrc) {
-    & $gccPath "-B$(Split-Path $gccPath)" -mabi=sysv -nostdlib "-Wl,--image-base=0x400000" -O2 $linuxTestSrc -o $linuxTestExe 2>$null
+    # -e _start: без crt0 нет mainCRTStartup, иначе ld дефолтит entry на начало .text
+    & $gccPath "-B$(Split-Path $gccPath)" -mabi=sysv -nostdlib "-Wl,--image-base=0x400000" "-Wl,-e,_start" -O2 $linuxTestSrc -o $linuxTestExe 2>$null
     if (Test-Path $linuxTestExe) {
         & $objcopyPath -O elf64-x86-64 $linuxTestExe $linuxTestElf
         Remove-Item $linuxTestExe -ErrorAction SilentlyContinue

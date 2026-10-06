@@ -52,9 +52,12 @@ LINUX_SYS_EXIT_GROUP  = 231
 LINUX_SYS_OPENAT      = 257
 LINUX_SYS_MKDIRAT     = 258
 LINUX_SYS_UNLINKAT    = 263
+LINUX_SYS_VFORK       = 58
+LINUX_SYS_GETPPID     = 110
 
 ; Linux Error Codes (negative return values in RAX)
 LINUX_EPERM   = -1
+LINUX_EAGAIN  = -11
 LINUX_ENOENT  = -2
 LINUX_ESRCH   = -3
 LINUX_EINTR   = -4
@@ -148,6 +151,16 @@ linux_syscall_dispatch:
     je .l_zero_id
     cmp eax, LINUX_SYS_GETEGID
     je .l_zero_id
+    cmp eax, LINUX_SYS_FORK
+    je .l_fork
+    cmp eax, LINUX_SYS_VFORK
+    je .l_fork
+    cmp eax, LINUX_SYS_CLONE
+    je .l_fork
+    cmp eax, LINUX_SYS_WAIT4
+    je .l_wait4
+    cmp eax, LINUX_SYS_GETPPID
+    je .l_getppid
 
     ; Unhandled Linux syscall: log to serial and return -ENOSYS
     push rax
@@ -303,6 +316,235 @@ linux_syscall_dispatch:
     mov al, 10
     call putc
     call task_exit
+    ret
+
+; ------------------------------------------------------------------------------
+; .l_fork / .l_vfork / .l_clone (simplified): duplicate the current task.
+;   fork/vfork -> identical call site, both land here.
+;   clone(flags, stack, ...) -> flags and child_stack are IGNORED: the child
+;   gets a private copy of the parent's VM and continues on its own stack copy.
+;   That is semantically wrong for CLONE_VM/CLONE_THREAD (Tier B), but correct
+;   enough for vfork+exec and musl's clone-based spawn helpers (child never
+;   shares the parent's stack with the parent running, so no interference).
+;
+; Child frame is built so sched_restore + iretq resumes it with RAX = 0 at the
+; same RIP/RSP as the parent; the parent gets the child pid (slot + 1, the
+; same numbering .l_getpid uses).
+;
+; Register frame of the syscall stub at this point (its pushes are balanced
+; before the dispatcher's call, so [rsp+0] = return address into the stub):
+;   +8 r10, +16 r9, +24 r8, +32 rdi, +40 rsi, +48 rdx, +56 r15,
+;   +64 r14, +72 r13, +80 r12, +88 rbx, +96 rbp, +104 r11 (=RFLAGS),
+;   +112 user RIP (rcx), +120 user RSP
+; ------------------------------------------------------------------------------
+.l_fork:
+    lea rbx, [rsp]                    ; rbx = stable frame base (keep!)
+
+    ; 1. Fresh slot + page tables (child TCB, CR3, phys code/stack bases)
+    push rbx
+    call task_alloc_user_slot
+    pop rbx
+    cmp eax, -1
+    je .l_fork_eagain
+    ; EAX = slot, RDI = child TCB, R9 = child phys_code, R10 = child phys_stack
+    mov r12d, eax                     ; r12 = child slot
+    mov r13, rdi                      ; r13 = child TCB
+    mov r14, r9                       ; r14 = child phys_code
+    mov r11, r10                      ; r11 = child phys_stack
+
+    ; Link the child to this parent before the long copies: a concurrent
+    ; waitpid scan must never see the half-built slot as its own zombie.
+    mov eax, [r15 + sched_curr_task - kmain]
+    mov [r13 + TCB_PARENT_ID], eax
+
+    ; 2. Deep-copy parent code (4MB) and stack (2MB) into the child's slot
+    mov ecx, [r15 + sched_curr_task - kmain]
+    dec ecx                           ; parent slot -> 0-based
+    imul ecx, USER_MEM_STRIDE
+    add ecx, USER_PHYS_BASE           ; ecx = parent phys_code
+    mov r8, rcx                       ; r8  = parent phys_code
+    lea r9, [rcx + 0x00400000]        ; r9  = parent phys_stack
+    mov rsi, r8
+    mov rdi, r14
+    mov ecx, (4 * 1024 * 1024) / 8
+    rep movsq                         ; code slot
+    mov rsi, r9
+    mov rdi, r11
+    mov ecx, (2 * 1024 * 1024) / 8
+    rep movsq                         ; stack slot
+
+    ; 3. File descriptor table: copy the parent's row, bump pipe refcounts
+    ;    (mirrors vfs_dup2; the child's vfs_cleanup_task_fds drops them again)
+    mov eax, [r15 + sched_curr_task - kmain]
+    imul eax, MAX_FDS_PER_TASK * FD_ENTRY_SIZE
+    lea rsi, [r15 + task_fd_tables - kmain + rax]
+    mov eax, r12d
+    imul eax, MAX_FDS_PER_TASK * FD_ENTRY_SIZE
+    lea rdi, [r15 + task_fd_tables - kmain + rax]
+    mov ecx, (MAX_FDS_PER_TASK * FD_ENTRY_SIZE) / 8
+    rep movsq
+    mov eax, r12d
+    imul eax, MAX_FDS_PER_TASK * FD_ENTRY_SIZE
+    lea rdi, [r15 + task_fd_tables - kmain + rax]
+    xor ecx, ecx
+.l_fork_fd_loop:
+    cmp ecx, MAX_FDS_PER_TASK
+    jae .l_fork_fd_done
+    cmp byte [rdi], FD_TYPE_PIPE
+    jne .l_fork_fd_next
+    movzx eax, word [rdi + 2]
+    imul eax, eax, PIPE_STRUCT_SIZE
+    lea rdx, [r15 + pipe_table - kmain + rax]
+    cmp byte [rdi + 1], O_RDONLY
+    jne .l_fork_fd_wr
+    inc word [rdx + 12]               ; readers++
+    jmp .l_fork_fd_next
+.l_fork_fd_wr:
+    inc word [rdx + 14]               ; writers++
+.l_fork_fd_next:
+    add rdi, FD_ENTRY_SIZE
+    inc ecx
+    jmp .l_fork_fd_loop
+.l_fork_fd_done:
+
+    ; 4. TCB fields: child inherits, parent slot links, spawn-only state reset
+    mov eax, [r15 + sched_curr_task - kmain]
+    imul eax, TCB_SIZE
+    lea rbp, [r15 + task_table - kmain + rax]   ; rbp = parent TCB
+    mov [r13 + TCB_ID], r12d
+    mov dword [r13 + TCB_SLEEP], 0
+    mov dword [r13 + TCB_SLICE], SCHED_QUANTUM
+    mov dword [r13 + TCB_TICKS], 0
+    mov dword [r13 + TCB_IS_USER], 1
+    mov dword [r13 + TCB_EXIT_CODE], 0
+    mov dword [r13 + TCB_WAIT_TID], -1
+    mov eax, [rbp + TCB_HEAP_BRK]     ; brk heap is identity-shared anyway,
+    mov [r13 + TCB_HEAP_BRK], eax     ; keep the same break point
+    mov eax, [rbp + TCB_ABI_TYPE]
+    mov [r13 + TCB_ABI_TYPE], eax
+    mov rax, [rbp + TCB_FS_BASE]      ; musl TLS base (same memory image)
+    mov [r13 + TCB_FS_BASE], rax
+    mov rax, [rbx + 120]
+    mov [r13 + TCB_USER_RSP], rax     ; parent user RSP
+    mov rax, [rbp + TCB_NAME]
+    mov [r13 + TCB_NAME], rax
+    lea rsi, [rbp + TCB_FXSAVE]       ; FPU/SSE state from the parent
+    lea rdi, [r13 + TCB_FXSAVE]
+    mov ecx, 512 / 8
+    rep movsq
+
+    ; 5. Child kernel stack + initial iretq frame (parent register snapshot)
+    mov eax, r12d
+    imul eax, TASK_STACK_SIZE
+    lea rax, [r15 + task_stacks - kmain + rax]
+    mov [r13 + TCB_STACK_BASE], rax
+    add rax, TASK_STACK_SIZE
+    mov [r13 + TCB_STACK_TOP], rax
+    mov rdi, rax                      ; rdi walks downward building the frame
+
+    ; iretq image (high -> low): SS, user RSP, RFLAGS, CS, RIP
+    sub rdi, 8
+    mov qword [rdi], 0x23             ; USER_DATA_SEL | 3
+    sub rdi, 8
+    mov rsi, [rbx + 120]
+    mov [rdi], rsi                    ; user RSP
+    sub rdi, 8
+    mov rsi, [rbx + 104]
+    mov [rdi], rsi                    ; RFLAGS (r11 slot = flags after SYSCALL)
+    sub rdi, 8
+    mov qword [rdi], 0x2B             ; USER_CODE_SEL | 3
+    sub rdi, 8
+    mov rsi, [rbx + 112]
+    mov [rdi], rsi                    ; user RIP
+
+    ; GPR image in sched_restore pop order reversed (rax highest .. r15 lowest)
+    sub rdi, 8
+    xor eax, eax
+    mov [rdi], rax                    ; rax = 0: fork returns 0 in the child
+    sub rdi, 8
+    mov rsi, [rbx + 88]
+    mov [rdi], rsi                    ; rbx
+    sub rdi, 8
+    mov rsi, [rbx + 112]
+    mov [rdi], rsi                    ; rcx (user rcx is lost to SYSCALL anyway)
+    sub rdi, 8
+    mov rsi, [rbx + 48]
+    mov [rdi], rsi                    ; rdx
+    sub rdi, 8
+    mov rsi, [rbx + 40]
+    mov [rdi], rsi                    ; rsi
+    sub rdi, 8
+    mov rsi, [rbx + 32]
+    mov [rdi], rsi                    ; rdi
+    sub rdi, 8
+    mov rsi, [rbx + 96]
+    mov [rdi], rsi                    ; rbp
+    sub rdi, 8
+    mov rsi, [rbx + 24]
+    mov [rdi], rsi                    ; r8
+    sub rdi, 8
+    mov rsi, [rbx + 16]
+    mov [rdi], rsi                    ; r9
+    sub rdi, 8
+    mov rsi, [rbx + 8]
+    mov [rdi], rsi                    ; r10
+    sub rdi, 8
+    mov rsi, [rbx + 104]
+    mov [rdi], rsi                    ; r11 (flags copy: same value the parent
+                                      ; sees in r11 after sysret)
+    sub rdi, 8
+    mov rsi, [rbx + 80]
+    mov [rdi], rsi                    ; r12
+    sub rdi, 8
+    mov rsi, [rbx + 72]
+    mov [rdi], rsi                    ; r13
+    sub rdi, 8
+    mov rsi, [rbx + 64]
+    mov [rdi], rsi                    ; r14
+    sub rdi, 8
+    mov rsi, [rbx + 56]
+    mov [rdi], rsi                    ; r15 (lowest GPR slot)
+    mov [r13 + TCB_RSP], rdi
+
+    ; 6. Publish the child: READY + task counter, then return its pid
+    inc dword [r15 + sched_task_cnt - kmain]
+    mov dword [r13 + TCB_STATE], TASK_READY
+    lea eax, [r12 + 1]                ; pid = slot + 1 (matches .l_getpid)
+    ret
+
+.l_fork_eagain:
+    mov rax, LINUX_EAGAIN             ; -11: no free task slots
+    ret
+
+; ------------------------------------------------------------------------------
+; .l_wait4: Linux wait4(pid, status, options, rusage) - rusage (R10) ignored.
+; pid > 1 -> 1-based pid translated to slot; pid <= 0 -> any child.
+; sys_handler_waitpid already writes POSIX status ((code & 0xFF) << 8) and
+; returns the slot; convert back to pid on success.
+; ------------------------------------------------------------------------------
+.l_wait4:
+    cmp rdi, 1
+    jl .l_wait4_any                   ; 0 / negative -> any child
+    je .l_wait4_echild                ; pid 1 = kernel task, never a child
+    dec rdi                           ; slot = pid - 1
+    cmp rdi, MAX_TASKS
+    jae .l_wait4_echild
+.l_wait4_any:
+    call sys_handler_waitpid
+    test rax, rax
+    jle .l_wait4_done                 ; 0 (WNOHANG) or -errno pass through
+    inc rax                           ; slot -> pid
+.l_wait4_done:
+    ret
+.l_wait4_echild:
+    mov rax, -10                      ; -ECHILD
+    ret
+
+.l_getppid:
+    mov eax, [r15 + sched_curr_task - kmain]
+    imul eax, TCB_SIZE
+    mov eax, [r15 + task_table - kmain + rax + TCB_PARENT_ID]
+    inc eax                           ; slot -> pid (slot 0 -> 1 = init)
     ret
 
 .l_uname:

@@ -28,14 +28,15 @@ io_uring, raw-сокетов/netlink и мультипроцессорного S
 (это уже не «ABI», а разметка Linux). Критерий — бинарники из официального
 Debian amd64 запускаются и выполняют свою работу, а не «проходят тесты».
 
-## 2. Где мы сейчас: 28 / ~450
+## 2. Где мы сейчас: 33 / ~450
 
-Фактически реализовано (`compat_linux.inc:82`, неизвестные → ENOSYS из
-`compat_linux.inc:150`):
+Фактически реализовано (`compat_linux.inc:87`, неизвестные → ENOSYS из
+`compat_linux.inc:165`):
 
 ```
 read(0) write(1) open(2) close(3) lseek(8) poll(7) ioctl(16) writev(20)
 mmap(9) mprotect(10) munmap(11) brk(12) dup2(33) getpid(39)
+clone(56) fork(57) vfork(58) wait4(61) getppid(110)
 exit(60) exit_group(231) uname(63) getcwd(79) chdir(80) mkdir(83)
 rmdir(84) unlink(87) arch_prctl(158) set_tid_address(218)
 getuid(102) getgid(104) geteuid(107) getegid(108)
@@ -44,7 +45,8 @@ getuid(102) getgid(104) geteuid(107) getegid(108)
 Уже работает end-to-end: детект ABI → spawn → argv/envp/auxv → старт
 musl/glibc-кода → mmap-зона/brk/TLS → вывод через пайп в GUI-терминал →
 exit-код. Эмпирически подтверждено: `linux_test.elf`, `busybox echo …`,
-полный список апплетов `busybox`.
+полный список апплетов `busybox`, цепочка `fork → child exit 42 →
+wait4 → status=0x2a00`.
 
 **Метод развития — покрытие таблицы, а не отдельные «фичи»:**
 - `docs/linux-syscalls.md` — матрица: номер → имя → статус
@@ -119,12 +121,23 @@ exit-код. Эмпирически подтверждено: `linux_test.elf`, 
 
 ### Фаза 2 — процессы и сигналы → Tier A
 
-- [ ] **fork/clone** — клонирование таблицы страниц (сначала deep copy,
-      потом COW), fd-таблицы, TCB. Основа для `sh -c`, конвейеров, всех
-      оболочек.
+- [x] **fork/clone** — `.l_fork` (57/58/56): deep copy кода (4MB) и стека
+      (2MB) в новый слот через `task_alloc_user_slot`, копия fd-таблицы
+      с инкрементом pipe refcount (зеркало `vfs_dup2`), TCB поле-в-поле
+      (HEAP_BRK/ABI/FS_BASE/FXSAVE от родителя; PARENT_ID выставляется до
+      копирования — гонка с чужим waitpid исключена; CR3 от alloc),
+      дочерний iretq-фрейм строится из syscall-рамки родителя (RAX=0,
+      RIP/RSP/регистры те же), возврат = слот+1 (= getpid), нет слота →
+      -EAGAIN. clone-флаги и child_stack игнорируются: child получает
+      приватную копию VM (корректно для vfork+exec и shell-оболочек,
+      CLONE_VM/CLONE_THREAD — Фаза 5/Tier B).
+- [x] **wait4/getppid** — `.l_wait4` (pid>1 → слот=pid-1, pid≤0 → любой
+      ребёнок, pid=1 → -ECHILD; успех → pid, WNOHANG/ошибки без
+      конвертации; status уже POSIX `(code&0xFF)<<8`, ожидает
+      `sys_handler_waitpid`), `.l_getppid` = PARENT_ID+1.
+      Проверено: `fork → child exit 42 → parent wait4 → status=0x2a00`.
 - [ ] **execve из ring3** (сейчас exec есть только через spawn терминала),
-      **wait4/waitid** с корректными WEXITSTATUS/WTERMSIG, **getppid/setsid/
-      getpgrp/setpgid** (job control шелла).
+      **waitid**, **setsid/getpgrp/setpgid** (job control шелла).
 - [ ] **Сигналы**: rt_sigaction/rt_sigprocmask/**sigreturn**, kill/tgkill,
       минимальный набор SIGINT/SIGTERM/SIGCHLD/SIGPIPE/SIGSEGV/SIGALRM;
       Ctrl+C терминала → SIGINT процессу; запись в пайп без readers → SIGPIPE
