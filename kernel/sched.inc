@@ -42,7 +42,8 @@ TCB_FXSAVE      = 0x70                ; 512 bytes: 16-byte aligned FXSAVE/FXRSTO
 TCB_SIG_PENDING = 0x270               ; uint64: pending signal bitmap (bit = sig-1)
 TCB_SIG_BLOCKED = 0x278               ; uint64: blocked mask (rt_sigprocmask)
 TCB_SIG_SENDER  = 0x280               ; uint32: pid of last kill() sender (si_pid)
-                                      ; (0x288: pad — 16-byte alignment of the table)
+TCB_ALARM_MS    = 0x288               ; uint32: alarm(2) countdown in ms (0 = off)
+                                      ; (0x28C..0x28F: pad — 16-byte alignment of the table)
 TCB_SIG_ACT     = 0x290               ; 64 entries * 32 bytes, per signal (sig-1)*32:
                                       ;   +0  handler  (0 = SIG_DFL, 1 = SIG_IGN, else addr)
                                       ;   +8  restorer (SA_RESTORER trampoline address)
@@ -57,6 +58,9 @@ align 16
 sched_enabled   dd 0
 sched_curr_task dd 0                  ; Index 0..MAX_TASKS-1
 sched_task_cnt  dd 1                  ; 1 task initially (Task 0 = Shell)
+fg_linux_slot   dd -1                 ; Last spawned Linux ABI task: the key
+                                      ; IRQ sends SIGINT to this slot on Ctrl+C;
+                                      ; -1/stale slots -> sig_send ESRCH (no-op)
 
 align 16
 task_table:     rb (MAX_TASKS * TCB_SIZE)
@@ -520,6 +524,10 @@ task_finalize_user:
     mov eax, dword [r15 + sys_spawn_abi - kmain]
     mov dword [rdi + TCB_ABI_TYPE], eax
     mov qword [r15 + sys_spawn_abi - kmain], 0
+    test eax, eax
+    jz @f
+    mov dword [r15 + fg_linux_slot - kmain], ebx  ; Linux image: Ctrl+C target
+@@:
     mov qword [rdi + TCB_FS_BASE], 0
     mov [rdi + TCB_USER_RSP], r11
 
@@ -528,6 +536,7 @@ task_finalize_user:
     ; survives execve (POSIX) and starts cleared with the task table on spawn.
     mov qword [rdi + TCB_SIG_PENDING], 0
     mov qword [rdi + TCB_SIG_SENDER], 0
+    mov dword [rdi + TCB_ALARM_MS], 0  ; no pending alarm on (re)load (POSIX)
     push rdi
     lea rdi, [rdi + TCB_SIG_ACT]
     xor eax, eax
@@ -771,6 +780,21 @@ sched_tick:
 
     imul eax, ebx, TCB_SIZE
     lea rsi, [r15 + task_table - kmain + rax]
+    ; alarm(2) countdown (independent of the sleep state): at zero queue
+    ; SIGALRM — sig_send_to_task gates on ABI==1 and wakes a sleeping target
+    mov edx, [rsi + TCB_ALARM_MS]
+    test edx, edx
+    jz .no_alarm
+    dec edx
+    mov [rsi + TCB_ALARM_MS], edx
+    jnz .no_alarm
+    mov edi, ebx
+    mov esi, 14                      ; Linux SIGALRM (constants come later)
+    xor edx, edx
+    call sig_send_to_task
+    imul eax, ebx, TCB_SIZE          ; sig_send returns in eax: reload TCB ptr
+    lea rsi, [r15 + task_table - kmain + rax]
+.no_alarm:
     cmp dword [rsi + TCB_STATE], TASK_SLEEPING
     jne .next_sleep
 

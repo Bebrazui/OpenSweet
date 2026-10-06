@@ -58,6 +58,7 @@ LINUX_SYS_RT_SIGACTION = 13
 LINUX_SYS_RT_SIGPROCMASK = 14
 LINUX_SYS_RT_SIGRETURN = 15
 LINUX_SYS_PAUSE       = 34
+LINUX_SYS_ALARM       = 37
 LINUX_SYS_KILL        = 62
 LINUX_SYS_SETPGID     = 109
 LINUX_SYS_GETPGRP     = 111
@@ -67,10 +68,16 @@ LINUX_SYS_GETSID      = 124
 LINUX_SYS_TGKILL      = 234
 
 ; Signal numbers (Linux x86_64 numbering)
+LINUX_SIGINT   = 2
+LINUX_SIGILL   = 4
+LINUX_SIGTRAP  = 5
+LINUX_SIGBUS   = 7
+LINUX_SIGFPE   = 8
 LINUX_SIGKILL  = 9
 LINUX_SIGUSR1  = 10
 LINUX_SIGSEGV  = 11
 LINUX_SIGPIPE  = 13
+LINUX_SIGALRM  = 14
 LINUX_SIGTERM  = 15
 LINUX_SIGCHLD  = 17
 LINUX_SIGCONT  = 18
@@ -292,6 +299,39 @@ sig_send_to_task:
     ret
 
 ; ------------------------------------------------------------------------------
+; sig_kill_current: default signal action — log "[Linux ABI] Terminated by
+; signal N" and terminate the current task with the WIFSIGNALED marker
+; (0x80000000 | sig in TCB_EXIT_CODE -> waitpid raw status).
+; In: ESI = signal number. Never returns.
+; ------------------------------------------------------------------------------
+sig_kill_current:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi                          ; sig lives at [rsp + 24]
+    push rdi
+    push r8
+    push r9
+    lea rsi, [r15 + str_l_sigkill - kmain]
+    call puts
+    mov rax, [rsp + 24]               ; sig (puts may clobber caller-saves)
+    call putdec64
+    mov al, 10
+    call putc
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi                           ; sig back in ESI
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    mov edi, esi
+    or edi, 0x80000000                ; signal-death marker for waitpid
+    call task_exit                    ; never returns
+
+; ------------------------------------------------------------------------------
 ; sig_on_syscall_ret: deliver pending signals just before returning to ring 3.
 ; Called from .syscall_ret with RSP = frame base F and RAX = syscall result,
 ; interrupts off. May patch the frame (enter a signal handler) or never return
@@ -318,6 +358,9 @@ sig_on_syscall_ret:
     lea rbx, [r15 + task_table - kmain + rbx]
     cmp dword [rbx + TCB_ABI_TYPE], 1
     jne .sor_ret
+    movsxd r12, r12d                  ; Linux errno convention: 32-bit -errno
+                                      ; returns must reach user space as
+                                      ; sign-extended 64-bit values
 .sor_loop:
     call sig_next_actionable          ; EAX = sig, EDX = DFL/handler
     test eax, eax
@@ -430,26 +473,8 @@ sig_on_syscall_ret:
     jmp .sor_loop                     ; queue may hold another signal
     ; ---------------- default action: terminate ----------------
 .sor_die:
-    ; log "[Linux ABI] Terminated by signal N"
-    push r13                          ; sig (deepest of the 5 pushes = [rsp+32])
-    push rax
-    push rcx
-    push rdx
-    push rsi
-    lea rsi, [r15 + str_l_sigkill - kmain]
-    call puts
-    mov rax, [rsp + 32]               ; sig (puts may clobber caller-saves)
-    call putdec64
-    mov al, 10
-    call putc
-    pop rsi
-    pop rdx
-    pop rcx
-    pop rax
-    pop r13
-    mov edi, r13d
-    or edi, 0x80000000                ; signal-death marker for waitpid
-    call task_exit                    ; never returns
+    mov esi, r13d                     ; sig
+    call sig_kill_current             ; log + task_exit (never returns)
     jmp .sor_ret
 .sor_ret:
     mov rax, r12                      ; restore the syscall return value
@@ -465,6 +490,246 @@ sig_on_syscall_ret:
     pop rdx
     pop rcx
     pop rbx
+    ret
+
+; ------------------------------------------------------------------------------
+; sig_on_exception: turn a ring3 CPU exception into a POSIX signal.
+; In:  RDI = common_ex frame base (15 pushed GPRs, vector at +120, then the
+;      CPU frame), ESI = exception vector.
+; Native-ABI tasks keep the legacy behaviour (log + task_exit). Linux ABI
+; tasks: default / ignored / blocked fault -> terminate via sig_kill_current
+; (waitpid reports WIFSIGNALED); installed handler -> build an rt_sigframe
+; from the faulting context, patch the interrupted iretq frame in place
+; (RIP = handler, RSP = sigframe, RDI/RSI/RDX = handler args) and return —
+; common_ex then pops the GPRs and iretqs into the handler. Never returns
+; unless a handler must run. Clobbers all registers.
+; ------------------------------------------------------------------------------
+sig_on_exception:
+    push rbp
+    mov rbp, rdi                      ; rbp = frame base (stable: above rsp)
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov r12d, esi                     ; r12 = vector
+    ; the faulting ring3 context belongs to the running task
+    mov ebx, [r15 + sched_curr_task - kmain]
+    imul ebx, TCB_SIZE
+    lea rbx, [r15 + task_table - kmain + rbx]
+    cmp dword [rbx + TCB_ABI_TYPE], 1
+    je .sx_sig
+    ; native ABI: legacy terminate (exit code = the task's own RDI)
+    lea rsi, [r15 + str_sys_crash - kmain]
+    call puts
+    mov edi, [rbp + 72]
+    call task_exit                    ; never returns
+.sx_sig:
+    ; vector -> signal number (SIGSEGV is the fallback)
+    mov esi, LINUX_SIGSEGV
+    cmp r12d, 0
+    je .sx_fpe
+    cmp r12d, 2
+    je .sx_fpe
+    cmp r12d, 16
+    je .sx_fpe
+    cmp r12d, 1
+    je .sx_trap
+    cmp r12d, 3
+    je .sx_ill
+    cmp r12d, 4
+    je .sx_ill
+    cmp r12d, 5
+    je .sx_ill
+    cmp r12d, 6
+    je .sx_ill
+    cmp r12d, 17
+    je .sx_bus
+    jmp .sx_ptrs
+.sx_fpe:
+    mov esi, LINUX_SIGFPE
+    jmp .sx_ptrs
+.sx_trap:
+    mov esi, LINUX_SIGTRAP
+    jmp .sx_ptrs
+.sx_ill:
+    mov esi, LINUX_SIGILL
+    jmp .sx_ptrs
+.sx_bus:
+    mov esi, LINUX_SIGBUS
+.sx_ptrs:
+    ; CPU frame pointers: error-code vectors shift RIP/RSP by one slot
+    lea rdx, [rbp + 16*8]             ; &RIP
+    lea rcx, [rbp + 19*8]             ; &user RSP
+    cmp r12d, 14
+    je .sx_hp
+    cmp r12d, 13
+    je .sx_hp
+    cmp r12d, 12
+    je .sx_hp
+    cmp r12d, 11
+    je .sx_hp
+    cmp r12d, 10
+    je .sx_hp
+    cmp r12d, 8
+    je .sx_hp
+    cmp r12d, 17
+    je .sx_hp
+    jmp .sx_act
+.sx_hp:
+    lea rdx, [rbp + 17*8]             ; &RIP (after the CPU error code)
+    lea rcx, [rbp + 20*8]             ; &user RSP
+.sx_act:
+    mov r13, rdx                      ; r13 = &rip slot
+    mov r14, rcx                      ; r14 = &rsp slot
+    ; action lookup: 0 = SIG_DFL, 1 = SIG_IGN, else handler address
+    mov ecx, esi                      ; ESI = signal (r12 holds the vector!)
+    dec ecx                           ; bit = sig - 1
+    mov rax, rcx
+    shl rax, 5
+    mov rdx, [rbx + TCB_SIG_ACT + rax]
+    mov r8, 1
+    shl r8, cl
+    test r8, [rbx + TCB_SIG_BLOCKED]
+    jnz .sx_die                       ; blocking a fault is undefined -> kill
+    test rdx, rdx
+    jz .sx_die                        ; SIG_DFL -> terminate with the signal
+    cmp rdx, 1
+    je .sx_die                        ; SIG_IGN cannot swallow a fault
+    ; --- handler delivery: rt_sigframe off the faulting user stack ---
+    mov r8, rdx                       ; r8 = handler address
+    mov rax, [r14]                    ; faulting user RSP
+    sub rax, 960
+    and rax, -16
+    add rax, 8                        ; FR ≡ 8 mod 16: handlers enter like a CALL
+    cmp rax, 0x1FE00000               ; must stay inside the task stack slot
+    jb .sx_die
+    cmp rax, 0x1FFFFE00
+    jae .sx_die
+    mov r9, rax                       ; r9 = FR
+    ; zero: siginfo (128B @FR+8), uc prefix+mcontext+sigmask (304B @FR+136)
+    lea rdi, [r9 + 8]
+    xor eax, eax
+    mov ecx, 128 / 8
+    rep stosq
+    lea rdi, [r9 + 136]
+    mov ecx, 304 / 8
+    rep stosq
+    ; fill mcontext from the exception frame (Linux x86_64 sigcontext)
+    lea rdi, [r9 + 176]
+    mov rax, [rbp + 56]
+    mov [rdi + 0], rax                ; r8
+    mov rax, [rbp + 48]
+    mov [rdi + 8], rax                ; r9
+    mov rax, [rbp + 40]
+    mov [rdi + 16], rax               ; r10
+    mov rax, [rbp + 32]
+    mov [rdi + 24], rax               ; r11
+    mov rax, [rbp + 24]
+    mov [rdi + 32], rax               ; r12
+    mov rax, [rbp + 16]
+    mov [rdi + 40], rax               ; r13
+    mov rax, [rbp + 8]
+    mov [rdi + 48], rax               ; r14
+    mov rax, [rbp + 0]
+    mov [rdi + 56], rax               ; r15
+    mov rax, [rbp + 72]
+    mov [rdi + 64], rax               ; rdi
+    mov rax, [rbp + 80]
+    mov [rdi + 72], rax               ; rsi
+    mov rax, [rbp + 64]
+    mov [rdi + 80], rax               ; rbp
+    mov rax, [rbp + 104]
+    mov [rdi + 88], rax               ; rbx
+    mov rax, [rbp + 88]
+    mov [rdi + 96], rax               ; rdx
+    mov rax, [rbp + 112]
+    mov [rdi + 104], rax              ; rax (faulting value)
+    mov rax, [rbp + 96]
+    mov [rdi + 112], rax              ; rcx (real rcx — exceptions keep it)
+    mov rax, [r14]
+    mov [rdi + 120], rax              ; rsp
+    mov rax, [r13]
+    mov [rdi + 128], rax              ; rip
+    mov rax, [r13 + 16]
+    mov [rdi + 136], rax              ; eflags
+    mov rax, [r13 + 8]
+    mov [rdi + 144], ax               ; cs
+    movzx eax, r12b
+    mov [rdi + 160], rax              ; trapno = vector
+    mov rax, cr2
+    mov [rdi + 176], rax              ; cr2 (fault address for #PF)
+    lea rax, [r9 + 440]
+    mov [rdi + 184], rax              ; fpstate -> FXSAVE area inside the frame
+    fxsave [r9 + 440]
+    ; siginfo: si_signo / si_code / si_addr
+    mov dword [r9 + 8], esi           ; si_signo
+    cmp esi, LINUX_SIGSEGV
+    je .sx_si_segv
+    cmp esi, LINUX_SIGILL
+    je .sx_si_rip
+    cmp esi, LINUX_SIGTRAP
+    je .sx_si_rip
+    cmp esi, LINUX_SIGFPE
+    je .sx_si_rip
+    mov dword [r9 + 16], 1            ; SIGBUS & co: generic trap cause
+    jmp .sx_si_done
+.sx_si_segv:
+    cmp r12b, 14                      ; #PF -> SEGV_MAPERR + si_addr = CR2
+    jne .sx_si_kernel
+    mov dword [r9 + 16], 1
+    mov rax, cr2
+    mov [r9 + 24], rax
+    jmp .sx_si_done
+.sx_si_kernel:
+    mov dword [r9 + 16], 0x80         ; SI_KERNEL (#GP and friends)
+    jmp .sx_si_done
+.sx_si_rip:
+    mov dword [r9 + 16], 1            ; ILL_ILLOPC / TRAP_BRKPT / FPE_INTDIV
+    mov rax, [r13]
+    mov [r9 + 24], rax                ; si_addr = faulting RIP
+.sx_si_done:
+    ; pretcode: the handler's `ret` jumps here -> restorer -> rt_sigreturn
+    mov ecx, esi
+    dec ecx                           ; bit = sig - 1 (rep stosq ate rcx)
+    mov rdx, rcx
+    shl rdx, 5                        ; action table offset
+    mov rax, [rbx + TCB_SIG_ACT + rdx + 8]
+    mov [r9], rax                     ; (0 if the app registered no restorer)
+    ; uc_sigmask = mask from BEFORE the handler (rt_sigreturn restores it)
+    mov rax, [rbx + TCB_SIG_BLOCKED]
+    mov [r9 + 432], rax
+    ; blocked |= sa_mask [| sig unless SA_NODEFER]; KILL/STOP stay unblockable
+    test qword [rbx + TCB_SIG_ACT + rdx + 16], SA_NODEFER
+    jnz @f
+    mov rax, 1
+    shl rax, cl
+    or [rbx + TCB_SIG_BLOCKED], rax
+@@:
+    mov rax, [rbx + TCB_SIG_ACT + rdx + 24]
+    or [rbx + TCB_SIG_BLOCKED], rax
+    mov rax, [rbx + TCB_SIG_BLOCKED]
+    and rax, not ((1 shl 8) or (1 shl 18))
+    mov [rbx + TCB_SIG_BLOCKED], rax
+    ; consume any queued instance of this signal
+    btr [rbx + TCB_SIG_PENDING], rcx
+    ; patch the interrupted frame: RIP = handler, RSP = FR, args in rdi/rsi/rdx
+    mov [r13], r8                     ; RIP
+    mov [r14], r9                     ; user RSP
+    mov [rbp + 72], rsi               ; RDI = sig (zero-extended)
+    lea rax, [r9 + 8]
+    mov [rbp + 80], rax               ; RSI = &siginfo
+    lea rax, [r9 + 136]
+    mov [rbp + 88], rax               ; RDX = &ucontext
+    jmp .sx_ret
+    ; ---------------- default action: terminate ----------------
+.sx_die:
+    call sig_kill_current             ; ESI = sig; never returns
+.sx_ret:
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    pop rbp
     ret
 
 ; ==============================================================================
@@ -561,6 +826,8 @@ linux_syscall_dispatch:
     je .l_rt_sigreturn
     cmp eax, LINUX_SYS_PAUSE
     je .l_pause
+    cmp eax, LINUX_SYS_ALARM
+    je .l_alarm
     cmp eax, LINUX_SYS_KILL
     je .l_kill
     cmp eax, LINUX_SYS_TGKILL
@@ -850,6 +1117,7 @@ linux_syscall_dispatch:
     lea rdi, [r13 + TCB_SIG_PENDING]  ; (fork inherits handlers, per POSIX)
     mov ecx, (TCB_SIZE - TCB_SIG_PENDING) / 8
     rep movsq
+    mov dword [r13 + TCB_ALARM_MS], 0 ; alarm(2) is NOT inherited (POSIX)
 
     ; 5. Child kernel stack + initial iretq frame (parent register snapshot)
     mov eax, r12d
@@ -1184,6 +1452,29 @@ linux_syscall_dispatch:
     jmp .l_pause
 .pause_eintr:
     mov eax, LINUX_EINTR
+    ret
+
+; ------------------------------------------------------------------------------
+; .l_alarm (Linux #37): RDI = seconds (0 cancels). Returns the whole seconds
+; still left on the previous alarm (0 if none). sched_tick counts down the
+; millisecond budget in TCB_ALARM_MS and queues SIGALRM when it hits zero;
+; alarm state is cleared on spawn/exec and never inherited across fork.
+; ------------------------------------------------------------------------------
+.l_alarm:
+    mov eax, [r15 + sched_curr_task - kmain]
+    imul eax, TCB_SIZE
+    lea rbx, [r15 + task_table - kmain + rax]    ; rbx = current TCB
+    mov eax, [rbx + TCB_ALARM_MS]
+    xor edx, edx
+    mov ecx, 1000
+    div ecx                          ; eax = whole seconds left on old alarm
+    test edi, edi
+    jz .alarm_off
+    imul edi, 1000
+    mov [rbx + TCB_ALARM_MS], edi
+    ret
+.alarm_off:
+    mov dword [rbx + TCB_ALARM_MS], 0
     ret
 
 ; ------------------------------------------------------------------------------

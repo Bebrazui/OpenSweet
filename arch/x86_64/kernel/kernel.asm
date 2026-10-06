@@ -1656,6 +1656,10 @@ kb_irq:
     ret
 
 .not_e0:
+    cmp al, 0x1D                     ; LCtrl make (and RCtrl: E0 1D)
+    je .ctl_on
+    cmp al, 0x9D                     ; LCtrl break (and RCtrl: E0 9D)
+    je .ctl_off
     cmp byte [r15 + kb_is_e0 - kmain], 1
     je .extended_key
 
@@ -1688,7 +1692,30 @@ kb_irq:
     mov al, [rbx + r8]
     test al, al
     jz .skip
-    jmp .push_event
+    cmp byte [r15 + kb_ctrl - kmain], 0
+    je .push_event
+    cmp al, 'a'                      ; Ctrl+letter -> control code (Ctrl+C = 3)
+    jb .ctl_up
+    cmp al, 'z'
+    ja .ctl_up
+    and al, 0x1F
+    jmp .ctl_key
+.ctl_up:
+    cmp al, 'A'
+    jb .ctl_key
+    cmp al, 'Z'
+    ja .ctl_key
+    and al, 0x1F
+.ctl_key:
+    cmp al, 3                        ; Ctrl+C -> SIGINT to the fg Linux job
+    jne .push_event
+    cmp ah, 4                        ; KEY_DOWN: queue the signal
+    jne .skip                        ; KEY_UP of Ctrl+C: swallow as well
+    mov edi, [r15 + fg_linux_slot - kmain]
+    mov esi, 2                       ; Linux SIGINT
+    xor edx, edx                     ; sender = kernel
+    call sig_send_to_task            ; no job / native -> ESRCH, harmless
+    jmp .skip                        ; swallow: never reaches the app queue
 
 .extended_key:
     mov byte [r15 + kb_is_e0 - kmain], 0
@@ -1734,6 +1761,16 @@ kb_irq:
     mov al, 0xB6              ; KEY_RSHIFT
     mov ah, 6                 ; KEY_UP
     jmp .push_event
+
+.ctl_on:
+    mov byte [r15 + kb_is_e0 - kmain], 0  ; consume a trailing E0 prefix (RCtrl)
+    mov byte [r15 + kb_ctrl - kmain], 1
+    ret
+
+.ctl_off:
+    mov byte [r15 + kb_is_e0 - kmain], 0
+    mov byte [r15 + kb_ctrl - kmain], 0
+    ret
 
 ; --- print ASCIIZ string at RSI ---
 puts:
@@ -2908,15 +2945,60 @@ common_ex:
     test al, 3
     jz .halt                          ; Kernel exception -> halt
 
-    ; Ring 3 user space exception: terminate task gracefully!
-    lea rsi, [r15 + str_sys_crash - kmain]
-    call puts
-    call task_exit
+    ; Ring 3 user space exception: raise it as a POSIX signal (Linux ABI
+    ; tasks); native tasks terminate as before. Returns only when an
+    ; installed handler must run — by then the iretq frame is patched.
+    mov esi, r12d                     ; vector
+    lea rdi, [rsp]                    ; exception frame base
+    call sig_on_exception
+    jmp .ex_resume
 
 .halt:
     cli
     hlt
     jmp .halt
+
+.ex_resume:
+    ; Return to ring3 into the signal handler: rewrite the pushed vector slot
+    ; with the number of stack bytes to drop (8 = vector, 16 = vector + the
+    ; CPU error code), then restore the GPRs and iretq.
+    movzx eax, byte [rsp + 15*8]      ; vector
+    mov qword [rsp + 15*8], 8
+    cmp al, 14
+    je .ex_err
+    cmp al, 13
+    je .ex_err
+    cmp al, 12
+    je .ex_err
+    cmp al, 11
+    je .ex_err
+    cmp al, 10
+    je .ex_err
+    cmp al, 8
+    je .ex_err
+    cmp al, 17
+    je .ex_err
+    jmp .ex_pop
+.ex_err:
+    mov qword [rsp + 15*8], 16
+.ex_pop:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rbp
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    add rsp, [rsp]                    ; drop vector (+ error code if present)
+    iretq
 
 rept 32 n
 {
@@ -3067,6 +3149,7 @@ prompt   db "opensweet> ", 0
 vendor   rb 16
 cur      dw 0
 shift    db 0
+kb_ctrl  db 0
 exc_msg  db "EXCEPTION ", 0
 at_msg   db " @ ", 0
 str_dump_r1 db 10, "  RAX=", 0

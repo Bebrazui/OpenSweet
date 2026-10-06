@@ -28,7 +28,7 @@ io_uring, raw-сокетов/netlink и мультипроцессорного S
 (это уже не «ABI», а разметка Linux). Критерий — бинарники из официального
 Debian amd64 запускаются и выполняют свою работу, а не «проходят тесты».
 
-## 2. Где мы сейчас: 45 / ~450
+## 2. Где мы сейчас: 46 / ~450
 
 Фактически реализовано (`compat_linux.inc:477`, неизвестные → ENOSYS из
 `compat_linux.inc:579`):
@@ -42,6 +42,7 @@ rmdir(84) unlink(87) arch_prctl(158) set_tid_address(218)
 getuid(102) getgid(104) geteuid(107) getegid(108)
 rt_sigaction(13) rt_sigprocmask(14) rt_sigreturn(15) pause(34) kill(62)
 setpgid(109) getpgrp(111) setsid(112) getpgid(121) getsid(124) tgkill(234)
+alarm(37)
 ```
 
 Уже работает end-to-end: детект ABI → spawn → argv/envp/auxv → старт
@@ -190,8 +191,12 @@ sigreturn → kill вернул 0`, `sigprocmask BLOCK → маска 0x800`,
       Проверено: `sigaction:0 → handler ran → handler saw:10, kill
       returned:0 → sigprocmask old=0x0 cur=0x800 → SIGTERM-смерть
       child → wait4 status=0xf`.
-- [ ] **Таймеры**: clock_gettime/gettimeofday/nanosleep(уже)/setitimer/
-      alarm → SIGALRM.
+- [x] **alarm(37) → SIGALRM**: TCB_ALARM_MS (0x288, ms), отсчёт в `sched_tick`
+      (`.sleep_loop`, независимо от sleep-состояния), срабатывание →
+      `sig_send_to_task(SIGALRM)` (будит спящую цель), возврат — целые
+      секунды остатка; сброс при spawn/exec (`task_finalize_user`) и fork
+      (POSIX: не наследуется). Остальные таймеры (clock_gettime/
+      gettimeofday/nanosleep/setitimer) — ещё нет.
 
 ### Фаза 3 — файловая система → Tier A (продолжение)
 

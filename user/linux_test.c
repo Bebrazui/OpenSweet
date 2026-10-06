@@ -11,6 +11,12 @@
  *   4. signals: rt_sigaction(SIGUSR1)+SA_RESTORER, kill(self) -> handler ->
  *      rt_sigreturn (g_saw=10, kill rc=0), sigprocmask BLOCK roundtrip
  *      (old=0x0 cur=0x800), child kill(self, SIGTERM) -> wait4 status=0xf
+ *   5. faults & timers: child #PF without handler -> wait4 status=0xb
+ *      (WIFSIGNALED SIGSEGV), child #PF with handler -> handler prints
+ *      si_addr=CR2 and exits 42 -> status=0x2a00, alarm(1)+pause ->
+ *      SIGALRM handler + pause returns -EINTR
+ *   --sigint: never returns — blocks in pause() until the keyboard Ctrl+C
+ *      path kills it (serial: "[Linux ABI] Terminated by signal 2").
  */
 
 static inline long long sys3(long long num, long long a1, long long a2, long long a3) {
@@ -77,14 +83,17 @@ static void print_hex(unsigned long long v) {
 
 static const char msg[] = "[Linux ABI] Hello from native Linux x86_64 ELF!\n";
 
-/* Entry trampoline: the kernel enters the process with a 16-byte-aligned RSP
- * (exactly like Linux create_elf_tables/STACK_ROUND), but GCC compiles C
- * functions under the CALL convention where RSP%16==8 on entry — otherwise
- * SSE spills (movaps) die with #GP on the misaligned address. glibc/musl crt1
- * do the same: align the stack, then CALL the C code. */
+/* Entry trampoline: the kernel enters the process with the Linux
+ * argc/argv/envp/auxv vector at RSP (0x1FFFFE00) and a 16-byte-aligned RSP —
+ * exactly like Linux create_elf_tables/STACK_ROUND. Capture argc/argv first,
+ * then align and CALL os_main: GCC compiles C functions under the CALL
+ * convention where RSP%16==8 on entry — otherwise SSE spills (movaps) die
+ * with #GP on the misaligned address. glibc/musl crt1 do the same. */
 __asm__(
     ".global _start\n"
     "_start:\n"
+    "    mov (%rsp), %rdi\n"           /* argc from the entry vector */
+    "    lea 8(%rsp), %rsi\n"          /* argv */
     "    andq $-16, %rsp\n"
     "    call os_main\n"
 );
@@ -110,6 +119,7 @@ struct k_sigaction {
 #define SA_RESTORER_FLAG 0x04000000
 
 static volatile long long g_sig_seen = 0;
+static volatile long long g_alrm_seen = 0;
 
 static void usr1_handler(long long sig, void *info, void *uc) {
     (void)info;
@@ -118,7 +128,39 @@ static void usr1_handler(long long sig, void *info, void *uc) {
     print("[Linux ABI] SIGUSR1 handler ran\n");
 }
 
-void os_main(void) {
+static void alrm_handler(long long sig, void *info, void *uc) {
+    (void)sig;
+    (void)info;
+    (void)uc;
+    g_alrm_seen = 1;
+    print("[Linux ABI] SIGALRM handler ran\n");
+}
+
+/* SIGSEGV handler: report si_addr (CR2 for a #PF) and exit(42) — returning
+ * would re-execute the faulting instruction and loop forever. */
+static void segv_handler(long long sig, void *info, void *uc) {
+    (void)sig;
+    (void)uc;
+    long long addr = *(long long *)((char *)info + 16);   /* si_addr */
+    print("[Linux ABI] SIGSEGV handler ran, si_addr=0x");
+    print_hex((unsigned long long)addr);
+    print("\n");
+    sys1(60, 42);
+}
+
+static int streq(const char *a, const char *b) {
+    while (*a && *a == *b) { a++; b++; }
+    return *a == *b;
+}
+
+void os_main(int argc, char **argv) {
+    /* --sigint: keyboard-path victim — block until Ctrl+C SIGINT kills us
+     * with the default action (wait status = 2). Never returns otherwise. */
+    if (argc > 1 && argv && argv[1] && streq(argv[1], "--sigint")) {
+        print("[Linux ABI] --sigint: blocking in pause, press Ctrl+C\n");
+        for (;;) sys1(34, 0);          /* pause() — no return before a signal */
+    }
+
     sys3(1, 1, (long long)msg, sizeof(msg) - 1);
 
     long long pid = sys1(57, 0);                 /* fork() */
@@ -222,6 +264,62 @@ void os_main(void) {
         print_hex((unsigned long long)(unsigned int)st3);   /* expect 0xf */
         print("\n");
     }
+
+    /* --- fault paths: #PF without a handler -> wait4 WIFSIGNALED(11) --- */
+    long long pid4 = sys1(57, 0);
+    if (pid4 == 0) {
+        volatile long long *bad = (volatile long long *)0x10;
+        *bad = 1;                      /* #PF -> SIGSEGV default -> die */
+        sys1(60, 77);                  /* not reached */
+    } else if (pid4 > 0) {
+        int st4 = 0;
+        long long w4 = sys_wait4(pid4, &st4);
+        print("[Linux ABI] segv death: wait=");
+        print_dec(w4);
+        print(" status=0x");
+        print_hex((unsigned long long)(unsigned int)st4);   /* expect 0xb */
+        print("\n");
+    }
+
+    /* --- #PF with a handler: fork inherits the action table --- */
+    long long pid5 = sys1(57, 0);
+    if (pid5 == 0) {
+        struct k_sigaction sa;
+        sa.handler = (long long)segv_handler;
+        sa.flags = SA_RESTORER_FLAG;
+        sa.restorer = (long long)sig_restore_rt;
+        sa.mask = 0;
+        sys3(13, 11, (long long)&sa, 0);               /* rt_sigaction(SIGSEGV) */
+        volatile long long *bad = (volatile long long *)0x20;
+        *bad = 42;                     /* #PF -> handler (never returns) */
+        sys1(60, 77);                  /* not reached */
+    } else if (pid5 > 0) {
+        int st5 = 0;
+        long long w5 = sys_wait4(pid5, &st5);
+        print("[Linux ABI] segv handled: wait=");
+        print_dec(w5);
+        print(" status=0x");
+        print_hex((unsigned long long)(unsigned int)st5);   /* expect 0x2a00 */
+        print("\n");
+    }
+
+    /* --- alarm(1) -> SIGALRM -> pause() returns -EINTR --- */
+    struct k_sigaction sa2;
+    sa2.handler = (long long)alrm_handler;
+    sa2.flags = SA_RESTORER_FLAG;
+    sa2.restorer = (long long)sig_restore_rt;
+    sa2.mask = 0;
+    sys3(13, 14, (long long)&sa2, 0);                  /* rt_sigaction(SIGALRM) */
+    long long aret = sys1(37, 1);                      /* alarm(1) -> 0 */
+    long long pret = sys1(34, 0);                      /* pause -> -EINTR */
+    print("[Linux ABI] alarm: prev=");
+    print_dec(aret);
+    print(" pause=");
+    print_dec(pret);
+    print(" fired=");
+    print_dec(g_alrm_seen);                            /* expect 1 */
+    print("\n");
+    sys1(37, 0);                                       /* cancel (nothing left) */
 
     sys1(60, 0);
 }
