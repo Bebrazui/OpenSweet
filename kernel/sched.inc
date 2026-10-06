@@ -17,7 +17,7 @@ USER_PAGE_TABLES_BASE = 0x00200000    ; 2MB: Physical base for per-process page 
 USER_PHYS_BASE        = 0x05000000    ; 80MB: Physical base for per-process code/stack (42MB for 7 slots)
 USER_MEM_STRIDE       = 0x00600000    ; 6MB physical stride per task slot (4MB code + 2MB stack)
 
-; TCB offsets (608 bytes per TCB, 16-byte aligned)
+; TCB offsets (2704 bytes per TCB, 16-byte aligned)
 TCB_RSP         = 0x00                ; uint64: Saved stack pointer
 TCB_STATE       = 0x08                ; uint32: TASK_* state
 TCB_ID          = 0x0C                ; uint32: Task ID
@@ -38,7 +38,17 @@ TCB_ABI_TYPE    = 0x5C                ; uint32: ABI type (0 = ABI_NATIVE, 1 = AB
 TCB_FS_BASE     = 0x60                ; uint64: Thread-local storage base (FS_BASE for Linux / TLS)
 TCB_PAD         = 0x68                ; uint64: alignment padding
 TCB_FXSAVE      = 0x70                ; 512 bytes: 16-byte aligned FXSAVE/FXRSTOR area
-TCB_SIZE        = 624                 ; 0x60 + 512 = 608 bytes (multiple of 16)
+; Linux signal state (appended after the FXSAVE area)
+TCB_SIG_PENDING = 0x270               ; uint64: pending signal bitmap (bit = sig-1)
+TCB_SIG_BLOCKED = 0x278               ; uint64: blocked mask (rt_sigprocmask)
+TCB_SIG_SENDER  = 0x280               ; uint32: pid of last kill() sender (si_pid)
+                                      ; (0x288: pad — 16-byte alignment of the table)
+TCB_SIG_ACT     = 0x290               ; 64 entries * 32 bytes, per signal (sig-1)*32:
+                                      ;   +0  handler  (0 = SIG_DFL, 1 = SIG_IGN, else addr)
+                                      ;   +8  restorer (SA_RESTORER trampoline address)
+                                      ;   +16 sa_flags
+                                      ;   +24 sa_mask  (kernel sigset, 8 bytes)
+TCB_SIZE        = 2704                ; 0xA90 = 0x290 + 64*32 (16-byte aligned)
 
 TASK_STACK_SIZE = 8192                ; 8 KB stack per task
 
@@ -512,6 +522,22 @@ task_finalize_user:
     mov qword [r15 + sys_spawn_abi - kmain], 0
     mov qword [rdi + TCB_FS_BASE], 0
     mov [rdi + TCB_USER_RSP], r11
+
+    ; Signal state: every (re-)loaded image starts with SIG_DFL handlers and
+    ; no pending signals — execve resets handlers per POSIX. The blocked mask
+    ; survives execve (POSIX) and starts cleared with the task table on spawn.
+    mov qword [rdi + TCB_SIG_PENDING], 0
+    mov qword [rdi + TCB_SIG_SENDER], 0
+    push rdi
+    lea rdi, [rdi + TCB_SIG_ACT]
+    xor eax, eax
+    mov ecx, (64 * 32) / 8
+    rep stosq                         ; all 64 actions -> SIG_DFL
+    pop rdi
+    cmp qword [r15 + sys_spawn_exec_mode - kmain], 0
+    jne @f
+    mov qword [rdi + TCB_SIG_BLOCKED], 0
+@@:
 
     ; Copy name (up to 7 chars)
     push rsi

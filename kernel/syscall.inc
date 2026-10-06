@@ -548,6 +548,9 @@ end if
     ; RAX = return code
     ; 6. Disable interrupts before restoring user stack and registers
     cli
+    ; Linux ABI: deliver pending signals (may patch RIP/RSP/RDI.. to enter a
+    ; handler, or terminate the task — default action). No-op for native tasks.
+    call sig_on_syscall_ret
     pop r10
     pop r9
     pop r8
@@ -1168,6 +1171,12 @@ sys_handler_waitpid:
     mov r14, rdx                        ; r14 = options
 
 .wait_loop:
+    ; An actionable pending signal interrupts the wait (POSIX -EINTR).
+    ; The probe also consumes dead signals (SIG_IGN / default-ignore).
+    call sig_probe_actionable
+    test eax, eax
+    jnz .wait_eintr
+
     ; Get caller task ID
     mov ebp, [r15 + sched_curr_task - kmain]
 
@@ -1264,10 +1273,18 @@ sys_handler_waitpid:
     imul eax, ebx, TCB_SIZE
     lea rdi, [r15 + task_table - kmain + rax]
 
-    ; Read exit code
+    ; Read exit code: bit 31 set = terminated by a signal (0x80000000 | sig),
+    ; which is the raw POSIX WIFSIGNALED status; otherwise it is a normal
+    ; exit() code that goes through (code & 0xFF) << 8.
     mov edx, [rdi + TCB_EXIT_CODE]
+    test edx, 0x80000000
+    jnz .reap_sigdeath
     and edx, 0xFF
     shl edx, 8                          ; POSIX WEXITSTATUS formatting
+    jmp .reap_status
+.reap_sigdeath:
+    and edx, 0x7F                       ; status = signo (WIFSIGNALED form)
+.reap_status:
 
     ; Store to user status pointer if provided
     test r13, r13
@@ -1293,6 +1310,10 @@ sys_handler_waitpid:
 
 .wait_nohang_zero:
     xor eax, eax                        ; Return 0 (no child exited yet)
+    jmp .wait_ret
+
+.wait_eintr:
+    mov eax, -4                         ; -EINTR (signal interrupted the wait)
     jmp .wait_ret
 
 .wait_echild:

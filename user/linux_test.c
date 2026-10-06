@@ -7,6 +7,10 @@
  *   1. hello line (regression marker used by the screenshot tests)
  *   2. fork -> child prints its pid and exits 42,
  *      parent wait4()s and reports pid/wait/status (expect status 0x2a00)
+ *   3. execve(busybox echo hello-from-execve)
+ *   4. signals: rt_sigaction(SIGUSR1)+SA_RESTORER, kill(self) -> handler ->
+ *      rt_sigreturn (g_saw=10, kill rc=0), sigprocmask BLOCK roundtrip
+ *      (old=0x0 cur=0x800), child kill(self, SIGTERM) -> wait4 status=0xf
  */
 
 static inline long long sys3(long long num, long long a1, long long a2, long long a3) {
@@ -85,6 +89,35 @@ __asm__(
     "    call os_main\n"
 );
 
+/* Kernel restorer trampoline for SA_RESTORER: the handler's `ret` lands here
+ * and issues rt_sigreturn with RSP exactly 8 bytes past the frame base. */
+__asm__(
+    ".global sig_restore_rt\n"
+    "sig_restore_rt:\n"
+    "    mov $15, %eax\n"
+    "    syscall\n"
+);
+extern void sig_restore_rt(void);
+
+/* Linux x86_64 userspace sigaction layout: handler, flags, restorer, mask */
+struct k_sigaction {
+    long long handler;      /* +0  */
+    long long flags;        /* +8  */
+    long long restorer;     /* +16 */
+    long long mask;         /* +24 */
+};
+
+#define SA_RESTORER_FLAG 0x04000000
+
+static volatile long long g_sig_seen = 0;
+
+static void usr1_handler(long long sig, void *info, void *uc) {
+    (void)info;
+    (void)uc;
+    g_sig_seen = sig;
+    print("[Linux ABI] SIGUSR1 handler ran\n");
+}
+
 void os_main(void) {
     sys3(1, 1, (long long)msg, sizeof(msg) - 1);
 
@@ -143,6 +176,50 @@ void os_main(void) {
     } else {
         print("[Linux ABI] fork2 failed: ");
         print_dec(pid2);
+        print("\n");
+    }
+
+    /* --- signal tests: rt_sigaction -> kill -> handler -> rt_sigreturn --- */
+    struct k_sigaction act, old;
+    act.handler = (long long)usr1_handler;
+    act.flags = SA_RESTORER_FLAG;
+    act.restorer = (long long)sig_restore_rt;
+    act.mask = 0;
+    long long sr = sys3(13, 10, (long long)&act, (long long)&old);
+    print("[Linux ABI] sigaction: ");
+    print_dec(sr);
+    print("\n");
+
+    long long kr = sys3(62, sys1(39, 0), 10, 0);      /* kill(self, SIGUSR1) */
+    print("[Linux ABI] SIGUSR1 handler saw: ");
+    print_dec(g_sig_seen);          /* 10 -> sigreturn restored the context */
+    print(", kill returned: ");
+    print_dec(kr);
+    print("\n");
+
+    /* blocked-mask roundtrip: BLOCK SIGUSR2(12) -> read back -> unblock */
+    long long mset = 0x800, mold = 0, mcur = 0;
+    sys3(14, 1, (long long)&mset, (long long)&mold);   /* SIG_BLOCK */
+    sys3(14, 1, 0, (long long)&mcur);                  /* query current */
+    print("[Linux ABI] sigprocmask: old=0x");
+    print_hex((unsigned long long)mold);
+    print(" cur=0x");
+    print_hex((unsigned long long)mcur);
+    print("\n");
+    sys3(14, 2, (long long)&mset, 0);                  /* SIG_UNBLOCK again */
+
+    /* default action: SIGTERM kills the child, wait4 sees WIFSIGNALED */
+    long long pid3 = sys1(57, 0);
+    if (pid3 == 0) {
+        sys3(62, sys1(39, 0), 15, 0);                  /* kill(self, TERM) */
+        sys1(60, 77);                                  /* not reached */
+    } else if (pid3 > 0) {
+        int st3 = 0;
+        long long w3 = sys_wait4(pid3, &st3);
+        print("[Linux ABI] signal death: wait=");
+        print_dec(w3);
+        print(" status=0x");
+        print_hex((unsigned long long)(unsigned int)st3);   /* expect 0xf */
         print("\n");
     }
 

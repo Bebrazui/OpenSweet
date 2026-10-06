@@ -470,6 +470,9 @@ vfs_read_fd:
     cmp word [r8 + 14], 0
     je .rfd_eof
     ; Empty pipe with live writers: POSIX read blocks until data or EOF
+    call sig_probe_actionable        ; signal pending? -> EINTR instead of block
+    test eax, eax
+    jnz .rfd_err_intr
     sti
     mov ecx, 2
     call task_sleep           ; preserves rax/rbx; context switch preserves the rest
@@ -514,6 +517,9 @@ vfs_read_fd:
 
 .rfd_err_fault:
     mov dword [r15 + vfs_last_err - kmain], 14      ; EFAULT
+    jmp .rfd_err
+.rfd_err_intr:
+    mov dword [r15 + vfs_last_err - kmain], 4       ; EINTR
     jmp .rfd_err
 .rfd_err_badfd:
     mov dword [r15 + vfs_last_err - kmain], 9       ; EBADF
@@ -619,7 +625,11 @@ vfs_write_fd:
     sub ecx, [r8 + 8]
     test ecx, ecx
     jg .wfd_p_room
-    sti                                 ; full: sleep until the reader drains
+    ; full: sleep until the reader drains (interruptible by signals)
+    call sig_probe_actionable
+    test eax, eax
+    jnz .wfd_err_intr
+    sti
     mov ecx, 2
     call task_sleep                     ; preserves rax/rbx; ctx switch the rest
     cli
@@ -658,6 +668,15 @@ vfs_write_fd:
 
 .wfd_err_epipe:
     mov dword [r15 + vfs_last_err - kmain], 32      ; EPIPE
+    ; Linux: writing to a pipe with no readers raises SIGPIPE for the writer
+    ; (default action terminates it) IN ADDITION to returning -EPIPE.
+    mov edi, [r15 + sched_curr_task - kmain]
+    mov esi, 13                         ; SIGPIPE
+    xor edx, edx                        ; kernel-generated
+    call sig_send_to_task
+    jmp .wfd_err
+.wfd_err_intr:
+    mov dword [r15 + vfs_last_err - kmain], 4       ; EINTR
     jmp .wfd_err
 .wfd_err_fault:
     mov dword [r15 + vfs_last_err - kmain], 14      ; EFAULT

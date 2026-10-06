@@ -54,6 +54,36 @@ LINUX_SYS_MKDIRAT     = 258
 LINUX_SYS_UNLINKAT    = 263
 LINUX_SYS_VFORK       = 58
 LINUX_SYS_GETPPID     = 110
+LINUX_SYS_RT_SIGACTION = 13
+LINUX_SYS_RT_SIGPROCMASK = 14
+LINUX_SYS_RT_SIGRETURN = 15
+LINUX_SYS_PAUSE       = 34
+LINUX_SYS_KILL        = 62
+LINUX_SYS_SETPGID     = 109
+LINUX_SYS_GETPGRP     = 111
+LINUX_SYS_SETSID      = 112
+LINUX_SYS_GETPGID     = 121
+LINUX_SYS_GETSID      = 124
+LINUX_SYS_TGKILL      = 234
+
+; Signal numbers (Linux x86_64 numbering)
+LINUX_SIGKILL  = 9
+LINUX_SIGUSR1  = 10
+LINUX_SIGSEGV  = 11
+LINUX_SIGPIPE  = 13
+LINUX_SIGTERM  = 15
+LINUX_SIGCHLD  = 17
+LINUX_SIGCONT  = 18
+LINUX_SIGSTOP  = 19
+LINUX_SIGTSTP  = 20
+LINUX_SIGTTIN  = 21
+LINUX_SIGTTOU  = 22
+LINUX_SIGURG   = 23
+LINUX_SIGWINCH = 28
+
+; rt_sigaction sa_flags bits (the ones we understand)
+SA_RESTORER    = 0x04000000           ; sa_restorer holds the sigreturn trampoline
+SA_NODEFER     = 0x40000000           ; do not block the signal during its handler
 
 ; Linux Error Codes (negative return values in RAX)
 LINUX_EPERM   = -1
@@ -77,6 +107,365 @@ LINUX_EMFILE  = -24
 LINUX_ENOTTY = -25
 LINUX_EPIPE  = -32
 LINUX_ENOSYS  = -38
+
+; ==============================================================================
+; Signal machinery (Linux ABI): queueing, delivery at syscall return, probing.
+;
+; Conventions:
+;   * pending/blocked are 64-bit bitmaps, bit = sig - 1;
+;   * action table entry (sig-1)*32: +0 handler (0=DFL, 1=IGN, else addr),
+;     +8 restorer, +16 sa_flags, +24 sa_mask;
+;   * delivery happens on the way back to ring 3 (sig_on_syscall_ret), where
+;     the syscall frame F is: [0]=r10 .. [96]=r11(flags), [104]=RIP,
+;     [112]=user RSP; RAX (live) = syscall return value;
+;   * inside the dispatcher the frame sits behind the `call` return address,
+;     so handlers see RIP at +112 and user RSP at +120 (one slot higher);
+;   * death by signal stores 0x80000000 | sig into TCB_EXIT_CODE, which
+;     sys_handler_waitpid turns into the raw POSIX WIFSIGNALED status.
+; ==============================================================================
+
+; ------------------------------------------------------------------------------
+; sig_next_actionable: first pending, unblocked, actionable signal.
+; In:  RBX = TCB pointer
+; Out: EAX = signal (1..64) or 0; EDX = 0 (default terminate) or handler addr.
+;      The found signal stays pending (the caller consumes it); dead signals
+;      (SIG_IGN, default-ignore) are consumed here — they die either way.
+; Clobbers: RAX, RCX, RDX, RSI
+; ------------------------------------------------------------------------------
+sig_next_actionable:
+.sna_loop:
+    mov rax, [rbx + TCB_SIG_PENDING]
+    mov rcx, [rbx + TCB_SIG_BLOCKED]
+    not rcx
+    and rax, rcx                      ; rax = pending & ~blocked
+    jz .sna_none
+    bsf rcx, rax                      ; rcx = bit = sig - 1
+    ; Tier A default-ignore set (stop signals are treated as no-ops until
+    ; real job control arrives)
+    lea esi, [rcx + 1]
+    cmp esi, LINUX_SIGCHLD
+    je .sna_drop
+    cmp esi, LINUX_SIGCONT
+    je .sna_drop
+    cmp esi, LINUX_SIGWINCH
+    je .sna_drop
+    cmp esi, LINUX_SIGURG
+    je .sna_drop
+    cmp esi, LINUX_SIGSTOP
+    je .sna_drop
+    cmp esi, LINUX_SIGTSTP
+    je .sna_drop
+    cmp esi, LINUX_SIGTTIN
+    je .sna_drop
+    cmp esi, LINUX_SIGTTOU
+    je .sna_drop
+    ; handler lookup: 0 = DFL, 1 = IGN, else address
+    mov rdx, rcx
+    shl rdx, 5                       ; (sig-1) * 32
+    mov rdx, [rbx + TCB_SIG_ACT + rdx]
+    cmp rdx, 1
+    je .sna_drop                      ; explicitly ignored
+    mov eax, esi                      ; EAX = sig, EDX = DFL(0)/handler
+    ret
+.sna_drop:
+    btr [rbx + TCB_SIG_PENDING], rcx
+    jmp .sna_loop
+.sna_none:
+    xor eax, eax
+    xor edx, edx
+    ret
+
+; ------------------------------------------------------------------------------
+; sig_probe_actionable: EINTR check for blocking loops.
+; Out: EAX = signal (0 = keep waiting). Preserves every other register.
+;      Also consumes dead signals on the way (same semantics as delivery).
+; ------------------------------------------------------------------------------
+sig_probe_actionable:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    mov ebx, [r15 + sched_curr_task - kmain]
+    imul ebx, TCB_SIZE
+    lea rbx, [r15 + task_table - kmain + rbx]
+    cmp dword [rbx + TCB_ABI_TYPE], 1
+    jne .spa_none
+    call sig_next_actionable
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+.spa_none:
+    xor eax, eax
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; ------------------------------------------------------------------------------
+; sig_send_to_task: queue a signal to a task (Linux ABI targets only).
+; In:  EDI = target slot, ESI = signal (1..64), EDX = sender pid (0 = kernel)
+; Out: EAX = 0 | -ESRCH | -EINVAL. All other registers preserved.
+;      A sleeping target is woken so its blocking loop re-checks EINTR.
+; ------------------------------------------------------------------------------
+sig_send_to_task:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    test esi, esi
+    jle .sst_einval
+    cmp esi, 64
+    ja .sst_einval
+    cmp edi, MAX_TASKS
+    jae .sst_esrch
+    imul ebx, edi, TCB_SIZE
+    lea rbx, [r15 + task_table - kmain + rbx]
+    cmp dword [rbx + TCB_STATE], TASK_UNUSED
+    je .sst_esrch
+    cmp dword [rbx + TCB_ABI_TYPE], 1
+    jne .sst_esrch                    ; signals exist only for Linux ABI tasks
+    mov ecx, esi
+    dec ecx
+    mov eax, 1
+    shl rax, cl
+    or [rbx + TCB_SIG_PENDING], rax
+    mov dword [rbx + TCB_SIG_SENDER], edx
+    cmp dword [rbx + TCB_STATE], TASK_SLEEPING
+    jne @f
+    mov dword [rbx + TCB_STATE], TASK_READY
+@@:
+    xor eax, eax
+    jmp .sst_done
+.sst_einval:
+    mov eax, LINUX_EINVAL
+    jmp .sst_done
+.sst_esrch:
+    mov eax, LINUX_ESRCH
+.sst_done:
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; ------------------------------------------------------------------------------
+; sig_on_syscall_ret: deliver pending signals just before returning to ring 3.
+; Called from .syscall_ret with RSP = frame base F and RAX = syscall result,
+; interrupts off. May patch the frame (enter a signal handler) or never return
+; (default action = terminate the task).
+; ------------------------------------------------------------------------------
+sig_on_syscall_ret:
+    lea rbp, [rsp + 8]                ; F (this call pushed a return address)
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    mov r12, rax                      ; syscall return value — probes clobber
+                                      ; rax, so the result lives on in r12
+    mov ebx, [r15 + sched_curr_task - kmain]
+    imul ebx, TCB_SIZE
+    lea rbx, [r15 + task_table - kmain + rbx]
+    cmp dword [rbx + TCB_ABI_TYPE], 1
+    jne .sor_ret
+.sor_loop:
+    call sig_next_actionable          ; EAX = sig, EDX = DFL/handler
+    test eax, eax
+    jz .sor_ret
+    mov r13d, eax                     ; r13 = sig
+    mov ecx, r13d
+    dec ecx
+    btr [rbx + TCB_SIG_PENDING], rcx   ; consume this instance
+    test rdx, rdx
+    jz .sor_die                       ; default action -> die with the signal
+    ; ---------------- handler delivery: build rt_sigframe ----------------
+    mov r8, rdx                       ; r8 = handler address
+    mov r14, [rbp + 112]              ; interrupted user RSP (F-relative)
+    sub r14, 960                      ; (frame 952B + 8 for the ABI rounding)
+    and r14, -16
+    add r14, 8                        ; FR ≡ 8 mod 16: handlers enter like a
+                                      ; CALL (pretcode = return address), while
+                                      ; the FXSAVE area lands on 16 (FR+440)
+    cmp r14, 0x1FE00000               ; must stay inside the task stack slot
+    jb .sor_die
+    cmp r14, 0x1FFFFE00
+    jae .sor_die
+    ; zero: siginfo (128B @FR+8), uc prefix+mcontext+sigmask (304B @FR+136)
+    lea rdi, [r14 + 8]
+    xor eax, eax
+    mov ecx, 128 / 8
+    rep stosq
+    lea rdi, [r14 + 136]
+    mov ecx, 304 / 8
+    rep stosq
+    ; fill mcontext from the frame (Linux x86_64 sigcontext layout)
+    lea rdi, [r14 + 176]
+    mov rax, [rbp + 16]
+    mov [rdi + 0], rax                ; r8
+    mov rax, [rbp + 8]
+    mov [rdi + 8], rax                ; r9
+    mov rax, [rbp + 0]
+    mov [rdi + 16], rax               ; r10
+    mov rax, [rbp + 96]
+    mov [rdi + 24], rax               ; r11 (= user RFLAGS, as in Linux pt_regs)
+    mov rax, [rbp + 72]
+    mov [rdi + 32], rax               ; r12
+    mov rax, [rbp + 64]
+    mov [rdi + 40], rax               ; r13
+    mov rax, [rbp + 56]
+    mov [rdi + 48], rax               ; r14
+    mov rax, [rbp + 48]
+    mov [rdi + 56], rax               ; r15
+    mov rax, [rbp + 24]
+    mov [rdi + 64], rax               ; rdi
+    mov rax, [rbp + 32]
+    mov [rdi + 72], rax               ; rsi
+    mov rax, [rbp + 88]
+    mov [rdi + 80], rax               ; rbp
+    mov rax, [rbp + 80]
+    mov [rdi + 88], rax               ; rbx
+    mov rax, [rbp + 40]
+    mov [rdi + 96], rax               ; rdx
+    mov rax, r12                      ; syscall return value (kept in r12)
+    mov [rdi + 104], rax              ; rax
+    mov rax, [rbp + 104]
+    mov [rdi + 112], rax              ; rcx (= interrupted RIP)
+    mov rax, [rbp + 112]
+    mov [rdi + 120], rax              ; rsp
+    mov rax, [rbp + 104]
+    mov [rdi + 128], rax              ; rip
+    mov rax, [rbp + 96]
+    mov [rdi + 136], rax              ; eflags
+    lea rax, [r14 + 440]
+    mov [rdi + 184], rax              ; fpstate -> FXSAVE area inside the frame
+    fxsave [r14 + 440]
+    ; siginfo: si_signo + si_pid (si_code stays SI_USER = 0)
+    mov dword [r14 + 8], r13d
+    mov eax, [rbx + TCB_SIG_SENDER]
+    mov [r14 + 8 + 16], eax           ; si_pid
+    ; pretcode: the handler's `ret` jumps here -> restorer -> rt_sigreturn
+    mov ecx, r13d
+    dec ecx
+    shl rcx, 5
+    mov rax, [rbx + TCB_SIG_ACT + rcx + 8]
+    mov [r14 + 0], rax                ; (0 if the app registered no restorer)
+    ; uc_sigmask = mask from BEFORE the handler (rt_sigreturn restores it)
+    mov rax, [rbx + TCB_SIG_BLOCKED]
+    mov [r14 + 432], rax
+    ; blocked |= sa_mask [| sig unless SA_NODEFER], KILL/STOP stay unblockable
+    mov ecx, r13d
+    dec ecx                           ; bit = sig - 1
+    mov rdx, rcx
+    shl rdx, 5                        ; action table offset
+    test qword [rbx + TCB_SIG_ACT + rdx + 16], SA_NODEFER
+    jnz @f
+    mov rax, 1
+    shl rax, cl
+    or [rbx + TCB_SIG_BLOCKED], rax
+@@:
+    mov rax, [rbx + TCB_SIG_ACT + rdx + 24]
+    or [rbx + TCB_SIG_BLOCKED], rax
+    mov rax, [rbx + TCB_SIG_BLOCKED]
+    and rax, not ((1 shl 8) or (1 shl 18))
+    mov [rbx + TCB_SIG_BLOCKED], rax
+    ; patch the syscall frame: RIP = handler, RSP = FR, RDI/RSI/RDX = args
+    mov [rbp + 104], r8               ; RIP
+    mov [rbp + 112], r14              ; user RSP
+    mov [rbp + 24], r13               ; RDI = sig
+    lea rax, [r14 + 8]
+    mov [rbp + 32], rax               ; RSI = &siginfo
+    lea rax, [r14 + 136]
+    mov [rbp + 40], rax               ; RDX = &ucontext
+    mov rax, r12                      ; RAX at handler entry = syscall result
+    jmp .sor_loop                     ; queue may hold another signal
+    ; ---------------- default action: terminate ----------------
+.sor_die:
+    ; log "[Linux ABI] Terminated by signal N"
+    push r13                          ; sig (deepest of the 5 pushes = [rsp+32])
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    lea rsi, [r15 + str_l_sigkill - kmain]
+    call puts
+    mov rax, [rsp + 32]               ; sig (puts may clobber caller-saves)
+    call putdec64
+    mov al, 10
+    call putc
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    pop r13
+    mov edi, r13d
+    or edi, 0x80000000                ; signal-death marker for waitpid
+    call task_exit                    ; never returns
+    jmp .sor_ret
+.sor_ret:
+    mov rax, r12                      ; restore the syscall return value
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
 
 ; ==============================================================================
 ; linux_syscall_dispatch: Dispatch Linux x86_64 syscall
@@ -164,6 +553,28 @@ linux_syscall_dispatch:
     je .l_getppid
     cmp eax, LINUX_SYS_EXECVE
     je .l_execve
+    cmp eax, LINUX_SYS_RT_SIGACTION
+    je .l_rt_sigaction
+    cmp eax, LINUX_SYS_RT_SIGPROCMASK
+    je .l_rt_sigprocmask
+    cmp eax, LINUX_SYS_RT_SIGRETURN
+    je .l_rt_sigreturn
+    cmp eax, LINUX_SYS_PAUSE
+    je .l_pause
+    cmp eax, LINUX_SYS_KILL
+    je .l_kill
+    cmp eax, LINUX_SYS_TGKILL
+    je .l_tgkill
+    cmp eax, LINUX_SYS_SETPGID
+    je .l_setpgid
+    cmp eax, LINUX_SYS_GETPGRP
+    je .l_getpgrp
+    cmp eax, LINUX_SYS_SETSID
+    je .l_setsid
+    cmp eax, LINUX_SYS_GETPGID
+    je .l_getpgid
+    cmp eax, LINUX_SYS_GETSID
+    je .l_getsid
 
     ; Unhandled Linux syscall: log to serial and return -ENOSYS
     push rax
@@ -435,6 +846,10 @@ linux_syscall_dispatch:
     lea rdi, [r13 + TCB_FXSAVE]
     mov ecx, 512 / 8
     rep movsq
+    lea rsi, [rbp + TCB_SIG_PENDING]  ; pending/blocked/sender + action table
+    lea rdi, [r13 + TCB_SIG_PENDING]  ; (fork inherits handlers, per POSIX)
+    mov ecx, (TCB_SIZE - TCB_SIG_PENDING) / 8
+    rep movsq
 
     ; 5. Child kernel stack + initial iretq frame (parent register snapshot)
     mov eax, r12d
@@ -548,6 +963,298 @@ linux_syscall_dispatch:
     imul eax, TCB_SIZE
     mov eax, [r15 + task_table - kmain + rax + TCB_PARENT_ID]
     inc eax                           ; slot -> pid (slot 0 -> 1 = init)
+    ret
+
+; ------------------------------------------------------------------------------
+; .l_rt_sigaction (Linux #13): RDI = sig, RSI = act (user, 0 = query),
+; RDX = oldact (user, 0 = none). User struct: +0 handler, +8 flags,
+; +16 restorer, +24 sa_mask (kernel sigset, 8 bytes).
+; ------------------------------------------------------------------------------
+.l_rt_sigaction:
+    test rdi, rdi
+    jle .sa_einval
+    cmp rdi, 64
+    ja .sa_einval
+    mov eax, [r15 + sched_curr_task - kmain]
+    imul eax, TCB_SIZE
+    lea rbx, [r15 + task_table - kmain + rax]    ; rbx = current TCB
+    lea rcx, [rdi - 1]
+    shl rcx, 5                                   ; (sig-1) * 32
+    ; --- write oldact out ---
+    test rdx, rdx
+    jz .sa_get_act
+    push rdi
+    push rsi
+    push rdx
+    mov rdi, rdx
+    mov esi, 32
+    call sys_validate_user_ptr
+    pop rdx
+    pop rsi
+    pop rdi
+    jc .sa_efault
+    mov rax, [rbx + TCB_SIG_ACT + rcx + 0]
+    mov [rdx + 0], rax             ; handler
+    mov rax, [rbx + TCB_SIG_ACT + rcx + 8]
+    mov [rdx + 16], rax            ; restorer
+    mov rax, [rbx + TCB_SIG_ACT + rcx + 16]
+    mov [rdx + 8], rax             ; flags
+    mov rax, [rbx + TCB_SIG_ACT + rcx + 24]
+    mov [rdx + 24], rax            ; sa_mask
+.sa_get_act:
+    ; --- install new act ---
+    test rsi, rsi
+    jz .sa_ok
+    push rdi
+    push rdx
+    push rsi                          ; the act pointer (validate clobbers rsi
+    mov rdi, rsi                      ; by passing the size in rsi)
+    mov esi, 32
+    call sys_validate_user_ptr
+    pop rsi
+    pop rdx
+    pop rdi
+    jc .sa_efault
+    mov rax, [rsi + 0]             ; handler
+    mov [rbx + TCB_SIG_ACT + rcx + 0], rax
+    mov rax, [rsi + 8]             ; flags
+    mov [rbx + TCB_SIG_ACT + rcx + 16], rax
+    mov rax, [rsi + 16]            ; restorer
+    mov [rbx + TCB_SIG_ACT + rcx + 8], rax
+    mov rax, [rsi + 24]            ; sa_mask
+    mov [rbx + TCB_SIG_ACT + rcx + 24], rax
+    cmp rdi, LINUX_SIGKILL         ; SIGKILL/SIGSTOP can never be caught
+    je .sa_uncatchable
+    cmp rdi, LINUX_SIGSTOP
+    je .sa_uncatchable
+.sa_ok:
+    xor eax, eax
+    ret
+.sa_uncatchable:
+    mov qword [rbx + TCB_SIG_ACT + rcx + 0], 0
+    xor eax, eax
+    ret
+.sa_einval:
+    mov eax, LINUX_EINVAL
+    ret
+.sa_efault:
+    mov eax, LINUX_EFAULT
+    ret
+
+; ------------------------------------------------------------------------------
+; .l_rt_sigprocmask (Linux #14): RDI = how (1=BLOCK, 2=UNBLOCK, 3=SETMASK),
+; RSI = set (user, 0 = no change), RDX = oldset (user, 0 = none).
+; ------------------------------------------------------------------------------
+.l_rt_sigprocmask:
+    mov eax, [r15 + sched_curr_task - kmain]
+    imul eax, TCB_SIZE
+    lea rbx, [r15 + task_table - kmain + rax]
+    test rdx, rdx
+    jz .spm_no_old
+    push rdi
+    push rsi
+    mov rdi, rdx
+    mov esi, 8
+    call sys_validate_user_ptr
+    pop rsi
+    pop rdi
+    jc .spm_fault
+    mov rax, [rbx + TCB_SIG_BLOCKED]
+    mov [rdx], rax                  ; old mask out
+.spm_no_old:
+    test rsi, rsi
+    jz .spm_fix
+    push rdi
+    push rdx
+    push rsi                          ; keep the set pointer: validate takes
+    mov rdi, rsi                      ; the size in rsi and clobbers it
+    mov esi, 8
+    call sys_validate_user_ptr
+    pop rsi
+    pop rdx
+    pop rdi
+    jc .spm_fault
+    mov rax, [rsi]                  ; new mask (kernel sigset = 8 bytes)
+    cmp rdi, 1
+    je .spm_block
+    cmp rdi, 2
+    je .spm_unblock
+    cmp rdi, 3
+    je .spm_set
+    mov eax, LINUX_EINVAL
+    ret
+.spm_block:
+    or [rbx + TCB_SIG_BLOCKED], rax
+    jmp .spm_fix
+.spm_unblock:
+    not rax
+    and [rbx + TCB_SIG_BLOCKED], rax
+    jmp .spm_fix
+.spm_set:
+    mov [rbx + TCB_SIG_BLOCKED], rax
+.spm_fix:
+    ; SIGKILL/SIGSTOP can never be blocked
+    mov rax, [rbx + TCB_SIG_BLOCKED]
+    and rax, not ((1 shl 8) or (1 shl 18))
+    mov [rbx + TCB_SIG_BLOCKED], rax
+    xor eax, eax
+    ret
+.spm_fault:
+    mov eax, LINUX_EFAULT
+    ret
+
+; ------------------------------------------------------------------------------
+; .l_rt_sigreturn (Linux #15): restore the interrupted context from the
+; rt_sigframe. The restorer did `ret` into pretcode before the syscall, so the
+; user RSP now points 8 bytes above the frame base (Linux: frame = rsp - 8).
+; Frame: +0 pretcode, +8 siginfo(128), +136 ucontext, +176 sigcontext(256),
+; +432 uc_sigmask, +440 FXSAVE area.
+; ------------------------------------------------------------------------------
+.l_rt_sigreturn:
+    mov rax, [rsp + 120]            ; user RSP (= FR + 8)
+    lea rdi, [rax - 8]              ; FR
+    cmp rdi, 0x1FE00000             ; inside the task stack slot?
+    jb .sigret_die
+    cmp rdi, 0x1FFFFE00
+    jae .sigret_die
+    lea rsi, [rdi + 176]            ; sigcontext
+    ; restore GPRs into the syscall frame (H = rsp)
+    mov rax, [rsi + 16]
+    mov [rsp + 8], rax              ; r10
+    mov rax, [rsi + 8]
+    mov [rsp + 16], rax             ; r9
+    mov rax, [rsi + 0]
+    mov [rsp + 24], rax             ; r8
+    mov rax, [rsi + 64]
+    mov [rsp + 32], rax             ; rdi
+    mov rax, [rsi + 72]
+    mov [rsp + 40], rax             ; rsi
+    mov rax, [rsi + 96]
+    mov [rsp + 48], rax             ; rdx
+    mov rax, [rsi + 56]
+    mov [rsp + 56], rax             ; r15
+    mov rax, [rsi + 48]
+    mov [rsp + 64], rax             ; r14
+    mov rax, [rsi + 40]
+    mov [rsp + 72], rax             ; r13
+    mov rax, [rsi + 32]
+    mov [rsp + 80], rax             ; r12
+    mov rax, [rsi + 88]
+    mov [rsp + 88], rax             ; rbx
+    mov rax, [rsi + 80]
+    mov [rsp + 96], rax             ; rbp
+    mov rax, [rsi + 136]
+    mov [rsp + 104], rax            ; eflags -> r11 slot
+    mov rax, [rsi + 128]
+    mov [rsp + 112], rax            ; rip
+    mov rax, [rsi + 120]
+    mov [rsp + 120], rax            ; rsp
+    ; FPU/SSE state (fpstate must be our own FXSAVE area — reject tampering)
+    mov rax, [rsi + 184]
+    lea rcx, [rdi + 440]
+    cmp rax, rcx
+    jne @f
+    fxrstor [rax]
+@@:
+    ; restore the pre-handler blocked mask (uc_sigmask), KILL/STOP stay clear
+    mov rax, [rdi + 432]
+    and rax, not ((1 shl 8) or (1 shl 18))
+    mov ecx, [r15 + sched_curr_task - kmain]
+    imul ecx, TCB_SIZE
+    mov [r15 + task_table - kmain + rcx + TCB_SIG_BLOCKED], rax
+    mov rax, [rsi + 104]            ; interrupted rax (syscall result)
+    ret
+.sigret_die:
+    mov edi, 0x80000000 or LINUX_SIGSEGV
+    call task_exit                  ; never returns
+    ret
+
+; ------------------------------------------------------------------------------
+; .l_pause (Linux #34): sleep until an actionable signal arrives -> -EINTR
+; (delivery runs at syscall return; a lethal signal never returns to user).
+; ------------------------------------------------------------------------------
+.l_pause:
+    call sig_probe_actionable
+    test eax, eax
+    jnz .pause_eintr
+    sti
+    mov ecx, 10
+    call task_sleep
+    cli
+    jmp .l_pause
+.pause_eintr:
+    mov eax, LINUX_EINTR
+    ret
+
+; ------------------------------------------------------------------------------
+; .l_tgkill (Linux #234) / .l_kill (Linux #62):
+;   tgkill: RDI = tgid (ignored — one thread group per task here),
+;           RSI = tid, RDX = sig, falls through into kill with tid in RDI.
+;   kill:   RDI = pid (> 0 only — no process groups yet), RSI = sig
+;           (0 = existence check).
+; ------------------------------------------------------------------------------
+.l_tgkill:
+    mov rdi, rsi                     ; tid
+    mov rsi, rdx                     ; sig
+.l_kill:
+    test rdi, rdi
+    jle .kill_esrch
+    cmp rdi, MAX_TASKS
+    jae .kill_esrch
+    test rsi, rsi
+    jz .kill_exist
+    lea edi, [rdi - 1]               ; pid -> slot
+    mov edx, [r15 + sched_curr_task - kmain]
+    inc edx                          ; si_pid = caller pid
+    call sig_send_to_task
+    ret
+.kill_exist:
+    mov eax, edi
+    dec eax
+    cmp eax, MAX_TASKS
+    jae .kill_esrch
+    imul eax, eax, TCB_SIZE
+    cmp dword [r15 + task_table - kmain + rax + TCB_STATE], TASK_UNUSED
+    je .kill_esrch
+    xor eax, eax
+    ret
+.kill_esrch:
+    mov eax, LINUX_ESRCH
+    ret
+
+; ------------------------------------------------------------------------------
+; Job control (Tier A stubs): every task is its own process group and session
+; leader until real pgids/sessions land. setpgid always "succeeds", getpgid/
+; getsid validate existence, setsid reports the task's own pid.
+; ------------------------------------------------------------------------------
+.l_setpgid:
+    xor eax, eax
+    ret
+.l_getpgrp:
+.l_setsid:
+    mov eax, [r15 + sched_curr_task - kmain]
+    inc eax
+    ret
+.l_getpgid:
+.l_getsid:
+    test rdi, rdi
+    jz .gps_self
+    js .gps_esrch
+    mov eax, edi
+    dec eax
+    cmp eax, MAX_TASKS
+    jae .gps_esrch
+    imul eax, eax, TCB_SIZE
+    cmp dword [r15 + task_table - kmain + rax + TCB_STATE], TASK_UNUSED
+    je .gps_esrch
+    mov eax, edi                     ; pid is its own pgid/sid
+    ret
+.gps_self:
+    mov eax, [r15 + sched_curr_task - kmain]
+    inc eax
+    ret
+.gps_esrch:
+    mov eax, LINUX_ESRCH
     ret
 
 ; ------------------------------------------------------------------------------
@@ -1037,6 +1744,7 @@ str_l_unimpl db "[Linux ABI] Unhandled syscall: #", 0
 str_l_call_log db "[Linux ABI] Call: #", 0
 str_l_fb_log db "[Linux ABI] fallback: #", 0
 str_l_exit_log db "[Linux ABI] Exit with code: ", 0
+str_l_sigkill db "[Linux ABI] Terminated by signal ", 0
 
 align 8
 linux_mmap_next dq 0x20000000

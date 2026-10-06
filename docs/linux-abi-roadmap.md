@@ -28,10 +28,10 @@ io_uring, raw-сокетов/netlink и мультипроцессорного S
 (это уже не «ABI», а разметка Linux). Критерий — бинарники из официального
 Debian amd64 запускаются и выполняют свою работу, а не «проходят тесты».
 
-## 2. Где мы сейчас: 34 / ~450
+## 2. Где мы сейчас: 45 / ~450
 
-Фактически реализовано (`compat_linux.inc:88`, неизвестные → ENOSYS из
-`compat_linux.inc:168`):
+Фактически реализовано (`compat_linux.inc:477`, неизвестные → ENOSYS из
+`compat_linux.inc:579`):
 
 ```
 read(0) write(1) open(2) close(3) lseek(8) poll(7) ioctl(16) writev(20)
@@ -40,6 +40,8 @@ clone(56) fork(57) vfork(58) execve(59) wait4(61) getppid(110)
 exit(60) exit_group(231) uname(63) getcwd(79) chdir(80) mkdir(83)
 rmdir(84) unlink(87) arch_prctl(158) set_tid_address(218)
 getuid(102) getgid(104) geteuid(107) getegid(108)
+rt_sigaction(13) rt_sigprocmask(14) rt_sigreturn(15) pause(34) kill(62)
+setpgid(109) getpgrp(111) setsid(112) getpgid(121) getsid(124) tgkill(234)
 ```
 
 Уже работает end-to-end: детект ABI → spawn → argv/envp/auxv → старт
@@ -47,7 +49,10 @@ musl/glibc-кода → mmap-зона/brk/TLS → вывод через пайп
 exit-код. Эмпирически подтверждено: `linux_test.elf`, `busybox echo …`,
 полный список апплетов `busybox`, цепочка `fork → child exit 42 →
 wait4 → status=0x2a00`, `fork → child execve('/busybox', …) →
-busybox печатает argv → parent wait4 → pid сохранён, status=0x0`.
+busybox печатает argv → parent wait4 → pid сохранён, status=0x0`,
+сигнальная цепочка `rt_sigaction(SIGUSR1) → kill(self) → handler →
+sigreturn → kill вернул 0`, `sigprocmask BLOCK → маска 0x800`,
+`kill(self, SIGTERM) → wait4 → status=0xf` (WIFSIGNALED).
 
 **Метод развития — покрытие таблицы, а не отдельные «фичи»:**
 - `docs/linux-syscalls.md` — матрица: номер → имя → статус
@@ -161,11 +166,30 @@ busybox печатает argv → parent wait4 → pid сохранён, status=
       Проверено: `fork → child execve('/busybox', ['busybox','echo',
       'hello-from-execve']) → печатает argv → parent wait4 → pid=6
       сохранён, status=0x0`.
-- [ ] **waitid**, **setsid/getpgrp/setpgid** (job control шелла).
-- [ ] **Сигналы**: rt_sigaction/rt_sigprocmask/**sigreturn**, kill/tgkill,
-      минимальный набор SIGINT/SIGTERM/SIGCHLD/SIGPIPE/SIGSEGV/SIGALRM;
-      Ctrl+C терминала → SIGINT процессу; запись в пайп без readers → SIGPIPE
-      (-EPIPE); #PF в ring3 → SIGSEGV, а не «crashed. Terminating».
+- [x] **Job control (заглушки)**: setpgid(109) → 0, getpgrp(111)/getpgid(121)/
+      getsid(124) → pid (pid=0 → свой), setsid(112) → свой pid; мир
+      «каждая задача — собственный leader группы и сессии», пока нет
+      реальных pgid/session. **waitid(247) — ещё нет.**
+- [x] **Сигналы (ядро)**: rt_sigaction(13)/rt_sigprocmask(14)/
+      rt_sigreturn(15)/kill(62)/tgkill(234)/pause(34). TCB расширен
+      (TCB_SIZE 624 → 2704): pending/blocked битмапы, sender и таблица
+      64×32 действий (handler/restorer/flags/sa_mask). Доставка на входе
+      в `.syscall_ret` (`sig_on_syscall_ret`): rt_sigframe на пользовательском
+      стеке (pretcode=SA_RESTORER-трамплин, siginfo, ucontext с
+      sigcontext-раскладкой glibc, FXSAVE-область, uc_sigmask = маска ДО
+      хендлера), возврат syscall'а сохраняется в регистре рамки; хендлер
+      входит по ABI вызывающего (RSP≡8 mod 16), default-действие =
+      смерть с `0x80000000|sig` в TCB_EXIT_CODE → waitpid отдаёт
+      WIFSIGNALED-статус (`status=signo`). SIGCHLD/CONT/WINCH/URG и
+      STOP-сигналы (Tier A) считаются игнорируемыми; SIGKILL/SIGSTOP не
+      ловятся и не блокируются. Наследование при fork (копия таблицы),
+      сброс handlers при execve (blocked сохраняется). EINTR в
+      waitpid/pipe-read/pipe-write/pause (`sig_probe_actionable`),
+      SIGPIPE при записи в пайп без читателей (+ прежний -EPIPE),
+      хук пробуждения спящей цели в `sig_send_to_task`.
+      Проверено: `sigaction:0 → handler ran → handler saw:10, kill
+      returned:0 → sigprocmask old=0x0 cur=0x800 → SIGTERM-смерть
+      child → wait4 status=0xf`.
 - [ ] **Таймеры**: clock_gettime/gettimeofday/nanosleep(уже)/setitimer/
       alarm → SIGALRM.
 
