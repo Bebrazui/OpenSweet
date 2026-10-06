@@ -2172,6 +2172,157 @@ ext4_dir_find:
     xor eax, eax
     jmp .pop_all
 
+; ================= read directory entries =================
+; EAX = directory inode, RDI = output buffer, RSI = buffer size,
+; RDX = starting byte offset. Fills struct linux_dirent64 records.
+; Returns: RAX = bytes written (-1 on error), RDX = final directory offset.
+ext4_read_dir:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push rbp
+    sub rsp, 32                 ; [rsp+0]=cur_off, [rsp+8]=blk_idx, [rsp+16]=off_in_blk, [rsp+24]=blk_size
+
+    mov [rsp + 0], rdx          ; cur_off = starting byte offset
+    mov r12, rdi                ; r12 = user output buffer
+    mov r13, rsi                ; r13 = buffer capacity
+    xor r14, r14                ; r14 = bytes written
+
+    call ext4_inode_load
+    jc .rd_err
+
+    ; Calculate block size = 1024 << ext4_lbs
+    mov ecx, [r15 + ext4_lbs - kmain]
+    mov r8d, 1024
+    shl r8d, cl
+    mov [rsp + 24], r8          ; save blk_size
+
+    ; Starting block index and offset in block from starting byte offset
+    mov rax, [rsp + 0]          ; cur_off
+    xor rdx, rdx
+    div r8                      ; rax = blk_idx, rdx = off_in_blk
+    mov [rsp + 8], rax          ; blk_idx
+    mov [rsp + 16], rdx         ; off_in_blk
+
+.rd_block_loop:
+    mov rax, [rsp + 8]          ; blk_idx
+    mov ecx, [r15 + ext4_lbs - kmain]
+    add ecx, 10
+    shl rax, cl                 ; logical byte offset of this block
+    cmp rax, qword [r15 + ext4_inode - kmain + IN_OFF_SIZE]
+    jae .rd_done
+
+    mov eax, dword [rsp + 8]    ; blk_idx
+    call ext4_map
+    cmp rax, -1
+    je .rd_err
+
+    lea rsi, [r15 + ext4_bbuf - kmain]
+    call ext4_blk_read
+    jc .rd_err
+
+    ; r11 = current entry pointer in buffer
+    lea r11, [r15 + ext4_bbuf - kmain]
+    add r11, [rsp + 16]         ; + off_in_blk
+
+    ; r10 = end of block buffer
+    lea r10, [r15 + ext4_bbuf - kmain]
+    add r10, [rsp + 24]         ; + blk_size
+
+.rd_entry_loop:
+    cmp r11, r10
+    jae .rd_next_block
+
+    ; Ensure we can read the fixed ext4_dir_entry header (8 bytes)
+    lea rax, [r11 + 8]
+    cmp rax, r10
+    ja .rd_next_block
+
+    movzx ebx, word [r11 + 4]   ; rec_len (bytes to advance in ext4 block)
+    test ebx, ebx
+    jz .rd_next_block
+
+    lea rax, [r11 + rbx]
+    cmp rax, r10
+    ja .rd_next_block
+
+    mov eax, [r11 + 0]          ; entry inode
+    test eax, eax
+    jz .rd_skip                 ; deleted / unused directory entry
+
+    ; Valid entry: extract name_len and file_type
+    movzx ecx, byte [r11 + 6]   ; name_len
+    movzx ebp, byte [r11 + 7]   ; file_type (d_type)
+
+    ; Calculate linux_dirent64 reclen:
+    ; header = 19 bytes (d_ino 8, d_off 8, d_reclen 2, d_type 1)
+    ; total = (19 + name_len + 1 null byte + 7) & ~7
+    lea edx, [ecx + 20 + 7]
+    and edx, -8                 ; edx = dirent64 reclen
+
+    ; Check if entry fits into user buffer
+    mov rax, r14
+    add rax, rdx
+    cmp rax, r13
+    ja .rd_done                 ; buffer full, stop and return what we have
+
+    ; Fill struct linux_dirent64 at [r12 + r14]:
+    mov eax, [r11 + 0]          ; inode
+    mov [r12 + r14 + 0], rax    ; d_ino (64-bit zero extended)
+
+    mov rax, [rsp + 0]          ; cur_off
+    add rax, rbx                ; d_off = offset after this entry
+    mov [r12 + r14 + 8], rax    ; d_off
+
+    mov [r12 + r14 + 16], dx    ; d_reclen (16-bit)
+    mov [r12 + r14 + 18], bpl   ; d_type (8-bit)
+
+    ; Copy name into d_name (starts at offset 19)
+    push rcx
+    push rdi
+    push rsi
+    lea rsi, [r11 + 8]          ; ext4 entry name
+    lea rdi, [r12 + r14 + 19]   ; d_name in dirent64
+    rep movsb
+    mov byte [rdi], 0           ; null-terminate
+    pop rsi
+    pop rdi
+    pop rcx
+
+    add r14, rdx                ; total bytes written += dirent64 reclen
+
+.rd_skip:
+    add [rsp + 0], rbx          ; cur_off += rec_len
+    add r11, rbx                ; entry ptr += rec_len
+    jmp .rd_entry_loop
+
+.rd_next_block:
+    mov qword [rsp + 16], 0     ; off_in_blk = 0 for subsequent blocks
+    inc qword [rsp + 8]         ; blk_idx++
+    jmp .rd_block_loop
+
+.rd_done:
+    mov rax, r14                ; bytes written
+    mov rdx, [rsp + 0]          ; final offset
+    add rsp, 32
+    pop rbp
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+.rd_err:
+    mov rax, -1
+    add rsp, 32
+    pop rbp
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
 ; ================= resolve path "/a/b/c" =================
 ; RSI = ASCIIZ path -> RAX = inode or 0. Path buffer is not modified.
 ext4_lookup:

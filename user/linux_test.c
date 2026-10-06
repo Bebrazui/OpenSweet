@@ -392,6 +392,31 @@ void os_main(int argc, char **argv) {
         sys3(3, pfd2, 0, 0);
     }
 
+    /* --- getdents64: read directory entries from / --- */
+    {
+        long long dfd = sys3(2, (long long)"/", 0, 0);  /* open("/") */
+        print("[Linux ABI] open(/) rc=");
+        print_dec(dfd);
+        print("\n");
+        if (dfd >= 0) {
+            char dbuf[256];
+            long long dr = sys3(217, dfd, (long long)dbuf, 256); /* getdents64 */
+            print("[Linux ABI] getdents64: rc=");
+            print_dec(dr);
+            print(" first=");
+            if (dr > 0) {
+                /* print first entry name: d_ino(8) d_off(8) d_reclen(2) d_type(1) name... */
+                print(dbuf + 19);
+            }
+            print("\n");
+            sys3(3, dfd, 0, 0);   /* close */
+        } else {
+            print("[Linux ABI] getdents64: open failed rc=");
+            print_dec(dfd);
+            print("\n");
+        }
+    }
+
     /* --- alarm(1) -> SIGALRM -> pause() returns -EINTR --- */
     struct k_sigaction sa2;
     sa2.handler = (long long)alrm_handler;

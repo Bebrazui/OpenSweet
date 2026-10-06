@@ -55,6 +55,7 @@ LINUX_SYS_OPENAT      = 257
 LINUX_SYS_MKDIRAT     = 258
 LINUX_SYS_UNLINKAT    = 263
 LINUX_SYS_NEWFSTATAT   = 262
+LINUX_SYS_GETDENTS64   = 217
 LINUX_SYS_VFORK       = 58
 LINUX_SYS_GETPPID     = 110
 LINUX_SYS_RT_SIGACTION = 13
@@ -852,6 +853,8 @@ linux_syscall_dispatch:
     je .l_fcntl
     cmp eax, LINUX_SYS_NEWFSTATAT
     je .l_newfstatat
+    cmp eax, LINUX_SYS_GETDENTS64
+    je .l_getdents64
     cmp eax, LINUX_SYS_KILL
     je .l_kill
     cmp eax, LINUX_SYS_TGKILL
@@ -1811,6 +1814,68 @@ linux_syscall_dispatch:
     ret
 .l_fstat:
     call vfs_stat_fd
+    ret
+
+; ------------------------------------------------------------------------------
+; .l_getdents64 (Linux #217): RDI = fd, RSI = buf, RDX = count.
+; Reads directory entries as struct linux_dirent64. Returns bytes written
+; or -errno.
+; ------------------------------------------------------------------------------
+.l_getdents64:
+    push rbx
+    push r12
+    push r13
+    push rdx                ; [rsp] = count
+    mov r12d, edi           ; r12d = fd
+    mov r13, rsi            ; r13 = buf
+    mov rdi, rsi
+    mov rsi, rdx
+    call sys_validate_user_ptr
+    jc .l_gd_efault
+    mov edi, r12d           ; fd
+    call vfs_get_fd_ptr
+    test rax, rax
+    jz .l_gd_badfd
+    mov rbx, rax
+    cmp byte [rbx + 0], FD_TYPE_FILE
+    jne .l_gd_badfd
+    movzx eax, word [rbx + 2]
+    call ext4_inode_load
+    jc .l_gd_efault
+    movzx eax, word [r15 + ext4_inode - kmain + 0]
+    and eax, 0xF000
+    cmp eax, 0x4000         ; S_IFDIR
+    jne .l_gd_notdir
+    mov r8d, [rbx + 4]      ; starting offset
+    movzx eax, word [rbx + 2]  ; inode
+    mov rdi, r13            ; buf
+    mov rsi, [rsp]          ; count
+    mov rdx, r8             ; starting offset
+    call ext4_read_dir
+    cmp rax, -1
+    je .l_gd_err
+    mov [rbx + 4], edx      ; advance fd offset to final directory offset
+    jmp .l_gd_done
+.l_gd_badfd:
+    mov rax, LINUX_EBADF
+    jmp .l_gd_done
+.l_gd_notdir:
+    mov rax, LINUX_ENOTDIR
+    jmp .l_gd_done
+.l_gd_efault:
+    mov rax, LINUX_EFAULT
+    jmp .l_gd_done
+.l_gd_err:
+    mov rax, LINUX_EIO
+    jmp .l_gd_done
+.l_gd_inoderr:
+    mov rax, LINUX_EIO
+    jmp .l_gd_done
+.l_gd_done:
+    add rsp, 8              ; pop count
+    pop r13
+    pop r12
+    pop rbx
     ret
 
 ; ------------------------------------------------------------------------------
