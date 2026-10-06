@@ -17,7 +17,7 @@ USER_PAGE_TABLES_BASE = 0x00200000    ; 2MB: Physical base for per-process page 
 USER_PHYS_BASE        = 0x05000000    ; 80MB: Physical base for per-process code/stack (42MB for 7 slots)
 USER_MEM_STRIDE       = 0x00600000    ; 6MB physical stride per task slot (4MB code + 2MB stack)
 
-; TCB offsets (2704 bytes per TCB, 16-byte aligned)
+; TCB offsets (2720 bytes per TCB, 16-byte aligned)
 TCB_RSP         = 0x00                ; uint64: Saved stack pointer
 TCB_STATE       = 0x08                ; uint32: TASK_* state
 TCB_ID          = 0x0C                ; uint32: Task ID
@@ -49,7 +49,8 @@ TCB_SIG_ACT     = 0x290               ; 64 entries * 32 bytes, per signal (sig-1
                                       ;   +8  restorer (SA_RESTORER trampoline address)
                                       ;   +16 sa_flags
                                       ;   +24 sa_mask  (kernel sigset, 8 bytes)
-TCB_SIZE        = 2704                ; 0xA90 = 0x290 + 64*32 (16-byte aligned)
+TCB_FUTEX_ADDR  = 0xA90               ; uint64: futex wait address (0 = not waiting)
+TCB_SIZE        = 2720                ; 0xA98 = 0xA90 + 8 (16-byte aligned)
 
 TASK_STACK_SIZE = 8192                ; 8 KB stack per task
 
@@ -537,6 +538,7 @@ task_finalize_user:
     mov qword [rdi + TCB_SIG_PENDING], 0
     mov qword [rdi + TCB_SIG_SENDER], 0
     mov dword [rdi + TCB_ALARM_MS], 0  ; no pending alarm on (re)load (POSIX)
+    mov qword [rdi + TCB_FUTEX_ADDR], 0 ; no pending futex wait on (re)load
     push rdi
     lea rdi, [rdi + TCB_SIG_ACT]
     xor eax, eax
@@ -796,6 +798,11 @@ sched_tick:
     lea rsi, [r15 + task_table - kmain + rax]
 .no_alarm:
     cmp dword [rsi + TCB_STATE], TASK_SLEEPING
+    jne .next_sleep
+
+    ; futex waiters sleep until FUTEX_WAKE or a signal — the tick must not
+    ; decrement their (absent) timeout or wake them prematurely
+    cmp qword [rsi + TCB_FUTEX_ADDR], 0
     jne .next_sleep
 
     cmp dword [rsi + TCB_SLEEP], 0

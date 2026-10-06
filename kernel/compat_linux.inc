@@ -275,6 +275,7 @@ sig_send_to_task:
     cmp dword [rbx + TCB_STATE], TASK_SLEEPING
     jne @f
     mov dword [rbx + TCB_STATE], TASK_READY
+    mov qword [rbx + TCB_FUTEX_ADDR], 0  ; a signal interrupts futex wait too
 @@:
     xor eax, eax
     jmp .sst_done
@@ -828,6 +829,8 @@ linux_syscall_dispatch:
     je .l_pause
     cmp eax, LINUX_SYS_ALARM
     je .l_alarm
+    cmp eax, LINUX_SYS_FUTEX
+    je .l_futex
     cmp eax, LINUX_SYS_KILL
     je .l_kill
     cmp eax, LINUX_SYS_TGKILL
@@ -1475,6 +1478,95 @@ linux_syscall_dispatch:
     ret
 .alarm_off:
     mov dword [rbx + TCB_ALARM_MS], 0
+    ret
+
+; ------------------------------------------------------------------------------
+; .l_futex (Linux #202): RDI = uaddr, ESI = op, RDX = val (expected for WAIT,
+; nr_wake for WAKE). FUTEX_PRIVATE_FLAG (0x80) is masked off — all futexes are
+; process-private here. FUTEX_WAIT sleeps until FUTEX_WAKE or a signal;
+; the scheduler tick never wakes futex waiters (see sched_tick .sleep_loop).
+; ------------------------------------------------------------------------------
+.l_futex:
+    push rbx
+    push r12
+    push r13
+    mov r12, rdi                ; r12 = uaddr
+    mov r13d, esi               ; r13 = op
+    and r13d, 0x7F              ; mask FUTEX_PRIVATE_FLAG / CLOCK_REALTIME
+    cmp r13d, 0                 ; FUTEX_WAIT
+    je .l_futex_wait
+    cmp r13d, 1                 ; FUTEX_WAKE
+    je .l_futex_wake
+    mov rax, LINUX_EINVAL
+    jmp .l_futex_done
+
+.l_futex_wait:
+    ; RDX = expected value
+    mov rdi, r12
+    mov esi, 4
+    call sys_validate_user_ptr
+    jc .l_futex_efault
+    mov eax, [r12]
+    cmp eax, edx
+    jne .l_futex_eagain         ; value changed: -EAGAIN, no sleep
+    ; sleep on the futex address (indefinite; timeout arg ignored for now)
+    mov eax, [r15 + sched_curr_task - kmain]
+    imul eax, TCB_SIZE
+    lea rbx, [r15 + task_table - kmain + rax]
+    mov [rbx + TCB_FUTEX_ADDR], r12
+    mov dword [rbx + TCB_SLEEP], 0
+    mov dword [rbx + TCB_STATE], TASK_SLEEPING
+    int 0x31                    ; yield: scheduler picks another task
+    ; woken by FUTEX_WAKE or a signal
+    mov qword [rbx + TCB_FUTEX_ADDR], 0
+    call sig_probe_actionable
+    test eax, eax
+    jnz .l_futex_eintr
+    xor eax, eax
+    jmp .l_futex_done
+
+.l_futex_wake:
+    ; RDX = nr_wake
+    mov rdi, r12
+    mov esi, 4
+    call sys_validate_user_ptr
+    jc .l_futex_efault
+    xor r13d, r13d              ; r13 = woken count
+    xor ebx, ebx                ; ebx = slot
+.l_futex_wake_loop:
+    cmp ebx, MAX_TASKS
+    jae .l_futex_wake_done
+    imul eax, ebx, TCB_SIZE
+    lea rdi, [r15 + task_table - kmain + rax]
+    cmp dword [rdi + TCB_STATE], TASK_SLEEPING
+    jne .l_futex_wake_next
+    mov rax, [rdi + TCB_FUTEX_ADDR]
+    cmp rax, r12
+    jne .l_futex_wake_next
+    mov qword [rdi + TCB_FUTEX_ADDR], 0
+    mov dword [rdi + TCB_STATE], TASK_READY
+    inc r13d
+    cmp r13d, edx
+    jae .l_futex_wake_done
+.l_futex_wake_next:
+    inc ebx
+    jmp .l_futex_wake_loop
+.l_futex_wake_done:
+    mov rax, r13
+    jmp .l_futex_done
+
+.l_futex_eagain:
+    mov rax, LINUX_EAGAIN
+    jmp .l_futex_done
+.l_futex_eintr:
+    mov rax, LINUX_EINTR
+    jmp .l_futex_done
+.l_futex_efault:
+    mov rax, LINUX_EFAULT
+.l_futex_done:
+    pop r13
+    pop r12
+    pop rbx
     ret
 
 ; ------------------------------------------------------------------------------

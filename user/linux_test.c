@@ -303,6 +303,18 @@ void os_main(int argc, char **argv) {
         print("\n");
     }
 
+    /* --- futex: WAIT fast path (-EAGAIN) and WAKE with no waiters --- */
+    {
+        volatile int faddr = 1;
+        long long fe = sys3(202, (long long)&faddr, 0, 2); /* WAIT val=2: -EAGAIN */
+        long long fw = sys3(202, (long long)&faddr, 1, 1); /* WAKE 1: 0 waiters */
+        print("[Linux ABI] futex: eagain=");
+        print_dec(fe);          /* expect -11 */
+        print(" wake=");
+        print_dec(fw);          /* expect 0 */
+        print("\n");
+    }
+
     /* --- alarm(1) -> SIGALRM -> pause() returns -EINTR --- */
     struct k_sigaction sa2;
     sa2.handler = (long long)alrm_handler;
