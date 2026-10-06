@@ -9,6 +9,8 @@ CONFIG_LINUX_COMPAT = 1
 ; Linux x86_64 Syscall Numbers
 LINUX_SYS_READ        = 0
 LINUX_SYS_WRITE       = 1
+LINUX_SYS_PREAD64     = 17
+LINUX_SYS_PWRITE64    = 18
 LINUX_SYS_OPEN        = 2
 LINUX_SYS_CLOSE       = 3
 LINUX_SYS_STAT        = 4
@@ -52,6 +54,7 @@ LINUX_SYS_EXIT_GROUP  = 231
 LINUX_SYS_OPENAT      = 257
 LINUX_SYS_MKDIRAT     = 258
 LINUX_SYS_UNLINKAT    = 263
+LINUX_SYS_NEWFSTATAT   = 262
 LINUX_SYS_VFORK       = 58
 LINUX_SYS_GETPPID     = 110
 LINUX_SYS_RT_SIGACTION = 13
@@ -831,6 +834,24 @@ linux_syscall_dispatch:
     je .l_alarm
     cmp eax, LINUX_SYS_FUTEX
     je .l_futex
+    cmp eax, LINUX_SYS_PREAD64
+    je .l_pread64
+    cmp eax, LINUX_SYS_PWRITE64
+    je .l_pwrite64
+    cmp eax, LINUX_SYS_STAT
+    je .l_stat
+    cmp eax, LINUX_SYS_FSTAT
+    je .l_fstat
+    cmp eax, LINUX_SYS_LSTAT
+    je .l_lstat
+    cmp eax, LINUX_SYS_PIPE
+    je .l_pipe
+    cmp eax, LINUX_SYS_DUP
+    je .l_dup
+    cmp eax, LINUX_SYS_FCNTL
+    je .l_fcntl
+    cmp eax, LINUX_SYS_NEWFSTATAT
+    je .l_newfstatat
     cmp eax, LINUX_SYS_KILL
     je .l_kill
     cmp eax, LINUX_SYS_TGKILL
@@ -1567,6 +1588,229 @@ linux_syscall_dispatch:
     pop r13
     pop r12
     pop rbx
+    ret
+
+; ------------------------------------------------------------------------------
+; .l_pread64 (Linux #17) / .l_pwrite64 (Linux #18): read/write at explicit
+; offset without moving the file position. RDI = fd, RSI = buf, RDX = count,
+; R10 = offset.
+; ------------------------------------------------------------------------------
+.l_pread64:
+    push rbx
+    push r12
+    push r13
+    mov r12d, edi
+    mov r13, rsi
+    mov rdi, rsi
+    mov rsi, rdx
+    call sys_validate_user_ptr
+    jc .l_pread_efault
+    mov edi, r12d
+    call vfs_get_fd_ptr
+    test rax, rax
+    jz .l_pread_badfd
+    mov rbx, rax
+    cmp byte [rbx + 0], FD_TYPE_FILE
+    jne .l_pread_badfd
+    push qword [rbx + 4]              ; save offset
+    mov [rbx + 4], r10d               ; set to pread offset
+    mov rdi, r12
+    mov rsi, r13
+    call vfs_read_fd
+    pop rcx
+    mov [rbx + 4], ecx                ; restore offset
+    jmp .l_pread_done
+.l_pread_badfd:
+    mov rax, LINUX_EBADF
+    jmp .l_pread_done
+.l_pread_efault:
+    mov rax, LINUX_EFAULT
+.l_pread_done:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+.l_pwrite64:
+    push rbx
+    push r12
+    push r13
+    mov r12d, edi
+    mov r13, rsi
+    mov rdi, rsi
+    mov rsi, rdx
+    call sys_validate_user_ptr
+    jc .l_pwrite_efault
+    mov edi, r12d
+    call vfs_get_fd_ptr
+    test rax, rax
+    jz .l_pwrite_badfd
+    mov rbx, rax
+    cmp byte [rbx + 0], FD_TYPE_FILE
+    jne .l_pwrite_badfd
+    push qword [rbx + 4]
+    mov [rbx + 4], r10d
+    mov rdi, r12
+    mov rsi, r13
+    call vfs_write_fd
+    pop rcx
+    mov [rbx + 4], ecx
+    jmp .l_pwrite_done
+.l_pwrite_badfd:
+    mov rax, LINUX_EBADF
+    jmp .l_pwrite_done
+.l_pwrite_efault:
+    mov rax, LINUX_EFAULT
+.l_pwrite_done:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ------------------------------------------------------------------------------
+; .l_pipe (Linux #22): RDI = int pipefd[2] (user). Returns 0 or -errno.
+; ------------------------------------------------------------------------------
+.l_pipe:
+    mov rdi, rdi
+    call vfs_pipe
+    cmp rax, -1
+    jne .l_pipe_ok
+    mov rax, LINUX_EMFILE            ; no free pipes/fds
+    ret
+.l_pipe_ok:
+    xor eax, eax
+    ret
+
+; ------------------------------------------------------------------------------
+; .l_dup (Linux #32): RDI = oldfd. Returns new fd or -errno.
+; ------------------------------------------------------------------------------
+.l_dup:
+    mov edi, edi
+    call vfs_dup
+    ret
+
+; ------------------------------------------------------------------------------
+; .l_fcntl (Linux #72): RDI = fd, ESI = cmd, EDX = arg.
+;   F_DUPFD(0) -> dup to first free fd >= arg
+;   F_GETFD(1) -> 0 (no per-fd flags tracked)
+;   F_SETFD(2) -> 0 (accepted, not tracked)
+;   F_GETFL(3) -> file status flags from fd_entry
+;   F_SETFL(4) -> update file status flags
+; ------------------------------------------------------------------------------
+.l_fcntl:
+    cmp esi, 0                       ; F_DUPFD
+    je .l_fcntl_dupfd
+    cmp esi, 1                       ; F_GETFD
+    je .l_fcntl_getfd
+    cmp esi, 2                       ; F_SETFD
+    je .l_fcntl_setfd
+    cmp esi, 3                       ; F_GETFL
+    je .l_fcntl_getfl
+    cmp esi, 4                       ; F_SETFL
+    je .l_fcntl_setfl
+    mov rax, LINUX_EINVAL
+    ret
+.l_fcntl_dupfd:
+    ; duplicate oldfd to first free fd >= arg
+    push rbx
+    push r12
+    push r13
+    mov r12d, edi                    ; oldfd
+    mov r13d, edx                    ; arg (min fd)
+    call vfs_get_fd_ptr
+    test rax, rax
+    jz .l_fcntl_badfd
+    mov rbx, rax
+    mov eax, [r15 + sched_curr_task - kmain]
+    imul eax, eax, (MAX_FDS_PER_TASK * FD_ENTRY_SIZE)
+    lea rax, [r15 + task_fd_tables - kmain + rax]
+    mov ecx, r13d
+    cmp ecx, 3
+    jae @f
+    mov ecx, 3
+@@:
+.l_fcntl_dup_find:
+    cmp ecx, MAX_FDS_PER_TASK
+    jae .l_fcntl_badfd
+    imul edx, ecx, FD_ENTRY_SIZE
+    cmp byte [rax + rdx + 0], FD_TYPE_UNUSED
+    je .l_fcntl_dup_found
+    inc ecx
+    jmp .l_fcntl_dup_find
+.l_fcntl_dup_found:
+    imul edx, ecx, FD_ENTRY_SIZE
+    lea rdi, [rax + rdx]
+    mov rsi, rbx
+    mov ecx, FD_ENTRY_SIZE / 8
+    rep movsq
+    cmp byte [rdi - FD_ENTRY_SIZE + 0], FD_TYPE_PIPE
+    jne .l_fcntl_dup_done
+    movzx eax, word [rdi - FD_ENTRY_SIZE + 2]
+    imul eax, eax, PIPE_STRUCT_SIZE
+    lea rdx, [r15 + pipe_table - kmain + rax]
+    cmp byte [rdi - FD_ENTRY_SIZE + 1], O_RDONLY
+    jne .l_fcntl_dup_wr
+    inc word [rdx + 12]
+    jmp .l_fcntl_dup_done
+.l_fcntl_dup_wr:
+    inc word [rdx + 14]
+.l_fcntl_dup_done:
+    mov eax, ecx                     ; return new fd
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.l_fcntl_badfd:
+    pop r13
+    pop r12
+    pop rbx
+    mov rax, LINUX_EBADF
+    ret
+.l_fcntl_getfd:
+    xor eax, eax
+    ret
+.l_fcntl_setfd:
+    xor eax, eax
+    ret
+.l_fcntl_getfl:
+    call vfs_get_fd_ptr
+    test rax, rax
+    jz .l_fcntl_badfd2
+    movzx eax, byte [rax + 1]        ; flags from fd_entry
+    ret
+.l_fcntl_setfl:
+    call vfs_get_fd_ptr
+    test rax, rax
+    jz .l_fcntl_badfd2
+    mov [rax + 1], dl                ; update flags
+    xor eax, eax
+    ret
+.l_fcntl_badfd2:
+    mov rax, LINUX_EBADF
+    ret
+
+; ------------------------------------------------------------------------------
+; .l_stat (Linux #4) / .l_lstat (Linux #6) / .l_newfstatat (Linux #262):
+;   stat:    RDI = pathname, RSI = statbuf
+;   lstat:   same (symlinks not supported yet, so identical to stat)
+;   newfstatat: RDI = dirfd (ignored), RSI = pathname, RDX = statbuf,
+;              R10 = flags (ignored)
+; .l_fstat (Linux #5): RDI = fd, RSI = statbuf
+; ------------------------------------------------------------------------------
+.l_stat:
+    call vfs_stat_path
+    ret
+.l_lstat:
+    call vfs_stat_path
+    ret
+.l_newfstatat:
+    ; RDI = dirfd (ignored), RSI = pathname, RDX = statbuf, R10 = flags
+    mov rdi, rsi                     ; pathname
+    mov rsi, rdx                     ; statbuf
+    call vfs_stat_path
+    ret
+.l_fstat:
+    call vfs_stat_fd
     ret
 
 ; ------------------------------------------------------------------------------

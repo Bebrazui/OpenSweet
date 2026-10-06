@@ -30,6 +30,18 @@ static inline long long sys3(long long num, long long a1, long long a2, long lon
     return ret;
 }
 
+static inline long long sys4(long long num, long long a1, long long a2, long long a3, long long a4) {
+    long long ret;
+    register long long r10 __asm__("r10") = a4;
+    __asm__ volatile (
+        "syscall"
+        : "=a"(ret)
+        : "a"(num), "D"(a1), "S"(a2), "d"(a3), "r"(r10)
+        : "rcx", "r11", "memory"
+    );
+    return ret;
+}
+
 static inline long long sys1(long long num, long long a1) {
     long long ret;
     __asm__ volatile (
@@ -313,6 +325,71 @@ void os_main(int argc, char **argv) {
         print(" wake=");
         print_dec(fw);          /* expect 0 */
         print("\n");
+    }
+
+    /* --- pipe/dup/stat/fstat/pread64/fcntl --- */
+    {
+        int pfd[2];
+        long long pr = sys3(22, (long long)pfd, 0, 0);   /* pipe() */
+        long long pw = sys3(1, pfd[1], (long long)"hi", 2); /* write(2) */
+        char rbuf[4];
+        long long rd = sys3(0, pfd[0], (long long)rbuf, 4); /* read(2) */
+        print("[Linux ABI] pipe: rc=");
+        print_dec(pr);
+        print(" w=");
+        print_dec(pw);
+        print(" r=");
+        print_dec(rd);
+        print(" data=");
+        print(rbuf);
+        print("\n");
+        sys3(3, pfd[0], 0, 0);   /* close */
+        sys3(3, pfd[1], 0, 0);   /* close */
+
+        /* stat linux_test.elf */
+        struct { unsigned long long dev, ino, nlink; unsigned mode, uid, gid;
+                 int pad; unsigned long long rdev; long long size, blksize,
+                 blocks; long long atime[2], mtime[2], ctime[2]; long long u[3];
+        } st;
+        long long src = sys3(4, (long long)"/linux_test.elf", (long long)&st, 0);
+        print("[Linux ABI] stat: rc=");
+        print_dec(src);
+        print(" size=");
+        print_dec(st.size);
+        print(" mode=0x");
+        print_hex(st.mode);
+        print("\n");
+
+        /* fstat on open fd */
+        long long fd = sys3(2, (long long)"/hello.elf", 0, 0); /* open */
+        long long fsrc = sys3(5, fd, (long long)&st, 0);        /* fstat */
+        print("[Linux ABI] fstat: fd=");
+        print_dec(fd);
+        print(" rc=");
+        print_dec(fsrc);
+        print(" size=");
+        print_dec(st.size);
+        print("\n");
+
+        /* pread64: read 4 bytes at offset 0, then check offset unchanged */
+        char pbuf[8];
+        long long pfd2 = sys3(2, (long long)"/hello.elf", 0, 0);
+        long long pad = sys4(17, pfd2, (long long)pbuf, 4, 0); /* pread64 */
+        long long sk = sys3(8, pfd2, 0, 1);                     /* lseek 0 */
+        print("[Linux ABI] pread64: rc=");
+        print_dec(pad);
+        print(" seek_after=");
+        print_dec(sk);
+        print("\n");
+
+        /* fcntl F_GETFL */
+        long long fl = sys3(72, pfd2, 3, 0);   /* F_GETFL */
+        print("[Linux ABI] fcntl: fl=0x");
+        print_hex((unsigned long long)(unsigned int)fl);
+        print("\n");
+
+        sys3(3, fd, 0, 0);
+        sys3(3, pfd2, 0, 0);
     }
 
     /* --- alarm(1) -> SIGALRM -> pause() returns -EINTR --- */

@@ -252,6 +252,210 @@ vfs_open:
     ret
 
 ; ==============================================================================
+; vfs_stat_fill: fill struct stat (144 bytes, x86_64 layout) at RDI from the
+; loaded ext4_inode. EAX = inode number (st_ino). Clobbers rax, rcx.
+; ==============================================================================
+vfs_stat_fill:
+    push rdi
+    push rax
+    push rcx
+    mov rcx, 144 / 8
+    xor eax, eax
+    rep stosq                         ; zero the buffer
+    pop rcx
+    pop rax
+    sub rdi, 144                      ; rep stosq advanced rdi
+    mov [rdi + 8], rax                ; st_ino
+    movzx ecx, word [r15 + ext4_inode - kmain + 26]
+    mov [rdi + 16], rcx               ; st_nlink = i_links_count
+    movzx ecx, word [r15 + ext4_inode - kmain + 0]
+    mov [rdi + 24], ecx               ; st_mode = i_mode
+    movzx ecx, word [r15 + ext4_inode - kmain + 2]
+    mov [rdi + 28], ecx               ; st_uid = i_uid
+    movzx ecx, word [r15 + ext4_inode - kmain + 24]
+    mov [rdi + 32], ecx               ; st_gid = i_gid
+    mov ecx, dword [r15 + ext4_inode - kmain + 4]
+    mov [rdi + 48], ecx               ; st_size low
+    mov ecx, dword [r15 + ext4_inode - kmain + 108]
+    mov [rdi + 52], ecx               ; st_size high
+    mov qword [rdi + 56], 1024        ; st_blksize
+    mov ecx, dword [r15 + ext4_inode - kmain + 28]
+    mov [rdi + 64], rcx               ; st_blocks (512B sectors)
+    mov ecx, dword [r15 + ext4_inode - kmain + 8]
+    mov [rdi + 72], rcx               ; st_atim.tv_sec
+    mov ecx, dword [r15 + ext4_inode - kmain + 16]
+    mov [rdi + 88], rcx               ; st_mtim.tv_sec
+    mov ecx, dword [r15 + ext4_inode - kmain + 12]
+    mov [rdi + 104], rcx              ; st_ctim.tv_sec
+    pop rdi
+    ret
+
+; ==============================================================================
+; vfs_stat_path: stat a path. RDI = pathname, RSI = statbuf (user, 144 bytes).
+; Returns EAX = 0 or -errno. Clobbers rbx, r12, r13.
+; ==============================================================================
+vfs_stat_path:
+    push rbx
+    push r12
+    push r13
+    mov r12, rdi
+    mov r13, rsi
+    mov rdi, r13
+    mov esi, 144
+    call sys_validate_user_ptr
+    jc .statp_efault
+    mov rdi, r12
+    mov esi, 64
+    call sys_validate_user_ptr
+    jc .statp_efault
+    mov rsi, r12
+    call ext4_lookup
+    test eax, eax
+    jz .statp_enoent
+    call ext4_inode_load
+    jc .statp_efault
+    sub rsp, 144
+    mov rdi, rsp
+    call vfs_stat_fill
+    mov rsi, rsp
+    mov rdi, r13
+    mov ecx, 144 / 8
+    rep movsq
+    add rsp, 144
+    xor eax, eax
+    jmp .statp_done
+.statp_enoent:
+    mov eax, LINUX_ENOENT
+    neg rax
+    jmp .statp_done
+.statp_efault:
+    mov eax, LINUX_EFAULT
+    neg rax
+.statp_done:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ==============================================================================
+; vfs_stat_fd: stat an open fd. EDI = fd, RSI = statbuf (user, 144 bytes).
+; Returns EAX = 0 or -errno.
+; ==============================================================================
+vfs_stat_fd:
+    push rbx
+    push r12
+    push r13
+    mov r12d, edi
+    mov r13, rsi
+    mov rdi, r13
+    mov esi, 144
+    call sys_validate_user_ptr
+    jc .statf_efault
+    mov edi, r12d
+    call vfs_get_fd_ptr
+    test rax, rax
+    jz .statf_badfd
+    mov rbx, rax
+    cmp byte [rbx + 0], FD_TYPE_FILE
+    jne .statf_badfd
+    movzx eax, word [rbx + 2]         ; inode number
+    call ext4_inode_load
+    jc .statf_efault
+    sub rsp, 144
+    mov rdi, rsp
+    call vfs_stat_fill
+    mov rsi, rsp
+    mov rdi, r13
+    mov ecx, 144 / 8
+    rep movsq
+    add rsp, 144
+    xor eax, eax
+    jmp .statf_done
+.statf_badfd:
+    mov eax, LINUX_EBADF
+    neg rax
+    jmp .statf_done
+.statf_efault:
+    mov eax, LINUX_EFAULT
+    neg rax
+.statf_done:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ==============================================================================
+; vfs_dup: duplicate oldfd to the first free fd >= 3. EDI = oldfd.
+; Returns EAX = new fd or -errno.
+; ==============================================================================
+vfs_dup:
+    pushfq
+    cli
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r12
+    mov r12d, edi                     ; r12d = oldfd
+    call vfs_get_fd_ptr
+    test rax, rax
+    jz .dup_badfd
+    mov rbx, rax                      ; rbx = old fd_entry
+    mov eax, [r15 + sched_curr_task - kmain]
+    imul eax, eax, (MAX_FDS_PER_TASK * FD_ENTRY_SIZE)
+    lea rdx, [r15 + task_fd_tables - kmain + rax]  ; rdx = fd table base
+    mov ecx, 3
+.dup_find:
+    cmp ecx, MAX_FDS_PER_TASK
+    jae .dup_badfd
+    imul eax, ecx, FD_ENTRY_SIZE
+    cmp byte [rdx + rax + 0], FD_TYPE_UNUSED
+    je .dup_found
+    inc ecx
+    jmp .dup_find
+.dup_found:
+    ; copy old fd_entry to new slot
+    imul eax, ecx, FD_ENTRY_SIZE
+    lea rdi, [rdx + rax]
+    mov rsi, rbx
+    mov ecx, FD_ENTRY_SIZE / 8
+    rep movsq
+    ; bump pipe refcounts if it's a pipe
+    cmp byte [rdi - FD_ENTRY_SIZE + 0], FD_TYPE_PIPE
+    jne .dup_done
+    movzx eax, word [rdi - FD_ENTRY_SIZE + 2]
+    imul eax, eax, PIPE_STRUCT_SIZE
+    lea rdx, [r15 + pipe_table - kmain + rax]
+    cmp byte [rdi - FD_ENTRY_SIZE + 1], O_RDONLY
+    jne .dup_wr
+    inc word [rdx + 12]               ; readers++
+    jmp .dup_done
+.dup_wr:
+    inc word [rdx + 14]               ; writers++
+.dup_done:
+    mov eax, ecx                      ; return new fd
+    pop r12
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    popfq
+    ret
+.dup_badfd:
+    pop r12
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    popfq
+    mov eax, LINUX_EBADF
+    neg rax
+    ret
+
+; ==============================================================================
 ; vfs_close: Close a file descriptor
 ; EDI = fd
 ; Returns: EAX = 0 on success, -1 on error
