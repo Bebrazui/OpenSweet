@@ -627,6 +627,8 @@ sys_handler_write:
     push rdx
     push rsi
     push rdi
+    push r12
+    push r13
 
     test rdx, rdx
     jz .sw_done
@@ -634,26 +636,27 @@ sys_handler_write:
     jbe @f
     mov rdx, 65536
 @@:
+    mov r12, rsi                      ; r12 = user buffer
+    mov r13, rdx                      ; r13 = count
+
     ; Validate user pointer
-    mov rdi, rsi
-    mov rsi, rdx
+    mov rdi, r12
+    mov rsi, r13
     call sys_validate_user_ptr
     jc .sw_err
 
-    mov rsi, rdi                      ; restore rsi = user buffer
-    mov rbx, [rsp + 16]               ; restore rbx = original count from saved rdx on stack
-    cmp rbx, 65536
-    jbe .sw_loop
-    mov rbx, 65536
 .sw_loop:
-    test rbx, rbx
+    test r13, r13
     jz .sw_done
-    lodsb
-    call putc                         ; Outputs to desktop terminal & serial!
-    dec rbx
+    mov al, byte [r12]
+    call putc                         ; putc prints to COM1 serial AND terminal buffer!
+    inc r12
+    dec r13
     jmp .sw_loop
 
 .sw_done:
+    pop r13
+    pop r12
     pop rdi
     pop rsi
     pop rdx
@@ -663,6 +666,8 @@ sys_handler_write:
     ret
 
 .sw_err:
+    pop r13
+    pop r12
     pop rdi
     pop rsi
     pop rdx

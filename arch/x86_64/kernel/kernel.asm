@@ -2862,7 +2862,7 @@ common_ex:
     mov rax, [rsp + 11*8]     ; RDX
     call puthex64
 
-    ; Line 2: RSI, RDI, R8, R9
+    ; Line 2: RSI, RDI, RBP, R8
     lea rsi, [r15 + str_dump_r2 - kmain]
     call puts
     mov rax, [rsp + 10*8]     ; RSI
@@ -2871,16 +2871,20 @@ common_ex:
     call puts
     mov rax, [rsp + 9*8]      ; RDI
     call puthex64
+    lea rsi, [r15 + str_dump_rbp - kmain]
+    call puts
+    mov rax, [rsp + 8*8]      ; RBP
+    call puthex64
     lea rsi, [r15 + str_dump_r8 - kmain]
     call puts
     mov rax, [rsp + 7*8]      ; R8
     call puthex64
-    lea rsi, [r15 + str_dump_r9 - kmain]
+
+    ; Line 3: R9, R10, R11, R12
+    lea rsi, [r15 + str_dump_r9_s - kmain]
     call puts
     mov rax, [rsp + 6*8]      ; R9
     call puthex64
-
-    ; Line 3: R10, R11, R12, R13
     lea rsi, [r15 + str_dump_ra - kmain]
     call puts
     mov rax, [rsp + 5*8]      ; R10
@@ -2892,10 +2896,6 @@ common_ex:
     lea rsi, [r15 + str_dump_rc1 - kmain]
     call puts
     mov rax, [rsp + 3*8]      ; R12
-    call puthex64
-    lea rsi, [r15 + str_dump_rd1 - kmain]
-    call puts
-    mov rax, [rsp + 2*8]      ; R13
     call puthex64
 
     ; Stack contents at fault RSP
@@ -3158,9 +3158,10 @@ str_dump_rc db " RCX=", 0
 str_dump_rd db " RDX=", 0
 str_dump_r2 db 10, "  RSI=", 0
 str_dump_di db " RDI=", 0
+str_dump_rbp db " RBP=", 0
 str_dump_r8 db " R8 =", 0
-str_dump_r9 db " R9 =", 0
-str_dump_ra db 10, "  R10=", 0
+str_dump_r9_s db 10, "  R9 =", 0
+str_dump_ra db " R10=", 0
 str_dump_rb1 db " R11=", 0
 str_dump_rc1 db " R12=", 0
 str_dump_rd1 db " R13=", 0

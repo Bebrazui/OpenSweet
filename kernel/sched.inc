@@ -350,6 +350,7 @@ task_setup_pagetables:
     cmp ecx, 512
     jb .fill_pd_loop
 
+
     ; Customize user-accessible entries in PD:
     ; Entries 2..3 (virtual 0x00400000..0x007FFFFF): User Code/Data/BSS (4MB)
     ; Map to slot's private physical code: USER_PHYS_BASE + (ebx - 1) * USER_MEM_STRIDE

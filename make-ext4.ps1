@@ -250,6 +250,40 @@ if ($hasDoom) {
     ExtentLeaf ($itable + 20 * 128) $doomStartBlock $doomBlocks $doomBytes.Length 0x81ED
 }
 
+$debHelloPath = Join-Path $PSScriptRoot "build\debian_test\debian_hello"
+$hasDebHello = Test-Path $debHelloPath
+$debHelloBlocks = 0
+$debHelloStartBlock = if ($hasDoom) { $doomStartBlock + $doomBlocks } elseif ($hasBusybox) { $busyboxStartBlock + $busyboxBlocks } else { $linuxTestStartBlock + $linuxTestBlocks }
+if ($hasDebHello) {
+    $debHelloBytes = [IO.File]::ReadAllBytes($debHelloPath)
+    $debHelloBlocks = [int][Math]::Ceiling($debHelloBytes.Length / 1024.0)
+    # inode 24 = debian_hello
+    ExtentLeaf ($itable + 23 * 128) $debHelloStartBlock $debHelloBlocks $debHelloBytes.Length 0x81ED
+}
+
+$ldPath = Join-Path $PSScriptRoot "build\debian_test\lib64\ld-linux-x86-64.so.2"
+$hasLd = Test-Path $ldPath
+$ldBlocks = 0
+$ldStartBlock = $debHelloStartBlock + $debHelloBlocks
+if ($hasLd) {
+    $ldBytes = [IO.File]::ReadAllBytes($ldPath)
+    $ldBlocks = [int][Math]::Ceiling($ldBytes.Length / 1024.0)
+    # inode 25 = ld-linux-x86-64.so.2
+    ExtentLeaf ($itable + 24 * 128) $ldStartBlock $ldBlocks $ldBytes.Length 0x81ED
+}
+
+$libcPath = Join-Path $PSScriptRoot "build\debian_test\lib\x86_64-linux-gnu\libc.so.6"
+$hasLibc = Test-Path $libcPath
+$libcBlocks = 0
+$libcStartBlock = $ldStartBlock + $ldBlocks
+if ($hasLibc) {
+    $libcBytes = [IO.File]::ReadAllBytes($libcPath)
+    $libcBlocks = [int][Math]::Ceiling($libcBytes.Length / 1024.0)
+    # inode 26 = libc.so.6
+    ExtentLeaf ($itable + 25 * 128) $libcStartBlock $libcBlocks $libcBytes.Length 0x81ED
+}
+
+
 $wadPath = Join-Path $PSScriptRoot "user\doomgeneric\doom1.wad"
 $hasWad = $includeDoom -and (Test-Path $wadPath)
 $wadBlocks = 0
@@ -317,13 +351,29 @@ if ($hasBusybox) {
     $curOff += 20
 }
 if ($hasDoom) {
-    $rec = if ($hasWad) { 20 } else { $d + 1024 - $curOff }
+    $rec = if ($hasDebHello -or $hasLd -or $hasLibc -or $hasWad) { 20 } else { $d + 1024 - $curOff }
     DirEntry $curOff 21 'doom.elf' 1 $rec
+    $curOff += 20
+}
+if ($hasDebHello) {
+    $rec = if ($hasLd -or $hasLibc -or $hasWad) { 24 } else { $d + 1024 - $curOff }
+    DirEntry $curOff 24 'debian_hello' 1 $rec
+    $curOff += 24
+}
+if ($hasLd) {
+    $rec = if ($hasLibc -or $hasWad) { 32 } else { $d + 1024 - $curOff }
+    DirEntry $curOff 25 'ld-linux-x86-64.so.2' 1 $rec
+    $curOff += 32
+}
+if ($hasLibc) {
+    $rec = if ($hasWad) { 20 } else { $d + 1024 - $curOff }
+    DirEntry $curOff 26 'libc.so.6' 1 $rec
     $curOff += 20
 }
 if ($hasWad) {
     DirEntry $curOff 20 'doom1.wad' 1 ($d + 1024 - $curOff)
 }
+
 
 # ---- file data ----
 $hello = [Text.Encoding]::ASCII.GetBytes("Hello from Opensweet ext4!`n")
@@ -371,13 +421,31 @@ if ($hasDoom) {
     Put ($doomStartBlock * $BS) $doomBytes
     echo "Added doom.elf ($($doomBytes.Length) bytes, $doomBlocks blocks) to disk image"
 }
+if ($hasDebHello) {
+    Put ($debHelloStartBlock * $BS) $debHelloBytes
+    echo "Added debian_hello ($($debHelloBytes.Length) bytes, $debHelloBlocks blocks) to disk image"
+}
+if ($hasLd) {
+    Put ($ldStartBlock * $BS) $ldBytes
+    echo "Added ld-linux-x86-64.so.2 ($($ldBytes.Length) bytes, $ldBlocks blocks) to disk image"
+}
+if ($hasLibc) {
+    Put ($libcStartBlock * $BS) $libcBytes
+    echo "Added libc.so.6 ($($libcBytes.Length) bytes, $libcBlocks blocks) to disk image"
+}
 if ($hasWad) {
     Put ($wadStartBlock * $BS) $wadBytes
     echo "Added doom1.wad ($($wadBytes.Length) bytes, $wadBlocks blocks) to disk image"
 }
 
 # ---- populate block and inode bitmaps and free counts ----
-$totalAllocatedBlocksGrp0 = if ($hasDoom) {
+$totalAllocatedBlocksGrp0 = if ($hasLibc) {
+    $libcStartBlock + $libcBlocks
+} elseif ($hasLd) {
+    $ldStartBlock + $ldBlocks
+} elseif ($hasDebHello) {
+    $debHelloStartBlock + $debHelloBlocks
+} elseif ($hasDoom) {
     $doomStartBlock + $doomBlocks
 } elseif ($hasBusybox) {
     $busyboxStartBlock + $busyboxBlocks
@@ -400,7 +468,7 @@ for ($b = 0; $b -lt $grp0Blocks; $b++) {
 # Inode bitmap at block 4 (inodes 1..lastIno are used)
 # Must cover the HIGHEST inode actually written above (index+1), else a
 # free-but-used inode gets handed out by the allocator and corrupts a file.
-$lastIno = if ($hasBusybox) { 23 } elseif ($hasLinuxTest) { 22 } elseif ($hasDoom) { 21 } elseif ($hasWad) { 20 } elseif ($hasFiles) { 19 } elseif ($hasTerm) { 18 } elseif ($hasNote) { 17 } elseif ($hasCalc) { 16 } elseif ($hasGui) { 15 } elseif ($hasElf) { 14 } elseif ($hasWall) { 13 } else { 12 }
+$lastIno = if ($hasLibc) { 26 } elseif ($hasLd) { 25 } elseif ($hasDebHello) { 24 } elseif ($hasBusybox) { 23 } elseif ($hasLinuxTest) { 22 } elseif ($hasDoom) { 21 } elseif ($hasWad) { 20 } elseif ($hasFiles) { 19 } elseif ($hasTerm) { 18 } elseif ($hasNote) { 17 } elseif ($hasCalc) { 16 } elseif ($hasGui) { 15 } elseif ($hasElf) { 14 } elseif ($hasWall) { 13 } else { 12 }
 [Array]::Clear($img, 4 * $BS, $BS)
 for ($ino = 1; $ino -le $lastIno; $ino++) {
     $bit = $ino - 1
@@ -408,6 +476,7 @@ for ($ino = 1; $ino -le $lastIno; $ino++) {
     $bitIdx  = $bit -band 7
     $img[(4 * $BS) + $byteIdx] = $img[(4 * $BS) + $byteIdx] -bor (1 -shl $bitIdx)
 }
+
 
 # Group 1 block bitmap at block 8192:
 # Mark 10 metadata blocks of Group 1 + wadBlocks

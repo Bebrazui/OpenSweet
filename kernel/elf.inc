@@ -11,6 +11,8 @@ EM_X86_64             = 0x3E
 ET_EXEC               = 2
 ET_DYN                = 3
 PT_LOAD               = 1
+PT_DYNAMIC            = 2
+PT_INTERP             = 3
 
 ; Return / Error Codes
 ELF_OK                = 0
@@ -59,7 +61,18 @@ str_elf_entry_log     db "[ELF] Entry point: 0x", 0
 str_elf_segs_log      db ", loaded segments: ", 0
 str_elf_spawned       db 10, "[ELF] Ring 3 process spawned! TID=", 0
 str_elf_abi_log       db "[ELF] ABI detect -> ", 0
+str_elf_interp_log    db "[ELF] PT_INTERP interpreter: '", 0
+str_elf_quote_nl      db "'", 10, 0
 str_elf_nl            db 10, 0
+
+align 8
+elf_has_interp        dq 0
+elf_interp_base       dq 0x00600000     ; Base VA to load dynamic interpreter (in code slot)
+elf_interp_entry      dq 0
+elf_interp_path       rb 128
+str_interp_fallback   db "/ld-linux-x86-64.so.2", 0
+str_elf_interp_ok     db "[ELF] Dynamic linker loaded at 0x600000!", 10, 0
+str_elf_err_interp    db "[ELF] Error: Failed to load dynamic interpreter.", 10, 0
 
 str_elf_err_fnf       db "[ELF] Error: File not found on ext4 filesystem.", 10, 0
 str_elf_err_read      db "[ELF] Error: Failed to read file from ext4.", 10, 0
@@ -262,6 +275,7 @@ elf_load_exec:
     mov r12, rsi                      ; r12 = buffer base
     mov r13, rdx                      ; r13 = file size
     mov r14, rdi                      ; r14 = process name
+    mov qword [r15 + elf_has_interp - kmain], 0
 
     ; 1. Validate ELF magic signature: \x7fELF
     cmp dword [r12 + EHDR_OFF_IDENT], ELF_MAGIC
@@ -375,7 +389,14 @@ elf_load_exec:
     push rbx                          ; [rsp + 24] = slot ID
     push r9                           ; [rsp + 16] = phys_code
     push r10                          ; [rsp + 8]  = phys_stack
-    push qword [r12 + EHDR_OFF_ENTRY] ; [rsp + 0]  = saved entry point RIP
+    mov rax, [r12 + EHDR_OFF_ENTRY]
+    cmp word [r12 + EHDR_OFF_TYPE], ET_DYN
+    jne @f
+    cmp rax, 0x400000
+    jae @f
+    add rax, 0x400000                 ; Relocate PIE entry to 0x400000
+@@:
+    push rax                          ; [rsp + 0]  = saved entry point RIP
 
     ; Stack layout:
     ; [rsp + 0]  = entry RIP
@@ -417,6 +438,10 @@ elf_load_exec:
     add rax, [rsp + 48]               ; phoff
     lea rdx, [r12 + rax]              ; rdx = phdr ptr
 
+    ; Check for PT_INTERP (type == 3)
+    cmp dword [rdx + PHDR_OFF_TYPE], PT_INTERP
+    je .handle_interp
+
     ; Check if PT_LOAD (type == 1)
     cmp dword [rdx + PHDR_OFF_TYPE], PT_LOAD
     jne .next_phdr
@@ -426,6 +451,14 @@ elf_load_exec:
     mov rdi, [rdx + PHDR_OFF_VADDR]   ; rdi = virtual memory address
     mov rax, [rdx + PHDR_OFF_FILESZ]  ; rax = file size
     mov r8,  [rdx + PHDR_OFF_MEMSZ]   ; r8  = memory size
+
+    ; For PIE (ET_DYN), relocate segment virtual address by slot base (0x400000)
+    cmp word [r12 + EHDR_OFF_TYPE], ET_DYN
+    jne @f
+    cmp rdi, 0x400000
+    jae @f
+    add rdi, 0x400000
+@@:
 
     ; Validate file offset + filesz <= file size (with 64-bit integer overflow check)
     mov rbp, rsi
@@ -489,6 +522,34 @@ elf_load_exec:
     inc ebx
     jmp .phdr_loop
 
+.handle_interp:
+    mov qword [r15 + elf_has_interp - kmain], 1
+    mov rsi, [rdx + PHDR_OFF_OFFSET]
+    mov eax, dword [rdx + PHDR_OFF_FILESZ]
+    cmp eax, 127
+    jbe @f
+    mov eax, 127
+@@:
+    push rcx
+    push rdi
+    push rsi
+    mov ecx, eax
+    lea rsi, [r12 + rsi]              ; source in elf buffer
+    lea rdi, [r15 + elf_interp_path - kmain]
+    rep movsb
+    mov byte [rdi], 0                 ; null terminate
+    ; Log interpreter path
+    lea rsi, [r15 + str_elf_interp_log - kmain]
+    call puts
+    lea rsi, [r15 + elf_interp_path - kmain]
+    call puts
+    lea rsi, [r15 + str_elf_quote_nl - kmain]
+    call puts
+    pop rsi
+    pop rdi
+    pop rcx
+    jmp .next_phdr
+
 .phdrs_done:
     pop r8                            ; r8  = saved entry point RIP
     pop r10                           ; r10 = phys_stack
@@ -545,7 +606,8 @@ elf_load_exec:
 @@: clc
 .argv_arr_checked:
     pop rbx
-    jc .fallback_args
+    ; Preserve r12 (ELF buffer base) across argv copying
+    push r12
 
     ; Copy arguments into phys_stack + 0x1FF800 (virtual 0x1FFFF800)
     lea r12, [r10 + 0x1FF800]          ; physical destination
@@ -613,6 +675,7 @@ elf_load_exec:
     jmp .copy_argv_loop
 
 .argv_copied:
+    pop r12                            ; restore ELF buffer base
     test ecx, ecx
     jz .fallback_args
 
@@ -712,26 +775,33 @@ elf_load_exec:
 
 .args_done:
     ; Setup AMD64 System V / Linux Auxiliary Vector (auxv) at RDI:
-    ; [0] AT_PHDR (3) = 0x400040 (load_addr + phoff)
+    ; [0] AT_PHDR (3) = 0x400000 + phoff
     mov qword [rdi + 0*8], 3
-    mov qword [rdi + 1*8], 0x400040
+    mov rax, [r12 + EHDR_OFF_PHOFF]
+    add rax, 0x400000
+    mov [rdi + 1*8], rax
     ; [1] AT_PHENT (4) = 56
     mov qword [rdi + 2*8], 4
     mov qword [rdi + 3*8], 56
-    ; [2] AT_PHNUM (5) = [rsp + 0] (saved phnum on stack or read from elf)
+    ; [2] AT_PHNUM (5) = phnum from ELF header
     mov qword [rdi + 4*8], 5
     movzx rax, word [r12 + EHDR_OFF_PHNUM]
     mov [rdi + 5*8], rax
     ; [3] AT_PAGESZ (6) = 4096
     mov qword [rdi + 6*8], 6
     mov qword [rdi + 7*8], 4096
-    ; [4] AT_BASE (7) = 0
+    ; [4] AT_BASE (7) = interp_base (or 0 if static)
     mov qword [rdi + 8*8], 7
-    mov qword [rdi + 9*8], 0
+    xor eax, eax
+    cmp qword [r15 + elf_has_interp - kmain], 0
+    je @f
+    mov rax, [r15 + elf_interp_base - kmain]
+@@:
+    mov [rdi + 9*8], rax
     ; [5] AT_FLAGS (8) = 0
     mov qword [rdi + 10*8], 8
     mov qword [rdi + 11*8], 0
-    ; [6] AT_ENTRY (9) = entry RIP (r8)
+    ; [6] AT_ENTRY (9) = entry RIP of executable
     mov qword [rdi + 12*8], 9
     mov [rdi + 13*8], r8
     ; [7] AT_UID (11) = 0
@@ -746,15 +816,18 @@ elf_load_exec:
     ; [10] AT_EGID (14) = 0
     mov qword [rdi + 20*8], 14
     mov qword [rdi + 21*8], 0
-    ; [11] AT_SECURE (23) = 0
-    mov qword [rdi + 22*8], 23
-    mov qword [rdi + 23*8], 0
-    ; [12] AT_RANDOM (25) = pointer to 16 random bytes (use 0x1FFFF500)
-    mov qword [rdi + 24*8], 25
-    mov qword [rdi + 25*8], 0x1FFFF500
-    ; [13] AT_NULL (0) = 0
-    mov qword [rdi + 26*8], 0
-    mov qword [rdi + 27*8], 0
+    ; [11] AT_CLKTCK (17) = 100
+    mov qword [rdi + 22*8], 17
+    mov qword [rdi + 23*8], 100
+    ; [12] AT_SECURE (23) = 0
+    mov qword [rdi + 24*8], 23
+    mov qword [rdi + 25*8], 0
+    ; [13] AT_RANDOM (25) = pointer to 16 random bytes (0x1FFFF500)
+    mov qword [rdi + 26*8], 25
+    mov qword [rdi + 27*8], 0x1FFFF500
+    ; [14] AT_NULL (0) = 0
+    mov qword [rdi + 28*8], 0
+    mov qword [rdi + 29*8], 0
 
     mov qword [r15 + sys_spawn_argv_ptr - kmain], 0
 
@@ -769,6 +842,9 @@ if defined CONFIG_LINUX_COMPAT
     push rsi
     push rax
     mov qword [r15 + sys_spawn_abi - kmain], 0
+    cmp qword [r15 + elf_has_interp - kmain], 0
+    jne .abi_is_linux
+
     ; Content scan first: GNU ld (Linux toolchains) always emits PT_GNU_STACK,
     ; PE-derived ELFs (our native apps / mingw-built test bins) never do — so
     ; arbitrary Debian binaries classify correctly regardless of file name.
@@ -815,6 +891,10 @@ if defined CONFIG_LINUX_COMPAT
     pop rsi
     pop rdi
 end if
+
+    ; If PT_INTERP requested, load dynamic linker and switch entry RIP
+    call elf_load_interp              ; EBX = slot ID, R8 = entry RIP -> RAX = effective entry RIP
+    mov r8, rax
 
     ; 11. Finalize Ring 3 User Task!
     ; EBX = slot ID
@@ -923,3 +1003,184 @@ elf_check_is_elf_command:
     pop rcx
     pop rsi
     ret
+
+; ==============================================================================
+; elf_load_interp: Load dynamic linker (ld-linux.so) if PT_INTERP was requested
+; EBX = task slot ID
+; R8  = main binary entry RIP
+; Returns: RAX = entry point to execute (interp entry if dynamic, or original R8)
+; ==============================================================================
+elf_load_interp:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+
+    cmp qword [r15 + elf_has_interp - kmain], 0
+    jne @f
+    mov rax, r8                       ; Static binary: keep original entry RIP
+    jmp .li_ret
+@@:
+    ; Force Linux ABI for dynamic binaries
+    mov qword [r15 + sys_spawn_abi - kmain], 1
+
+    ; 1. Try finding interpreter by requested path
+    lea rsi, [r15 + elf_interp_path - kmain]
+    call ext4_lookup
+    test eax, eax
+    jnz .li_have_inode
+
+    ; Fallback: look in root directory (/ld-linux-x86-64.so.2)
+    lea rsi, [r15 + str_interp_fallback - kmain]
+    call ext4_lookup
+    test eax, eax
+    jnz .li_have_inode
+
+    ; Interpreter not found!
+    lea rsi, [r15 + str_elf_err_interp - kmain]
+    call puts
+    mov rax, r8                       ; Fallback to main binary
+    jmp .li_ret
+
+.li_have_inode:
+    call ext4_inode_load
+    jc .li_fail
+
+    mov r12, qword [r15 + ext4_inode - kmain + IN_OFF_SIZE]
+    cmp r12, 64
+    jb .li_fail
+
+    ; 2. Allocate buffer from heap to read ld-linux
+    mov rcx, r12
+    call kmalloc
+    test rax, rax
+    jz .li_fail
+    mov r13, rax                      ; r13 = interp buffer
+
+    ; 3. Read file into buffer
+    lea rsi, [r15 + elf_interp_path - kmain]
+    push rax
+    call ext4_lookup
+    test eax, eax
+    jnz @f
+    lea rsi, [r15 + str_interp_fallback - kmain]
+@@:
+    pop rax
+    mov rdi, r13
+    mov rcx, r12
+    call ext4_read_file_to_mem
+    jc .li_free_fail
+
+    ; 4. Validate ELF header of interpreter
+    cmp dword [r13 + EHDR_OFF_IDENT], ELF_MAGIC
+    jne .li_free_fail
+    cmp byte [r13 + EHDR_OFF_IDENT + 4], ELFCLASS64
+    jne .li_free_fail
+
+    ; Compute interpreter entry RIP: interp_base + e_entry
+    mov rax, [r13 + EHDR_OFF_ENTRY]
+    add rax, [r15 + elf_interp_base - kmain]
+    mov [r15 + elf_interp_entry - kmain], rax
+
+    ; 5. Calculate physical destination base for interpreter
+    ; Slot code memory is 4MB at phys_code.
+    ; Interp base is 0x600000 -> phys_dest = phys_code + 0x200000
+    lea eax, [ebx - 1]
+    imul eax, USER_MEM_STRIDE
+    add eax, USER_PHYS_BASE + 0x00200000
+    mov r14d, eax                     ; r14 = physical base for interpreter
+
+    ; 6. Iterate and load PT_LOAD segments of the interpreter
+    movzx r10d, word [r13 + EHDR_OFF_PHNUM]     ; phnum
+    movzx ebp, word [r13 + EHDR_OFF_PHENTSIZE]  ; phentsize
+    mov r9, [r13 + EHDR_OFF_PHOFF]              ; phoff
+    xor ecx, ecx                                ; ph index
+
+.li_phdr_loop:
+    cmp ecx, r10d
+    jae .li_load_done
+
+    mov rax, rcx
+    imul rax, rbp
+    add rax, r9
+    lea rdx, [r13 + rax]              ; rdx = phdr ptr
+
+    cmp dword [rdx + PHDR_OFF_TYPE], PT_LOAD
+    jne .li_next_phdr
+
+    ; Segment details:
+    mov rsi, [rdx + PHDR_OFF_OFFSET]  ; file offset
+    mov rdi, [rdx + PHDR_OFF_VADDR]   ; virtual address offset (from 0)
+    mov r8,  [rdx + PHDR_OFF_FILESZ]  ; filesz
+    mov r11, [rdx + PHDR_OFF_MEMSZ]   ; memsz
+
+    ; Copy segment data into task's physical memory
+    push rcx
+    push rdi
+    lea rdi, [r14 + rdi]              ; target physical address
+    lea rsi, [r13 + rsi]              ; source buffer
+    mov rcx, r8                       ; filesz
+    rep movsb
+
+    ; Clear BSS if memsz > filesz
+    cmp r11, r8
+    jbe @f
+    mov rcx, r11
+    sub rcx, r8                       ; BSS size
+    xor eax, eax
+    rep stosb
+@@:
+    pop rdi
+    pop rcx
+
+.li_next_phdr:
+    inc ecx
+    jmp .li_phdr_loop
+
+
+.li_load_done:
+    ; Advance linux_mmap_next to 0x20100000 (beyond interpreter)
+    mov qword [r15 + linux_mmap_next - kmain], 0x20100000
+
+    lea rsi, [r15 + str_elf_interp_ok - kmain]
+    call puts
+
+    mov rdi, r13
+    call kfree
+
+    mov rax, [r15 + elf_interp_entry - kmain]
+    jmp .li_ret
+
+.li_free_fail:
+    mov rdi, r13
+    call kfree
+.li_fail:
+    lea rsi, [r15 + str_elf_err_interp - kmain]
+    call puts
+    mov rax, [rsp + 56]               ; original r8 (main binary entry)
+
+.li_ret:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+

@@ -105,6 +105,48 @@ vfs_get_fd_ptr:
     ret
 
 ; ==============================================================================
+; vfs_lookup_with_fallback: lookup path in ext4; if not found and contains '/',
+; fallback to looking up just the basename in the root directory.
+; RSI = path (ASCIIZ)
+; Returns: EAX = inode or 0. Preserves RSI.
+; ==============================================================================
+vfs_lookup_with_fallback:
+    push rsi
+    push rcx
+    call ext4_lookup
+    test eax, eax
+    jnz .lwf_done
+
+    ; If lookup failed, find basename (character after last '/')
+    mov rcx, [rsp + 8]                ; original rsi
+    xor eax, eax                      ; eax = last slash ptr (or 0)
+.lwf_scan:
+    mov dl, [rcx]
+    test dl, dl
+    jz .lwf_scan_done
+    cmp dl, '/'
+    jne @f
+    lea rax, [rcx + 1]
+@@:
+    inc rcx
+    jmp .lwf_scan
+.lwf_scan_done:
+    test rax, rax
+    jz .lwf_fail                      ; no slash in path
+    cmp byte [rax], 0
+    jz .lwf_fail                      ; trailing slash with no name
+    mov rsi, rax
+    call ext4_lookup
+    jmp .lwf_done
+
+.lwf_fail:
+    xor eax, eax
+.lwf_done:
+    pop rcx
+    pop rsi
+    ret
+
+; ==============================================================================
 ; vfs_open: Open a file and allocate a file descriptor
 ; RDI = path (ASCIIZ), ESI = flags, EDX = mode
 ; Returns: EAX = fd (3..15), or -1 on error
@@ -173,7 +215,7 @@ vfs_open:
 
     ; Check if file exists in ext4
     lea rsi, [rsp]
-    call ext4_lookup
+    call vfs_lookup_with_fallback
     test eax, eax
     jnz .have_inode
 
@@ -309,7 +351,7 @@ vfs_stat_path:
     call sys_validate_user_ptr
     jc .statp_efault
     mov rsi, r12
-    call ext4_lookup
+    call vfs_lookup_with_fallback
     test eax, eax
     jz .statp_enoent
     call ext4_inode_load

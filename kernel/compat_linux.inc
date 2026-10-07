@@ -853,6 +853,8 @@ linux_syscall_dispatch:
     je .l_fcntl
     cmp eax, LINUX_SYS_NEWFSTATAT
     je .l_newfstatat
+    cmp eax, LINUX_SYS_OPENAT
+    je .l_openat
     cmp eax, LINUX_SYS_GETDENTS64
     je .l_getdents64
     cmp eax, LINUX_SYS_KILL
@@ -933,8 +935,11 @@ linux_syscall_dispatch:
     mov rdx, [r13 + 8]          ; iov_len
     test rdx, rdx
     jz .l_wv_next
-    call vfs_write_fd
-    test rax, rax
+    push rsi
+    push rdx
+    call sys_handler_write
+    pop rdx
+    pop rsi
     js .l_wv_err
     add rbp, rax
 .l_wv_next:
@@ -982,6 +987,22 @@ linux_syscall_dispatch:
 .l_open:
     ; RDI = pathname, RSI = flags, RDX = mode
     call vfs_open
+    cmp rax, -1
+    jne .l_open_ret
+    mov rax, LINUX_ENOENT
+.l_open_ret:
+    ret
+
+.l_openat:
+    ; RDI = dirfd, RSI = pathname, RDX = flags, R10 = mode
+    mov rdi, rsi                     ; pathname
+    mov rsi, rdx                     ; flags
+    mov rdx, r10                     ; mode
+    call vfs_open
+    cmp rax, -1
+    jne .l_openat_ret
+    mov rax, LINUX_ENOENT
+.l_openat_ret:
     ret
 
 .l_close:
@@ -2234,14 +2255,18 @@ linux_syscall_dispatch:
     cmp rsi, 0x20000000             ; C-L1: cap length at the zone size (512MB)
     ja .l_mmap_einval
 
-    ; Loop over length in 4KB pages and map with vmm_map
-    push r12
-    push r13
-    push r14
-    push r15
-    push rbx
+    ; Save parameters on stack to preserve across page loop and vmm_map calls
+    push r9                             ; [rsp + 56] = offset
+    push r8                             ; [rsp + 48] = fd
+    push r10                            ; [rsp + 40] = flags
+    push rsi                            ; [rsp + 32] = original length
+    push r12                            ; [rsp + 24]
+    push r13                            ; [rsp + 16]
+    push r14                            ; [rsp + 8]
+    push r15                            ; [rsp + 0]
+    push rbx                            ; [rsp - 8] -> after push rbx: [rsp + 0] = rbx, etc.
 
-    xor r14d, r14d                  ; r14 = bump-mode flag (addr == 0)
+    xor r14d, r14d                      ; r14 = bump-mode flag (addr == 0)
     test rdi, rdi
     jnz .l_mmap_base_ok
     mov rdi, [r15 + linux_mmap_next - kmain]
@@ -2270,6 +2295,16 @@ linux_syscall_dispatch:
     test r13, r13
     jz .l_mmap_done
 
+    ; If page already mapped (e.g. MAP_FIXED over reserved mapping), unmap and free old phys page
+    mov rdi, r12
+    call vmm_unmap                      ; RAX = existing phys page (0 if none)
+    test rax, rax
+    jz @f
+    cmp rax, 0x10000000                 ; only PMM bitmap range
+    jae @f
+    mov rdi, rax
+    call pmm_free
+@@:
     ; Allocate zeroed physical page
     call pmm_alloc_zero
     test rax, rax
@@ -2286,6 +2321,63 @@ linux_syscall_dispatch:
     ja .l_mmap_page_loop
 
 .l_mmap_done:
+    ; Saved on stack:
+    ;   [rsp + 0]  = rbx
+    ;   [rsp + 8]  = r15
+    ;   [rsp + 16] = r14
+    ;   [rsp + 24] = r13
+    ;   [rsp + 32] = r12
+    ;   [rsp + 40] = original length (rsi)
+    ;   [rsp + 48] = flags (r10)
+    ;   [rsp + 56] = fd (r8)
+    ;   [rsp + 64] = offset (r9)
+
+    ; Check if file-backed mapping: fd (in [rsp + 56]) >= 0 and not anonymous
+    ; Linux MAP_ANONYMOUS is 0x20. If fd != -1 and not MAP_ANON:
+    test dword [rsp + 48], 0x20         ; MAP_ANONYMOUS?
+    jnz .l_mmap_commit
+    mov r8, [rsp + 56]                  ; saved fd
+    cmp r8, -1
+    je .l_mmap_commit
+    cmp r8, MAX_FDS_PER_TASK
+    jae .l_mmap_commit
+
+    ; Get fd_entry for fd
+    mov edi, r8d
+    call vfs_get_fd_ptr
+    test rax, rax
+    jz .l_mmap_commit
+    cmp byte [rax + 0], FD_TYPE_FILE
+    jne .l_mmap_commit
+
+    movzx ebp, word [rax + 2]           ; ebp = inode
+    mov edx, [rax + 8]                  ; edx = file size
+    mov r9, [rsp + 64]                  ; saved offset (offset 64 from rsp)
+    cmp r9, rdx                         ; offset >= size?
+    jae .l_mmap_commit
+    sub edx, r9d                        ; remaining bytes in file from offset
+    mov ecx, edx                        ; ecx = max bytes to read from file
+    cmp rcx, [rsp + 40]                 ; min(file_remaining, length)
+    jbe @f
+    mov rcx, [rsp + 40]
+@@:
+    test rcx, rcx
+    jz .l_mmap_commit
+
+    ; Read file chunk directly into mapped virtual memory at rbx
+    ; ext4_read_file_chunk_inode(EAX=inode, RCX=max_bytes, RDX=offset, RDI=dest)
+    push rbx
+    push rcx
+    push rdx
+    mov eax, ebp                        ; inode
+    mov rdx, [rsp + 64 + 24]            ; file offset from stack (+24 for 3 pushes)
+    mov rdi, rbx                        ; mapped virtual destination
+    call ext4_read_file_chunk_inode
+    pop rdx
+    pop rcx
+    pop rbx
+
+.l_mmap_commit:
     test r14d, r14d
     jz .l_mmap_ret
     ; Bump mode only: commit [base, r12) now that every page is mapped, so a
@@ -2300,6 +2392,7 @@ linux_syscall_dispatch:
     pop r14
     pop r13
     pop r12
+    add rsp, 32                 ; discard saved rsi, r10, r8, r9
     ret
 
 .l_mmap_enomem:
@@ -2327,6 +2420,7 @@ linux_syscall_dispatch:
     pop r14
     pop r13
     pop r12
+    add rsp, 32
     mov rax, LINUX_ENOMEM
     ret
 
@@ -2336,6 +2430,7 @@ linux_syscall_dispatch:
     pop r14
     pop r13
     pop r12
+    add rsp, 32
 .l_mmap_einval:
     mov rax, LINUX_EINVAL
     ret
