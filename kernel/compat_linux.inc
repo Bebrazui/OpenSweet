@@ -70,6 +70,14 @@ LINUX_SYS_SETSID      = 112
 LINUX_SYS_GETPGID     = 121
 LINUX_SYS_GETSID      = 124
 LINUX_SYS_TGKILL      = 234
+LINUX_SYS_READV       = 19
+LINUX_SYS_MADVISE     = 28
+LINUX_SYS_SYSINFO     = 99
+LINUX_SYS_FACCESSAT   = 269
+LINUX_SYS_GETRUSAGE   = 98
+LINUX_SYS_TIMES       = 100
+LINUX_SYS_READLINK    = 89
+LINUX_SYS_READLINKAT  = 267
 
 ; Signal numbers (Linux x86_64 numbering)
 LINUX_SIGINT   = 2
@@ -871,6 +879,24 @@ linux_syscall_dispatch:
     je .l_getpgid
     cmp eax, LINUX_SYS_GETSID
     je .l_getsid
+    cmp eax, LINUX_SYS_ACCESS
+    je .l_access
+    cmp eax, LINUX_SYS_FACCESSAT
+    je .l_faccessat
+    cmp eax, LINUX_SYS_READV
+    je .l_readv
+    cmp eax, LINUX_SYS_MADVISE
+    je .l_madvise
+    cmp eax, LINUX_SYS_SYSINFO
+    je .l_sysinfo
+    cmp eax, LINUX_SYS_GETRUSAGE
+    je .l_getrusage
+    cmp eax, LINUX_SYS_TIMES
+    je .l_times
+    cmp eax, LINUX_SYS_READLINK
+    je .l_readlink
+    cmp eax, LINUX_SYS_READLINKAT
+    je .l_readlinkat
 
     ; Unhandled Linux syscall: log to serial and return -ENOSYS
     push rax
@@ -978,10 +1004,364 @@ linux_syscall_dispatch:
     pop rbx
     ret
 
+.l_readv:
+    ; RDI = fd, RSI = const struct iovec *iov, RDX = int iovcnt
+    push rbx
+    push r12
+    push r13
+    push r14
+    push rbp
+    mov r12, rdi                ; r12 = fd
+    mov r13, rsi                ; r13 = iov
+    mov r14, rdx                ; r14 = iovcnt
+    xor ebp, ebp                ; ebp = total read
+    test r14, r14
+    jz .l_rv_done
+    cmp r14, 1024
+    ja .l_rv_einval
+    mov rdi, r13
+    mov rsi, r14
+    shl rsi, 4                  ; iovcnt * 16
+    call sys_validate_user_ptr
+    jc .l_rv_efault
+.l_rv_loop:
+    test r14, r14
+    jz .l_rv_done
+    mov rdi, r12                ; fd
+    mov rsi, [r13 + 0]          ; iov_base
+    mov rdx, [r13 + 8]          ; iov_len
+    test rdx, rdx
+    jz .l_rv_next
+    call vfs_read_fd
+    cmp rax, -1
+    je .l_rv_err
+    test rax, rax
+    jz .l_rv_done               ; EOF
+    add rbp, rax
+.l_rv_next:
+    add r13, 16
+    dec r14
+    jmp .l_rv_loop
+.l_rv_done:
+    mov rax, rbp
+    pop rbp
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.l_rv_err:
+    test rbp, rbp
+    jnz .l_rv_done
+    mov eax, [r15 + vfs_last_err - kmain]
+    neg rax
+    pop rbp
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.l_rv_einval:
+    mov rax, LINUX_EINVAL
+    pop rbp
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.l_rv_efault:
+    mov rax, LINUX_EFAULT
+    pop rbp
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
 .l_ioctl:
     ; RDI = fd, RSI = request, RDX = arg
-    ; For TIOCGWINSZ (0x5413), fill 80x25 or return ENOTTY (-25)
+    ; Check if fd is a console fd (0, 1, 2)
+    cmp rdi, 3
+    jae .l_ioctl_notty
+    ; TIOCGWINSZ = 0x5413: struct winsize { unsigned short ws_row, ws_col, ws_xpixel, ws_ypixel; }
+    cmp rsi, 0x5413
+    je .l_ioctl_winsz
+    ; TCGETS = 0x5401: struct termios (60 bytes)
+    cmp rsi, 0x5401
+    je .l_ioctl_tcgets
+    ; TCSETS/TCSETSW/TCSETSF (0x5402..0x5404): accept as no-op
+    cmp rsi, 0x5402
+    je .l_ioctl_ok
+    cmp rsi, 0x5403
+    je .l_ioctl_ok
+    cmp rsi, 0x5404
+    je .l_ioctl_ok
+.l_ioctl_notty:
     mov rax, -25                ; -ENOTTY
+    ret
+.l_ioctl_ok:
+    xor eax, eax
+    ret
+.l_ioctl_winsz:
+    test rdx, rdx
+    jz .l_ioctl_efault
+    push rdi
+    push rsi
+    mov rdi, rdx
+    mov rsi, 8
+    call sys_validate_user_ptr
+    pop rsi
+    pop rdi
+    jc .l_ioctl_efault
+    mov word [rdx + 0], 25      ; ws_row = 25
+    mov word [rdx + 2], 80      ; ws_col = 80
+    mov word [rdx + 4], 0       ; ws_xpixel = 0
+    mov word [rdx + 6], 0       ; ws_ypixel = 0
+    xor eax, eax
+    ret
+.l_ioctl_tcgets:
+    test rdx, rdx
+    jz .l_ioctl_efault
+    push rdi
+    push rsi
+    mov rdi, rdx
+    mov rsi, 60
+    call sys_validate_user_ptr
+    pop rsi
+    pop rdi
+    jc .l_ioctl_efault
+    push rdi
+    push rcx
+    mov rdi, rdx
+    mov ecx, 60 / 4
+    xor eax, eax
+    rep stosd
+    pop rcx
+    pop rdi
+    ; c_iflag = ICRNL (0x0100), c_oflag = OPOST|ONLCR (0x0005), c_cflag = CS8|CREAD (0x00bf), c_lflag = ISIG|ICANON|ECHO (0x000b)
+    mov dword [rdx + 0],  0x00000100   ; c_iflag
+    mov dword [rdx + 4],  0x00000005   ; c_oflag
+    mov dword [rdx + 8],  0x000000bf   ; c_cflag
+    mov dword [rdx + 12], 0x0000000b   ; c_lflag
+    xor eax, eax
+    ret
+.l_ioctl_efault:
+    mov rax, LINUX_EFAULT
+    ret
+
+.l_access:
+    ; RDI = pathname, RSI = mode
+    test rdi, rdi
+    jz .l_acc_efault
+    push rsi
+    mov rsi, 64
+    call sys_validate_user_ptr
+    pop rsi
+    jc .l_acc_efault
+    push rsi
+    mov rsi, rdi
+    call vfs_lookup_with_fallback
+    pop rsi
+    test eax, eax
+    jz .l_acc_enoent
+    xor eax, eax
+    ret
+.l_acc_enoent:
+    mov rax, LINUX_ENOENT
+    ret
+.l_acc_efault:
+    mov rax, LINUX_EFAULT
+    ret
+
+.l_faccessat:
+    ; RDI = dirfd, RSI = pathname, RDX = mode, R10 = flags
+    mov rdi, rsi                ; pathname
+    mov rsi, rdx                ; mode
+    jmp .l_access
+
+.l_madvise:
+    ; RDI = addr, RSI = length, RDX = advice
+    xor eax, eax                ; Successful stub
+    ret
+
+.l_sysinfo:
+    ; RDI = struct sysinfo pointer (112 bytes)
+    test rdi, rdi
+    jz .l_sysinfo_efault
+    push rdi
+    push rsi
+    mov rsi, 112
+    call sys_validate_user_ptr
+    pop rsi
+    pop rdi
+    jc .l_sysinfo_efault
+    ; Zero 112 bytes
+    push rdi
+    push rcx
+    push rax
+    mov rcx, 112 / 8
+    xor eax, eax
+    rep stosq
+    pop rax
+    pop rcx
+    pop rdi
+    ; sysinfo.uptime = timer_ticks / 1000
+    mov eax, [r15 + timer_ticks - kmain]
+    xor edx, edx
+    mov ecx, 1000
+    div ecx
+    mov [rdi + 0], rax          ; uptime (seconds)
+    ; totalram = 256MB, freeram = ~128MB
+    mov qword [rdi + 32], 256 * 1024 * 1024  ; totalram
+    mov qword [rdi + 40], 128 * 1024 * 1024  ; freeram
+    mov word  [rdi + 80], 4096               ; mem_unit = 4KB
+    mov word  [rdi + 78], 1                  ; procs = 1
+    xor eax, eax
+    ret
+.l_sysinfo_efault:
+    mov rax, LINUX_EFAULT
+    ret
+
+.l_getrusage:
+    ; RDI = int who (RUSAGE_SELF = 0, RUSAGE_CHILDREN = -1, RUSAGE_THREAD = 1)
+    ; RSI = struct rusage pointer (144 bytes: 18 * uint64_t)
+    test rsi, rsi
+    jz .l_rusage_efault
+    push rdi
+    push rsi
+    mov rdi, rsi
+    mov rsi, 144
+    call sys_validate_user_ptr
+    pop rsi
+    pop rdi
+    jc .l_rusage_efault
+    ; Zero out struct rusage (144 bytes)
+    push rdi
+    push rcx
+    push rax
+    mov rdi, rsi
+    mov ecx, 144 / 8
+    xor eax, eax
+    rep stosq
+    pop rax
+    pop rcx
+    pop rdi
+    xor eax, eax
+    ret
+.l_rusage_efault:
+    mov rax, LINUX_EFAULT
+    ret
+
+.l_times:
+    ; RDI = struct tms pointer (32 bytes: 4 * clock_t = 4 * uint64_t)
+    test rdi, rdi
+    jz .l_times_skip_buf
+    push rdi
+    push rsi
+    mov rsi, 32
+    call sys_validate_user_ptr
+    pop rsi
+    pop rdi
+    jc .l_times_efault
+    ; Zero 32 bytes
+    mov qword [rdi + 0],  0             ; tms_utime
+    mov qword [rdi + 8],  0             ; tms_stime
+    mov qword [rdi + 16], 0             ; tms_cutime
+    mov qword [rdi + 24], 0             ; tms_cstime
+.l_times_skip_buf:
+    ; Return clock ticks since boot (timer_ticks)
+    mov eax, [r15 + timer_ticks - kmain]
+    ret
+.l_times_efault:
+    mov rax, LINUX_EFAULT
+    ret
+
+.l_readlinkat:
+    ; RDI = dirfd, RSI = pathname, RDX = buf, R10 = bufsiz
+    mov rdi, rsi                ; pathname
+    mov rsi, rdx                ; buf
+    mov rdx, r10                ; bufsiz
+    ; Fallthrough to .l_readlink
+
+.l_readlink:
+    ; RDI = pathname, RSI = buf, RDX = bufsiz
+    test rdi, rdi
+    jz .l_rl_fault
+    test rsi, rsi
+    jz .l_rl_fault
+    test rdx, rdx
+    jz .l_rl_inval
+    push rdi
+    push rsi
+    push rdx
+    ; Validate pathname (64 bytes)
+    mov rsi, 64
+    call sys_validate_user_ptr
+    pop rdx
+    pop rsi
+    pop rdi
+    jc .l_rl_fault
+
+    push rdi
+    push rsi
+    push rdx
+    ; Validate user destination buffer
+    mov rdi, rsi
+    mov rsi, rdx
+    call sys_validate_user_ptr
+    pop rdx
+    pop rsi
+    pop rdi
+    jc .l_rl_fault
+
+    ; Check if path points to /proc/self/exe or /proc/<pid>/exe
+    cmp dword [rdi], '/pro'
+    jne .l_rl_noent
+
+    ; Target string: write current executable path to user buf
+    ; Form: "/<task_name>"
+    push rdi
+    push rsi
+    push rdx
+    push rcx
+    mov r8, rsi                         ; r8 = dest buf
+    mov r9, rdx                         ; r9 = bufsiz
+    mov byte [r8], '/'
+    inc r8
+    dec r9
+    ; Get current task TCB_NAME
+    mov eax, [r15 + sched_curr_task - kmain]
+    imul eax, TCB_SIZE
+    lea rsi, [r15 + task_table - kmain + rax + TCB_NAME]
+    xor ecx, ecx
+.l_rl_cp:
+    test r9, r9
+    jz .l_rl_cp_done
+    lodsb
+    test al, al
+    jz .l_rl_cp_done
+    mov [r8], al
+    inc r8
+    dec r9
+    inc ecx
+    jmp .l_rl_cp
+.l_rl_cp_done:
+    inc ecx                             ; +1 for leading '/'
+    mov rax, rcx                        ; return bytes copied (no trailing zero per POSIX readlink)
+    pop rcx
+    pop rdx
+    pop rsi
+    pop rdi
+    ret
+
+.l_rl_noent:
+    mov rax, LINUX_ENOENT
+    ret
+.l_rl_fault:
+    mov rax, LINUX_EFAULT
+    ret
+.l_rl_inval:
+    mov rax, LINUX_EINVAL
     ret
 
 .l_open:

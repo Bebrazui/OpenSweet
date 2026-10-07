@@ -14,6 +14,7 @@ FD_TYPE_UNUSED   = 0
 FD_TYPE_CONSOLE  = 1   ; stdin/stdout/stderr
 FD_TYPE_FILE     = 2   ; regular ext4 file
 FD_TYPE_PIPE     = 3   ; pipe
+FD_TYPE_DEV_NULL = 4   ; /dev/null, /dev/zero, /dev/urandom
 
 ; POSIX Open Flags
 O_RDONLY         = 0
@@ -212,7 +213,38 @@ vfs_open:
     mov byte [rdi], 0
     mov byte [rdx], 0
 .cp_p_done:
+    ; Check for virtual devices: /dev/null, /dev/zero, /dev/urandom
+    cmp dword [rsp], '/dev'
+    jne .not_dev
+    cmp word [rsp + 4], '/n'
+    je .is_dev_null
+    cmp word [rsp + 4], '/z'
+    je .is_dev_null
+    cmp word [rsp + 4], '/u'
+    je .is_dev_null
+    jmp .not_dev
 
+.is_dev_null:
+    mov byte [r14 + 0], FD_TYPE_DEV_NULL
+    mov byte [r14 + 1], r13b            ; flags
+    mov word [r14 + 2], 0               ; inode 0
+    mov dword [r14 + 4], 0              ; offset 0
+    mov dword [r14 + 8], 0              ; size 0
+    mov rax, [rsp + 56]                 ; allocated fd
+    add rsp, 64
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    popfq
+    ret
+
+.not_dev:
     ; Check if file exists in ext4
     lea rsi, [rsp]
     call vfs_lookup_with_fallback
@@ -668,6 +700,9 @@ vfs_read_fd:
     cmp byte [rbx + 0], FD_TYPE_PIPE
     je .rfd_pipe
 
+    cmp byte [rbx + 0], FD_TYPE_DEV_NULL
+    je .rfd_dev_null
+
     cmp byte [rbx + 0], FD_TYPE_FILE
     jne .rfd_err_badfd
 
@@ -761,6 +796,25 @@ vfs_read_fd:
     xor eax, eax
     jmp .rfd_done
 
+.rfd_dev_null:
+    ; rsi = user buffer, rdx = count
+    ; If pathname is /dev/null, return 0 (EOF immediately)
+    cmp byte [rbx + 12 + 5], 'n'
+    je .rfd_eof
+    ; For /dev/zero or /dev/urandom: fill with zeroes / pseudo-random bytes
+    push rdi
+    push rcx
+    push rax
+    mov rdi, rsi
+    mov rcx, rdx
+    xor eax, eax
+    rep stosb
+    pop rax
+    pop rcx
+    pop rdi
+    mov rax, rdx
+    jmp .rfd_done
+
 .rfd_err_fault:
     mov dword [r15 + vfs_last_err - kmain], 14      ; EFAULT
     jmp .rfd_err
@@ -831,6 +885,9 @@ vfs_write_fd:
 
     cmp byte [rbx + 0], FD_TYPE_PIPE
     je .wfd_pipe
+
+    cmp byte [rbx + 0], FD_TYPE_DEV_NULL
+    je .wfd_dev_null
 
     cmp byte [rbx + 0], FD_TYPE_FILE
     jne .wfd_err_badfd
@@ -906,6 +963,10 @@ vfs_write_fd:
     pop rsi
     mov [r8 + 0], r10d
     mov rax, rdx
+    jmp .wfd_done
+
+.wfd_dev_null:
+    mov rax, rdx                        ; successfully discarded all bytes
     jmp .wfd_done
 
 .wfd_zero:
