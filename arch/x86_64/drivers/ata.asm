@@ -113,6 +113,7 @@ ata_identify:
     pop rbx
     ret
 .faild:
+    xor eax, eax
     stc
     pop rbx
     ret

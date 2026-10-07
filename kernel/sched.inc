@@ -36,7 +36,8 @@ TCB_EXIT_CODE   = 0x54                ; uint32: Process exit status code
 TCB_WAIT_TID    = 0x58                ; int32: Target child TID being waited on (-1 if none)
 TCB_ABI_TYPE    = 0x5C                ; uint32: ABI type (0 = ABI_NATIVE, 1 = ABI_LINUX)
 TCB_FS_BASE     = 0x60                ; uint64: Thread-local storage base (FS_BASE for Linux / TLS)
-TCB_PAD         = 0x68                ; uint64: alignment padding
+TCB_TGID        = 0x68                ; uint32: Thread group ID (PID of leader thread)
+TCB_IS_THREAD   = 0x6C                ; uint32: 1 if secondary thread, 0 if leader
 TCB_FXSAVE      = 0x70                ; 512 bytes: 16-byte aligned FXSAVE/FXRSTOR area
 ; Linux signal state (appended after the FXSAVE area)
 TCB_SIG_PENDING = 0x270               ; uint64: pending signal bitmap (bit = sig-1)
@@ -49,8 +50,17 @@ TCB_SIG_ACT     = 0x290               ; 64 entries * 32 bytes, per signal (sig-1
                                       ;   +8  restorer (SA_RESTORER trampoline address)
                                       ;   +16 sa_flags
                                       ;   +24 sa_mask  (kernel sigset, 8 bytes)
-TCB_FUTEX_ADDR  = 0xA90               ; uint64: futex wait address (0 = not waiting)
-TCB_SIZE        = 2720                ; 0xA98 = 0xA90 + 8 (16-byte aligned)
+TCB_FUTEX_ADDR       = 0xA90          ; uint64: futex wait address (0 = not waiting)
+TCB_CLEAR_CHILD_TID  = 0xA98          ; uint64: user pointer to clear on thread exit (0 = none)
+TCB_UID              = 0xAA0          ; uint32: real UID (0 = root)
+TCB_GID              = 0xAA4          ; uint32: real GID (0 = root)
+TCB_EUID             = 0xAA8          ; uint32: effective UID (0 = root)
+TCB_EGID             = 0xAAC          ; uint32: effective GID (0 = root)
+TCB_SUID             = 0xAB0          ; uint32: saved set-UID (0 = root)
+TCB_SGID             = 0xAB4          ; uint32: saved set-GID (0 = root)
+TCB_UMASK            = 0xAB8          ; uint32: file creation mask (default 022 = 0x12)
+TCB_PAD_CRED         = 0xABC          ; uint32: alignment padding
+TCB_SIZE             = 2752           ; 0xAC0 (16-byte aligned)
 
 TASK_STACK_SIZE = 8192                ; 8 KB stack per task
 
@@ -531,6 +541,17 @@ task_finalize_user:
     mov dword [r15 + fg_linux_slot - kmain], ebx  ; Linux image: Ctrl+C target
 @@:
     mov qword [rdi + TCB_FS_BASE], 0
+    lea eax, [ebx + 1]
+    mov [rdi + TCB_TGID], eax
+    mov dword [rdi + TCB_IS_THREAD], 0
+    mov qword [rdi + TCB_CLEAR_CHILD_TID], 0
+    mov dword [rdi + TCB_UID], 0
+    mov dword [rdi + TCB_GID], 0
+    mov dword [rdi + TCB_EUID], 0
+    mov dword [rdi + TCB_EGID], 0
+    mov dword [rdi + TCB_SUID], 0
+    mov dword [rdi + TCB_SGID], 0
+    mov dword [rdi + TCB_UMASK], 0x12  ; 022 octal (default umask)
     mov [rdi + TCB_USER_RSP], r11
 
     ; Signal state: every (re-)loaded image starts with SIG_DFL handlers and
@@ -750,6 +771,45 @@ task_yield:
     ret
 
 ; ==============================================================================
+; futex_wake_addr: Wake up to EDX tasks waiting on futex address in R12
+; In: R12 = futex address (user pointer)
+;     EDX = max tasks to wake
+; Out: EAX = number of tasks woken
+; ==============================================================================
+futex_wake_addr:
+    push rbx
+    push rdi
+    push r13
+    push rdx
+    xor r13d, r13d              ; r13d = woken count
+    xor ebx, ebx                ; ebx = slot
+.fwa_loop:
+    cmp ebx, MAX_TASKS
+    jae .fwa_done
+    imul eax, ebx, TCB_SIZE
+    lea rdi, [r15 + task_table - kmain + rax]
+    cmp dword [rdi + TCB_STATE], TASK_SLEEPING
+    jne .fwa_next
+    mov rax, [rdi + TCB_FUTEX_ADDR]
+    cmp rax, r12
+    jne .fwa_next
+    mov qword [rdi + TCB_FUTEX_ADDR], 0
+    mov dword [rdi + TCB_STATE], TASK_READY
+    inc r13d
+    cmp r13d, edx
+    jae .fwa_done
+.fwa_next:
+    inc ebx
+    jmp .fwa_loop
+.fwa_done:
+    mov eax, r13d
+    pop rdx
+    pop r13
+    pop rdi
+    pop rbx
+    ret
+
+; ==============================================================================
 ; task_exit: Terminate current task
 ; ==============================================================================
 task_exit:
@@ -757,11 +817,32 @@ task_exit:
     imul eax, TCB_SIZE
     lea rbx, [r15 + task_table - kmain + rax]
     mov [rbx + TCB_EXIT_CODE], edi     ; Store user exit status
+
+    ; If TCB_CLEAR_CHILD_TID != 0, write 0 to *clear_child_tid and futex_wake 1 waiter
+    mov rdx, [rbx + TCB_CLEAR_CHILD_TID]
+    test rdx, rdx
+    jz .te_no_clear_tid
+    mov rdi, rdx
+    mov esi, 4
+    call sys_validate_user_ptr
+    jc .te_no_clear_tid
+    mov dword [rdx], 0
+    mov r12, rdx
+    mov edx, 1
+    call futex_wake_addr
+    mov qword [rbx + TCB_CLEAR_CHILD_TID], 0
+.te_no_clear_tid:
+
     mov dword [rbx + TCB_STATE], TASK_DEAD
     dec dword [r15 + sched_task_cnt - kmain]
 
-    ; Close all file descriptors for exiting task
+    ; Close all file descriptors for exiting task (skip if secondary thread)
+    cmp dword [rbx + TCB_IS_THREAD], 1
+    je .te_skip_fds
+    mov edi, [rbx + TCB_TGID]
+    call vfs_release_tgid_locks
     call vfs_cleanup_task_fds
+.te_skip_fds:
 
     int 0x31
 .halt:

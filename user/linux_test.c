@@ -42,6 +42,17 @@ static inline long long sys4(long long num, long long a1, long long a2, long lon
     return ret;
 }
 
+static inline long long sys2(long long num, long long a1, long long a2) {
+    long long ret;
+    __asm__ volatile (
+        "syscall"
+        : "=a"(ret)
+        : "a"(num), "D"(a1), "S"(a2)
+        : "rcx", "r11", "memory"
+    );
+    return ret;
+}
+
 static inline long long sys1(long long num, long long a1) {
     long long ret;
     __asm__ volatile (
@@ -433,7 +444,67 @@ void os_main(int argc, char **argv) {
     print(" fired=");
     print_dec(g_alrm_seen);                            /* expect 1 */
     print("\n");
-    sys1(37, 0);                                       /* cancel (nothing left) */
+    /* --- symlink, readlink, link, rename, chmod tests --- */
+    {
+        print("[Linux ABI] Testing symlink/readlink/link/rename/chmod...\n");
+        /* 1. symlink("hello.txt", "slink.txt") */
+        long long slr = sys2(88, (long long)"hello.txt", (long long)"slink.txt");
+        print("[Linux ABI] symlink rc=");
+        print_dec(slr);
+        print("\n");
+
+        /* 2. readlink("slink.txt", buf, 64) */
+        char rlbuf[64];
+        for (int i = 0; i < 64; i++) rlbuf[i] = 0;
+        long long rlr = sys3(89, (long long)"slink.txt", (long long)rlbuf, 64);
+        print("[Linux ABI] readlink rc=");
+        print_dec(rlr);
+        print(" target=");
+        print(rlbuf);
+        print("\n");
+
+        /* 3. link("hello.txt", "hlink.txt") */
+        long long lkr = sys2(86, (long long)"hello.txt", (long long)"hlink.txt");
+        print("[Linux ABI] link rc=");
+        print_dec(lkr);
+        print("\n");
+
+        /* 4. rename("hlink.txt", "renamed.txt") */
+        long long rnr = sys2(82, (long long)"hlink.txt", (long long)"renamed.txt");
+        print("[Linux ABI] rename rc=");
+        print_dec(rnr);
+        print("\n");
+
+        /* 5. chmod("renamed.txt", 0644) */
+        long long cmr = sys2(90, (long long)"renamed.txt", 0644);
+        print("[Linux ABI] chmod rc=");
+        print_dec(cmr);
+        print("\n");
+
+        /* 6. mkdirat / rmdir */
+        long long mkr = sys3(258, -100, (long long)"testdir", 0755);
+        print("[Linux ABI] mkdirat rc=");
+        print_dec(mkr);
+        print("\n");
+
+        long long rmd = sys1(84, (long long)"testdir");
+        print("[Linux ABI] rmdir rc=");
+        print_dec(rmd);
+        print("\n");
+
+        /* 7. rename overwrite existing file */
+        /* slink.txt -> hello.txt. Now rename slink.txt over renamed.txt */
+        long long rnovr = sys2(82, (long long)"slink.txt", (long long)"renamed.txt");
+        print("[Linux ABI] rename_overwrite rc=");
+        print_dec(rnovr);
+        print("\n");
+
+        /* 8. unlink / unlinkat */
+        long long unl = sys1(87, (long long)"renamed.txt");
+        print("[Linux ABI] unlink rc=");
+        print_dec(unl);
+        print("\n");
+    }
 
     sys1(60, 0);
 }

@@ -78,6 +78,31 @@ LINUX_SYS_GETRUSAGE   = 98
 LINUX_SYS_TIMES       = 100
 LINUX_SYS_READLINK    = 89
 LINUX_SYS_READLINKAT  = 267
+LINUX_SYS_FLOCK       = 73
+LINUX_SYS_FSYNC       = 74
+LINUX_SYS_FDATASYNC   = 75
+LINUX_SYS_TRUNCATE    = 76
+LINUX_SYS_FTRUNCATE   = 77
+LINUX_SYS_CHMOD       = 90
+LINUX_SYS_FCHMOD      = 91
+LINUX_SYS_CHOWN       = 92
+LINUX_SYS_FCHOWN      = 93
+LINUX_SYS_UMASK       = 95
+LINUX_SYS_SETUID      = 105
+LINUX_SYS_SETGID      = 106
+LINUX_SYS_SETREUID    = 113
+LINUX_SYS_SETREGID    = 114
+LINUX_SYS_GETGROUPS   = 115
+LINUX_SYS_SETGROUPS   = 116
+LINUX_SYS_SETRESUID   = 117
+LINUX_SYS_GETRESUID   = 118
+LINUX_SYS_SETRESGID   = 119
+LINUX_SYS_GETRESGID   = 120
+LINUX_SYS_CHROOT      = 161
+LINUX_SYS_FCHMODAT    = 268
+LINUX_SYS_FCHOWNAT    = 260
+LINUX_SYS_UTIMENSAT   = 280
+LINUX_SYS_STATX       = 332
 
 ; Signal numbers (Linux x86_64 numbering)
 LINUX_SIGINT   = 2
@@ -104,19 +129,28 @@ LINUX_SIGWINCH = 28
 SA_RESTORER    = 0x04000000           ; sa_restorer holds the sigreturn trampoline
 SA_NODEFER     = 0x40000000           ; do not block the signal during its handler
 
+LINUX_SYS_RENAME      = 82
+LINUX_SYS_LINK        = 86
+LINUX_SYS_SYMLINK     = 88
+LINUX_SYS_LINKAT      = 265
+LINUX_SYS_SYMLINKAT   = 266
+LINUX_SYS_RENAMEAT    = 264
+LINUX_SYS_RENAMEAT2   = 316
+
 ; Linux Error Codes (negative return values in RAX)
 LINUX_EPERM   = -1
-LINUX_EAGAIN  = -11
-LINUX_ENOEXEC = -8
 LINUX_ENOENT  = -2
 LINUX_ESRCH   = -3
 LINUX_EINTR   = -4
 LINUX_EIO     = -5
+LINUX_ENOEXEC = -8
 LINUX_EBADF   = -9
+LINUX_EAGAIN  = -11
 LINUX_ENOMEM  = -12
 LINUX_EACCES  = -13
 LINUX_EFAULT  = -14
 LINUX_EEXIST  = -17
+LINUX_EXDEV   = -18
 LINUX_ENODEV  = -19
 LINUX_ENOTDIR = -20
 LINUX_EISDIR  = -21
@@ -124,8 +158,13 @@ LINUX_EINVAL  = -22
 LINUX_ENFILE  = -23
 LINUX_EMFILE  = -24
 LINUX_ENOTTY = -25
-LINUX_EPIPE  = -32
+LINUX_EROFS   = -30
+LINUX_EMLINK  = -31
+LINUX_EPIPE   = -32
+LINUX_ENOLCK  = -37
 LINUX_ENOSYS  = -38
+LINUX_ENOTEMPTY = -39
+LINUX_ELOOP   = -40
 
 ; ==============================================================================
 ; Signal machinery (Linux ABI): queueing, delivery at syscall return, probing.
@@ -744,6 +783,38 @@ sig_on_exception:
     pop rbx
     pop rbp
     ret
+; ==============================================================================
+; vfs_release_tgid_locks: Release all advisory inode locks held by a TGID
+; In: EDI = tgid
+; ==============================================================================
+vfs_release_tgid_locks:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    lea rsi, [r15 + inode_lock_table - kmain]
+    xor ecx, ecx
+.vrtl_loop:
+    cmp ecx, MAX_INODE_LOCKS
+    jae .vrtl_done
+    mov edx, ecx
+    shl edx, 4                       ; edx = ecx * 16
+    cmp dword [rsi + rdx + 0], 0
+    jz .vrtl_next
+    cmp dword [rsi + rdx + 4], edi
+    jne .vrtl_next
+    mov dword [rsi + rdx + 0], 0
+    mov dword [rsi + rdx + 4], 0
+    mov dword [rsi + rdx + 8], 0
+.vrtl_next:
+    inc ecx
+    jmp .vrtl_loop
+.vrtl_done:
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
 
 ; ==============================================================================
 ; linux_syscall_dispatch: Dispatch Linux x86_64 syscall
@@ -794,7 +865,7 @@ linux_syscall_dispatch:
     cmp eax, LINUX_SYS_EXIT
     je .l_exit
     cmp eax, LINUX_SYS_EXIT_GROUP
-    je .l_exit
+    je .l_exit_group
     cmp eax, LINUX_SYS_UNAME
     je .l_uname
     cmp eax, LINUX_SYS_GETCWD
@@ -811,20 +882,46 @@ linux_syscall_dispatch:
     je .l_arch_prctl
     cmp eax, LINUX_SYS_SET_TID_ADDR
     je .l_set_tid_address
+    cmp eax, LINUX_SYS_GETTID
+    je .l_gettid
     cmp eax, LINUX_SYS_GETUID
-    je .l_zero_id
+    je .l_getuid
     cmp eax, LINUX_SYS_GETGID
-    je .l_zero_id
+    je .l_getgid
     cmp eax, LINUX_SYS_GETEUID
-    je .l_zero_id
+    je .l_geteuid
     cmp eax, LINUX_SYS_GETEGID
-    je .l_zero_id
+    je .l_getegid
+    cmp eax, LINUX_SYS_SETUID
+    je .l_setuid
+    cmp eax, LINUX_SYS_SETGID
+    je .l_setgid
+    cmp eax, LINUX_SYS_SETREUID
+    je .l_setreuid
+    cmp eax, LINUX_SYS_SETREGID
+    je .l_setregid
+    cmp eax, LINUX_SYS_SETRESUID
+    je .l_setresuid
+    cmp eax, LINUX_SYS_GETRESUID
+    je .l_getresuid
+    cmp eax, LINUX_SYS_SETRESGID
+    je .l_setresGID
+    cmp eax, LINUX_SYS_GETRESGID
+    je .l_getresGID
+    cmp eax, LINUX_SYS_GETGROUPS
+    je .l_getgroups
+    cmp eax, LINUX_SYS_SETGROUPS
+    je .l_setgroups
+    cmp eax, LINUX_SYS_UMASK
+    je .l_umask
+    cmp eax, LINUX_SYS_CHROOT
+    je .l_chroot
     cmp eax, LINUX_SYS_FORK
     je .l_fork
     cmp eax, LINUX_SYS_VFORK
     je .l_fork
     cmp eax, LINUX_SYS_CLONE
-    je .l_fork
+    je .l_clone
     cmp eax, LINUX_SYS_WAIT4
     je .l_wait4
     cmp eax, LINUX_SYS_GETPPID
@@ -859,6 +956,8 @@ linux_syscall_dispatch:
     je .l_dup
     cmp eax, LINUX_SYS_FCNTL
     je .l_fcntl
+    cmp eax, LINUX_SYS_FLOCK
+    je .l_flock
     cmp eax, LINUX_SYS_NEWFSTATAT
     je .l_newfstatat
     cmp eax, LINUX_SYS_OPENAT
@@ -897,6 +996,48 @@ linux_syscall_dispatch:
     je .l_readlink
     cmp eax, LINUX_SYS_READLINKAT
     je .l_readlinkat
+    cmp eax, LINUX_SYS_FSYNC
+    je .l_fsync
+    cmp eax, LINUX_SYS_FDATASYNC
+    je .l_fsync
+    cmp eax, LINUX_SYS_TRUNCATE
+    je .l_truncate
+    cmp eax, LINUX_SYS_FTRUNCATE
+    je .l_ftruncate
+    cmp eax, LINUX_SYS_CHMOD
+    je .l_chmod
+    cmp eax, LINUX_SYS_FCHMOD
+    je .l_fchmod
+    cmp eax, LINUX_SYS_FCHMODAT
+    je .l_fchmodat
+    cmp eax, LINUX_SYS_CHOWN
+    je .l_chown
+    cmp eax, LINUX_SYS_FCHOWN
+    je .l_fchown
+    cmp eax, LINUX_SYS_FCHOWNAT
+    je .l_fchownat
+    cmp eax, LINUX_SYS_UTIMENSAT
+    je .l_utimensat
+    cmp eax, LINUX_SYS_STATX
+    je .l_statx
+    cmp eax, LINUX_SYS_RENAME
+    je .l_rename
+    cmp eax, LINUX_SYS_RENAMEAT
+    je .l_renameat
+    cmp eax, LINUX_SYS_RENAMEAT2
+    je .l_renameat2
+    cmp eax, LINUX_SYS_LINK
+    je .l_link
+    cmp eax, LINUX_SYS_LINKAT
+    je .l_linkat
+    cmp eax, LINUX_SYS_SYMLINK
+    je .l_symlink
+    cmp eax, LINUX_SYS_SYMLINKAT
+    je .l_symlinkat
+    cmp eax, LINUX_SYS_MKDIRAT
+    je .l_mkdirat
+    cmp eax, LINUX_SYS_UNLINKAT
+    je .l_unlinkat
 
     ; Unhandled Linux syscall: log to serial and return -ENOSYS
     push rax
@@ -924,7 +1065,80 @@ linux_syscall_dispatch:
 
 .l_write:
     ; RDI = fd, RSI = buf, RDX = count
+    push rdi
+    push rsi
+    push rdx
     call vfs_write_fd
+    pop rdx
+    pop rsi
+    pop rdi
+    push rax
+    push rsi
+    push rdi
+    push rdx
+    lea rsi, [r15 + str_l_write_dbg - kmain]
+    call puts
+    mov rax, [rsp + 8]                  ; saved rdi (fd)
+    call putdec64
+    mov al, ','
+    call putc
+    mov al, ' '
+    call putc
+    mov rax, [rsp + 0]                  ; saved rdx (count)
+    call putdec64
+    lea rsi, [r15 + str_l_write_dbg2 - kmain]
+    call puts
+    mov rax, [rsp + 24]                 ; saved rax (result)
+    call putdec64
+    mov al, ' '
+    call putc
+    mov al, '['
+    call putc
+    push rsi
+    push rcx
+    mov rcx, [rsp + 16]                 ; count (saved rdx)
+    cmp rcx, 40
+    jbe @f
+    mov rcx, 40
+@@:
+    mov rsi, [rsp + 32]                 ; buf (saved rsi)
+.dbg_str_loop:
+    test rcx, rcx
+    jz .dbg_str_done
+    mov al, ' '
+    call putc
+    movzx eax, byte [rsi]
+    push rax
+    shr al, 4
+    and al, 0x0F
+    add al, '0'
+    cmp al, '9'
+    jbe @f
+    add al, 'A' - '0' - 10
+@@:
+    call putc
+    pop rax
+    and al, 0x0F
+    add al, '0'
+    cmp al, '9'
+    jbe @f
+    add al, 'A' - '0' - 10
+@@:
+    call putc
+    inc rsi
+    dec rcx
+    jmp .dbg_str_loop
+.dbg_str_done:
+    pop rcx
+    pop rsi
+    mov al, ']'
+    call putc
+    mov al, 10
+    call putc
+    pop rdx
+    pop rdi
+    pop rsi
+    pop rax
     cmp rax, -1
     jne .l_write_ret
     mov eax, [r15 + vfs_last_err - kmain]   ; positive errno from vfs
@@ -1316,7 +1530,7 @@ linux_syscall_dispatch:
 
     ; Check if path points to /proc/self/exe or /proc/<pid>/exe
     cmp dword [rdi], '/pro'
-    jne .l_rl_noent
+    jne .l_rl_disk
 
     ; Target string: write current executable path to user buf
     ; Form: "/<task_name>"
@@ -1352,6 +1566,21 @@ linux_syscall_dispatch:
     pop rdx
     pop rsi
     pop rdi
+    ret
+
+.l_rl_disk:
+    ; Lookup pathname in ext4 (without following symlink) and read symlink from inode
+    push rsi                            ; buf
+    push rdx                            ; bufsiz
+    mov rsi, rdi                        ; rsi = pathname
+    call ext4_lookup_nofollow
+    pop rsi                             ; rsi = bufsiz
+    pop rdi                             ; rdi = buf
+    test eax, eax
+    jz .l_rl_noent
+    call ext4_readlink_inode
+    cmp rax, -1
+    je .l_rl_inval                      ; not a symlink
     ret
 
 .l_rl_noent:
@@ -1411,8 +1640,48 @@ linux_syscall_dispatch:
 
 .l_getpid:
     mov eax, [r15 + sched_curr_task - kmain]
-    inc eax                     ; 1-based PID
+    imul eax, TCB_SIZE
+    lea rbx, [r15 + task_table - kmain + rax]
+    mov eax, [rbx + TCB_TGID]
+    test eax, eax
+    jnz @f
+    mov eax, [r15 + sched_curr_task - kmain]
+    inc eax
+@@:
     ret
+
+.l_gettid:
+    mov eax, [r15 + sched_curr_task - kmain]
+    inc eax                     ; 1-based TID
+    ret
+
+.l_exit_group:
+    ; RDI = exit code
+    mov eax, [r15 + sched_curr_task - kmain]
+    imul eax, TCB_SIZE
+    lea rbx, [r15 + task_table - kmain + rax]
+    mov edx, [rbx + TCB_TGID]
+    test edx, edx
+    jz .l_exit
+    xor ecx, ecx
+.exit_grp_loop:
+    cmp ecx, MAX_TASKS
+    jae .l_exit
+    cmp ecx, [r15 + sched_curr_task - kmain]
+    je .exit_grp_next
+    imul eax, ecx, TCB_SIZE
+    lea rsi, [r15 + task_table - kmain + rax]
+    cmp dword [rsi + TCB_STATE], TASK_UNUSED
+    je .exit_grp_next
+    cmp dword [rsi + TCB_STATE], TASK_DEAD
+    je .exit_grp_next
+    cmp [rsi + TCB_TGID], edx
+    jne .exit_grp_next
+    mov dword [rsi + TCB_STATE], TASK_DEAD
+    dec dword [r15 + sched_task_cnt - kmain]
+.exit_grp_next:
+    inc ecx
+    jmp .exit_grp_loop
 
 .l_exit:
     ; RDI = exit code
@@ -1446,6 +1715,244 @@ linux_syscall_dispatch:
 ;   +64 r14, +72 r13, +80 r12, +88 rbx, +96 rbp, +104 r11 (=RFLAGS),
 ;   +112 user RIP (rcx), +120 user RSP
 ; ------------------------------------------------------------------------------
+; .l_clone: Linux clone(flags, child_stack, parent_tid, child_tid, tls)
+;   flags       = RDI (also [rbx + 32])
+;   child_stack = RSI (also [rbx + 40])
+;   parent_tid  = RDX (also [rbx + 48])
+;   child_tid   = R10 (also [rbx + 8])
+;   tls         = R8  (also [rbx + 24])
+; ------------------------------------------------------------------------------
+.l_clone:
+    test edi, 0x00000100              ; CLONE_VM?
+    jz .l_fork                        ; non-CLONE_VM -> fork semantics
+
+    lea rbx, [rsp]                    ; rbx = stable syscall frame base
+
+    ; 1. Find a free slot in task_table (1..MAX_TASKS-1)
+    mov ecx, 1
+.clone_find_slot:
+    cmp ecx, MAX_TASKS
+    jae .clone_try_dead
+    imul eax, ecx, TCB_SIZE
+    lea rdi, [r15 + task_table - kmain + rax]
+    cmp dword [rdi + TCB_STATE], TASK_UNUSED
+    je .clone_slot_found
+    inc ecx
+    jmp .clone_find_slot
+
+.clone_try_dead:
+    mov ecx, 1
+.clone_find_dead:
+    cmp ecx, MAX_TASKS
+    jae .l_clone_eagain
+    imul eax, ecx, TCB_SIZE
+    lea rdi, [r15 + task_table - kmain + rax]
+    cmp dword [rdi + TCB_STATE], TASK_DEAD
+    je .clone_slot_found
+    inc ecx
+    jmp .clone_find_dead
+
+.l_clone_eagain:
+    mov rax, LINUX_EAGAIN
+    ret
+
+.clone_slot_found:
+    ; ecx = child slot (1..MAX_TASKS-1)
+    ; rdi = child TCB pointer
+    mov r12d, ecx                     ; r12d = child slot
+    mov r13, rdi                      ; r13  = child TCB
+
+    mov eax, [r15 + sched_curr_task - kmain]
+    imul eax, TCB_SIZE
+    lea rbp, [r15 + task_table - kmain + rax]   ; rbp = parent TCB
+
+    ; 2. Initialize child TCB fields
+    mov [r13 + TCB_ID], r12d
+    mov dword [r13 + TCB_SLEEP], 0
+    mov dword [r13 + TCB_SLICE], SCHED_QUANTUM
+    mov qword [r13 + TCB_TICKS], 0
+    mov dword [r13 + TCB_IS_USER], 1
+    mov dword [r13 + TCB_EXIT_CODE], 0
+    mov dword [r13 + TCB_WAIT_TID], -1
+    mov dword [r13 + TCB_ABI_TYPE], 1
+    mov dword [r13 + TCB_IS_THREAD], 1
+
+    ; Link parent
+    mov eax, [r15 + sched_curr_task - kmain]
+    mov [r13 + TCB_PARENT_ID], eax
+
+    ; Shared virtual address space: same CR3
+    mov rax, [rbp + TCB_CR3]
+    mov [r13 + TCB_CR3], rax
+
+    ; Shared heap brk
+    mov eax, [rbp + TCB_HEAP_BRK]
+    mov [r13 + TCB_HEAP_BRK], eax
+
+    ; Thread Group ID (TGID)
+    mov eax, [rbp + TCB_TGID]
+    test eax, eax
+    jnz @f
+    mov eax, [r15 + sched_curr_task - kmain]
+    inc eax
+    mov [rbp + TCB_TGID], eax
+@@:
+    mov [r13 + TCB_TGID], eax
+
+    ; Task name
+    mov rax, [rbp + TCB_NAME]
+    mov [r13 + TCB_NAME], rax
+
+    ; Copy FXSAVE
+    lea rsi, [rbp + TCB_FXSAVE]
+    lea rdi, [r13 + TCB_FXSAVE]
+    mov ecx, 512 / 8
+    rep movsq
+
+    ; Inherit signal handlers and mask
+    lea rsi, [rbp + TCB_SIG_PENDING]
+    lea rdi, [r13 + TCB_SIG_PENDING]
+    mov ecx, (TCB_SIZE - TCB_SIG_PENDING) / 8
+    rep movsq
+    mov dword [r13 + TCB_ALARM_MS], 0
+    mov qword [r13 + TCB_FUTEX_ADDR], 0
+
+    ; 3. TLS setup (CLONE_SETTLS = 0x00080000)
+    ; In syscall frame: [rbx + 32] = flags, [rbx + 24] = tls (r8)
+    test dword [rbx + 32], 0x00080000
+    jz .clone_no_settls
+    mov rax, [rbx + 24]               ; tls arg
+    mov [r13 + TCB_FS_BASE], rax
+    jmp .clone_tls_done
+.clone_no_settls:
+    mov rax, [rbp + TCB_FS_BASE]
+    mov [r13 + TCB_FS_BASE], rax
+.clone_tls_done:
+
+    ; 4. CLONE_CHILD_CLEARTID (0x00200000)
+    ; In syscall frame: [rbx + 8] = child_tid (r10)
+    test dword [rbx + 32], 0x00200000
+    jz .clone_no_cleartid
+    mov rax, [rbx + 8]
+    mov [r13 + TCB_CLEAR_CHILD_TID], rax
+    jmp .clone_cleartid_done
+.clone_no_cleartid:
+    mov qword [r13 + TCB_CLEAR_CHILD_TID], 0
+.clone_cleartid_done:
+
+    ; 5. CLONE_PARENT_SETTID (0x00100000)
+    test dword [rbx + 32], 0x00100000
+    jz .clone_no_parent_settid
+    mov rdi, [rbx + 48]               ; parent_tid ptr (rdx)
+    test rdi, rdi
+    jz .clone_no_parent_settid
+    mov esi, 4
+    call sys_validate_user_ptr
+    jc .clone_no_parent_settid
+    lea eax, [r12 + 1]                ; child TID
+    mov [rdi], eax
+.clone_no_parent_settid:
+
+    ; 6. CLONE_CHILD_SETTID (0x01000000)
+    test dword [rbx + 32], 0x01000000
+    jz .clone_no_child_settid
+    mov rdi, [rbx + 8]                ; child_tid ptr (r10)
+    test rdi, rdi
+    jz .clone_no_child_settid
+    mov esi, 4
+    call sys_validate_user_ptr
+    jc .clone_no_child_settid
+    lea eax, [r12 + 1]                ; child TID
+    mov [rdi], eax
+.clone_no_child_settid:
+
+    ; 7. User stack for child
+    ; [rbx + 40] = child_stack (rsi)
+    mov rax, [rbx + 40]
+    test rax, rax
+    jnz @f
+    mov rax, [rbx + 120]              ; fallback to parent user RSP
+@@:
+    mov [r13 + TCB_USER_RSP], rax
+
+    ; 8. Child kernel stack and iretq / GPR snapshot
+    mov eax, r12d
+    imul eax, TASK_STACK_SIZE
+    lea rax, [r15 + task_stacks - kmain + rax]
+    mov [r13 + TCB_STACK_BASE], rax
+    add rax, TASK_STACK_SIZE
+    mov [r13 + TCB_STACK_TOP], rax
+    mov rdi, rax
+
+    ; iretq frame (high -> low): SS, user RSP, RFLAGS, CS, RIP
+    sub rdi, 8
+    mov qword [rdi], 0x23             ; USER_DATA_SEL | 3
+    sub rdi, 8
+    mov rsi, [r13 + TCB_USER_RSP]
+    mov [rdi], rsi                    ; user RSP
+    sub rdi, 8
+    mov rsi, [rbx + 104]
+    mov [rdi], rsi                    ; RFLAGS
+    sub rdi, 8
+    mov qword [rdi], 0x2B             ; USER_CODE_SEL | 3
+    sub rdi, 8
+    mov rsi, [rbx + 112]
+    mov [rdi], rsi                    ; user RIP
+
+    ; GPR image in sched_restore pop order reversed (rax highest .. r15 lowest)
+    sub rdi, 8
+    xor eax, eax
+    mov [rdi], rax                    ; rax = 0 (child thread returns 0 from clone)
+    sub rdi, 8
+    mov rsi, [rbx + 88]
+    mov [rdi], rsi                    ; rbx
+    sub rdi, 8
+    mov rsi, [rbx + 112]
+    mov [rdi], rsi                    ; rcx
+    sub rdi, 8
+    mov rsi, [rbx + 48]
+    mov [rdi], rsi                    ; rdx
+    sub rdi, 8
+    mov rsi, [rbx + 40]
+    mov [rdi], rsi                    ; rsi
+    sub rdi, 8
+    mov rsi, [rbx + 32]
+    mov [rdi], rsi                    ; rdi
+    sub rdi, 8
+    mov rsi, [rbx + 96]
+    mov [rdi], rsi                    ; rbp
+    sub rdi, 8
+    mov rsi, [rbx + 24]
+    mov [rdi], rsi                    ; r8
+    sub rdi, 8
+    mov rsi, [rbx + 16]
+    mov [rdi], rsi                    ; r9
+    sub rdi, 8
+    mov rsi, [rbx + 8]
+    mov [rdi], rsi                    ; r10
+    sub rdi, 8
+    mov rsi, [rbx + 104]
+    mov [rdi], rsi                    ; r11
+    sub rdi, 8
+    mov rsi, [rbx + 80]
+    mov [rdi], rsi                    ; r12
+    sub rdi, 8
+    mov rsi, [rbx + 72]
+    mov [rdi], rsi                    ; r13
+    sub rdi, 8
+    mov rsi, [rbx + 64]
+    mov [rdi], rsi                    ; r14
+    sub rdi, 8
+    mov rsi, [rbx + 56]
+    mov [rdi], rsi                    ; r15
+    mov [r13 + TCB_RSP], rdi
+
+    ; 9. Publish child thread: READY + increment task count
+    inc dword [r15 + sched_task_cnt - kmain]
+    mov dword [r13 + TCB_STATE], TASK_READY
+    lea eax, [r12 + 1]                ; parent returns child TID (slot + 1)
+    ret
+
 .l_fork:
     lea rbx, [rsp]                    ; rbx = stable frame base (keep!)
 
@@ -1533,6 +2040,10 @@ linux_syscall_dispatch:
     mov [r13 + TCB_ABI_TYPE], eax
     mov rax, [rbp + TCB_FS_BASE]      ; musl TLS base (same memory image)
     mov [r13 + TCB_FS_BASE], rax
+    lea eax, [r12 + 1]
+    mov [r13 + TCB_TGID], eax         ; child process gets its own PID as TGID
+    mov dword [r13 + TCB_IS_THREAD], 0
+    mov qword [r13 + TCB_CLEAR_CHILD_TID], 0
     mov rax, [rbx + 120]
     mov [r13 + TCB_USER_RSP], rax     ; parent user RSP
     mov rax, [rbp + TCB_NAME]
@@ -1920,8 +2431,16 @@ linux_syscall_dispatch:
     and r13d, 0x7F              ; mask FUTEX_PRIVATE_FLAG / CLOCK_REALTIME
     cmp r13d, 0                 ; FUTEX_WAIT
     je .l_futex_wait
+    cmp r13d, 9                 ; FUTEX_WAIT_BITSET
+    je .l_futex_wait
     cmp r13d, 1                 ; FUTEX_WAKE
     je .l_futex_wake
+    cmp r13d, 10                ; FUTEX_WAKE_BITSET
+    je .l_futex_wake
+    cmp r13d, 3                 ; FUTEX_REQUEUE
+    je .l_futex_requeue
+    cmp r13d, 4                 ; FUTEX_CMP_REQUEUE
+    je .l_futex_cmp_requeue
     mov rax, LINUX_EINVAL
     jmp .l_futex_done
 
@@ -1956,28 +2475,73 @@ linux_syscall_dispatch:
     mov esi, 4
     call sys_validate_user_ptr
     jc .l_futex_efault
-    xor r13d, r13d              ; r13 = woken count
-    xor ebx, ebx                ; ebx = slot
-.l_futex_wake_loop:
+    call futex_wake_addr
+    jmp .l_futex_done
+
+.l_futex_cmp_requeue:
+    ; R9 = val3 (expected value at uaddr1)
+    mov rdi, r12
+    mov esi, 4
+    call sys_validate_user_ptr
+    jc .l_futex_efault
+    mov eax, [r12]
+    cmp eax, r9d
+    jne .l_futex_eagain         ; value changed: -EAGAIN
+
+.l_futex_requeue:
+    ; RDI (r12) = uaddr1
+    ; RDX = val (max to wake)
+    ; R10 = val2 (max to requeue)
+    ; R8  = uaddr2 (target futex address)
+    mov rdi, r12
+    mov esi, 4
+    call sys_validate_user_ptr
+    jc .l_futex_efault
+    mov rdi, r8
+    mov esi, 4
+    call sys_validate_user_ptr
+    jc .l_futex_efault
+
+    push r14
+    push rbp
+    mov r14d, edx               ; r14d = max wake
+    mov ebp, r10d               ; ebp  = max requeue
+    mov r13, r8                 ; r13  = uaddr2
+    xor ecx, ecx                ; ecx  = woken count
+    xor edx, edx                ; edx  = requeued count
+    xor ebx, ebx                ; ebx  = task slot
+.l_frq_loop:
     cmp ebx, MAX_TASKS
-    jae .l_futex_wake_done
+    jae .l_frq_done
     imul eax, ebx, TCB_SIZE
     lea rdi, [r15 + task_table - kmain + rax]
     cmp dword [rdi + TCB_STATE], TASK_SLEEPING
-    jne .l_futex_wake_next
+    jne .l_frq_next
     mov rax, [rdi + TCB_FUTEX_ADDR]
-    cmp rax, r12
-    jne .l_futex_wake_next
+    cmp rax, r12                ; waiting on uaddr1?
+    jne .l_frq_next
+
+    cmp ecx, r14d
+    jae .l_frq_check_requeue
     mov qword [rdi + TCB_FUTEX_ADDR], 0
     mov dword [rdi + TCB_STATE], TASK_READY
-    inc r13d
-    cmp r13d, edx
-    jae .l_futex_wake_done
-.l_futex_wake_next:
+    inc ecx
+    jmp .l_frq_next
+
+.l_frq_check_requeue:
+    cmp edx, ebp
+    jae .l_frq_done
+    mov [rdi + TCB_FUTEX_ADDR], r13
+    inc edx
+
+.l_frq_next:
     inc ebx
-    jmp .l_futex_wake_loop
-.l_futex_wake_done:
-    mov rax, r13
+    jmp .l_frq_loop
+
+.l_frq_done:
+    mov eax, ecx
+    pop rbp
+    pop r14
     jmp .l_futex_done
 
 .l_futex_eagain:
@@ -2112,7 +2676,154 @@ linux_syscall_dispatch:
     je .l_fcntl_getfl
     cmp esi, 4                       ; F_SETFL
     je .l_fcntl_setfl
+    cmp esi, 5                       ; F_GETLK
+    je .l_fcntl_getlk
+    cmp esi, 6                       ; F_SETLK
+    je .l_fcntl_setlk
+    cmp esi, 7                       ; F_SETLKW
+    je .l_fcntl_setlk
+    cmp esi, 1024                    ; F_DUPFD_CLOEXEC
+    je .l_fcntl_dupfd
     mov rax, LINUX_EINVAL
+    ret
+
+.l_flock:
+    ; RDI = fd, ESI = operation (LOCK_SH=1, LOCK_EX=2, LOCK_NB=4, LOCK_UN=8)
+    call vfs_get_fd_ptr
+    test rax, rax
+    jz .l_flock_badfd
+    cmp byte [rax], FD_TYPE_FILE
+    jne .l_flock_badfd
+    movzx r8d, word [rax + 2]        ; inode
+    test r8d, r8d
+    jz .l_flock_badfd
+    mov eax, [r15 + sched_curr_task - kmain]
+    imul eax, TCB_SIZE
+    mov r9d, [r15 + task_table - kmain + rax + TCB_TGID] ; current tgid
+    test esi, 8                      ; LOCK_UN?
+    jnz .l_flock_unlock
+    ; Lock: find existing entry for this inode or first free
+    lea rax, [r15 + inode_lock_table - kmain]
+    xor ecx, ecx
+.l_flock_search:
+    cmp ecx, MAX_INODE_LOCKS * INODE_LOCK_ENTRY_SIZE
+    jae .l_flock_find_free
+    cmp [rax + rcx + 0], r8d
+    je .l_flock_have_entry
+    add ecx, INODE_LOCK_ENTRY_SIZE
+    jmp .l_flock_search
+.l_flock_find_free:
+    xor ecx, ecx
+.l_flock_free_loop:
+    cmp ecx, MAX_INODE_LOCKS * INODE_LOCK_ENTRY_SIZE
+    jae .l_flock_enolck
+    cmp dword [rax + rcx + 0], 0
+    je .l_flock_have_entry
+    add ecx, INODE_LOCK_ENTRY_SIZE
+    jmp .l_flock_free_loop
+.l_flock_have_entry:
+    mov [rax + rcx + 0], r8d
+    mov [rax + rcx + 4], r9d
+    mov dword [rax + rcx + 8], 2 ; exclusive lock
+    xor eax, eax
+    ret
+.l_flock_enolck:
+    mov rax, LINUX_ENOLCK
+    ret
+.l_flock_unlock:
+    lea rax, [r15 + inode_lock_table - kmain]
+    xor ecx, ecx
+.l_flock_un_loop:
+    cmp ecx, MAX_INODE_LOCKS * INODE_LOCK_ENTRY_SIZE
+    jae .l_flock_un_done
+    cmp [rax + rcx + 0], r8d
+    jne .l_flock_un_next
+    cmp [rax + rcx + 4], r9d
+    jne .l_flock_un_next
+    mov dword [rax + rcx + 0], 0
+    mov dword [rax + rcx + 4], 0
+    mov dword [rax + rcx + 8], 0
+.l_flock_un_next:
+    add ecx, INODE_LOCK_ENTRY_SIZE
+    jmp .l_flock_un_loop
+.l_flock_un_done:
+    xor eax, eax
+    ret
+.l_flock_badfd:
+    mov rax, LINUX_EBADF
+    ret
+
+.l_fcntl_getlk:
+    ; RDI = fd, RSI = cmd, RDX = flock struct pointer
+    test rdx, rdx
+    jz .l_fcntl_badfd2
+    ; Report unlocked (F_UNLCK = 2 in Linux struct flock)
+    mov word [rdx + 0], 2            ; l_type = F_UNLCK
+    xor eax, eax
+    ret
+
+.l_fcntl_setlk:
+    ; RDI = fd, RSI = cmd, RDX = flock struct pointer
+    test rdx, rdx
+    jz .l_fcntl_badfd2
+    call vfs_get_fd_ptr
+    test rax, rax
+    jz .l_fcntl_badfd2
+    cmp byte [rax], FD_TYPE_FILE
+    jne .l_fcntl_badfd2
+    movzx r8d, word [rax + 2]        ; inode
+    test r8d, r8d
+    jz .l_fcntl_badfd2
+    mov eax, [r15 + sched_curr_task - kmain]
+    imul eax, TCB_SIZE
+    mov r9d, [r15 + task_table - kmain + rax + TCB_TGID] ; current tgid
+    movzx ecx, word [rdx + 0]        ; l_type: 0=F_RDLCK, 1=F_WRLCK, 2=F_UNLCK
+    cmp ecx, 2                       ; F_UNLCK?
+    je .l_fcntl_unlock
+    ; Lock: find existing entry for this inode or free slot
+    lea rax, [r15 + inode_lock_table - kmain]
+    xor edx, edx
+.l_fsetlk_search:
+    cmp edx, MAX_INODE_LOCKS * INODE_LOCK_ENTRY_SIZE
+    jae .l_fsetlk_find_free
+    cmp [rax + rdx + 0], r8d
+    je .l_fsetlk_have_entry
+    add edx, INODE_LOCK_ENTRY_SIZE
+    jmp .l_fsetlk_search
+.l_fsetlk_find_free:
+    xor edx, edx
+.l_fsetlk_free_loop:
+    cmp edx, MAX_INODE_LOCKS * INODE_LOCK_ENTRY_SIZE
+    jae .l_fsetlk_done
+    cmp dword [rax + rdx + 0], 0
+    je .l_fsetlk_have_entry
+    add edx, INODE_LOCK_ENTRY_SIZE
+    jmp .l_fsetlk_free_loop
+.l_fsetlk_have_entry:
+    mov [rax + rdx + 0], r8d
+    mov [rax + rdx + 4], r9d
+    mov [rax + rdx + 8], ecx
+.l_fsetlk_done:
+    xor eax, eax
+    ret
+.l_fcntl_unlock:
+    lea rax, [r15 + inode_lock_table - kmain]
+    xor edx, edx
+.l_funlock_loop:
+    cmp edx, MAX_INODE_LOCKS * INODE_LOCK_ENTRY_SIZE
+    jae .l_funlock_done
+    cmp [rax + rdx + 0], r8d
+    jne .l_funlock_next
+    cmp [rax + rdx + 4], r9d
+    jne .l_funlock_next
+    mov dword [rax + rdx + 0], 0
+    mov dword [rax + rdx + 4], 0
+    mov dword [rax + rdx + 8], 0
+.l_funlock_next:
+    add edx, INODE_LOCK_ENTRY_SIZE
+    jmp .l_funlock_loop
+.l_funlock_done:
+    xor eax, eax
     ret
 .l_fcntl_dupfd:
     ; duplicate oldfd to first free fd >= arg
@@ -2253,9 +2964,14 @@ linux_syscall_dispatch:
     mov rsi, [rsp]          ; count
     mov rdx, r8             ; starting offset
     call ext4_read_dir
+    cmp rax, -2
+    je .l_gd_einval
     cmp rax, -1
     je .l_gd_err
     mov [rbx + 4], edx      ; advance fd offset to final directory offset
+    jmp .l_gd_done
+.l_gd_einval:
+    mov rax, LINUX_EINVAL
     jmp .l_gd_done
 .l_gd_badfd:
     mov rax, LINUX_EBADF
@@ -2547,17 +3263,337 @@ linux_syscall_dispatch:
 .l_mkdir:
     ; RDI = path, RSI = mode
     call sys_handler_mkdir
+    test eax, eax
+    jz @f
+    mov rax, LINUX_EACCES
     ret
+@@:
+    xor eax, eax
+    ret
+
+.l_mkdirat:
+    ; RDI = dirfd, RSI = path, RDX = mode
+    mov rdi, rsi
+    mov rsi, rdx
+    jmp .l_mkdir
 
 .l_rmdir:
     ; RDI = path
     call sys_handler_rmdir
+    test eax, eax
+    jz @f
+    mov rax, LINUX_ENOENT
+    ret
+@@:
+    xor eax, eax
     ret
 
 .l_unlink:
     ; RDI = path
     call sys_handler_unlink
+    test eax, eax
+    jz @f
+    mov rax, LINUX_ENOENT
     ret
+@@:
+    xor eax, eax
+    ret
+
+.l_unlinkat:
+    ; RDI = dirfd, RSI = pathname, RDX = flags (AT_REMOVEDIR = 0x200)
+    test edx, 0x200
+    jnz .l_unlinkat_rmdir
+    mov rdi, rsi
+    jmp .l_unlink
+.l_unlinkat_rmdir:
+    mov rdi, rsi
+    jmp .l_rmdir
+
+.l_symlink:
+    ; RDI = target, RSI = linkpath
+    push rdi
+    push rsi
+    mov rdi, rdi
+    mov rsi, 64
+    call sys_validate_user_ptr
+    pop rsi
+    pop rdi
+    jc .l_symlink_fault
+    push rdi
+    push rsi
+    mov rdi, rsi
+    mov rsi, 64
+    call sys_validate_user_ptr
+    pop rsi
+    pop rdi
+    jc .l_symlink_fault
+    ; RDI = target, RSI = linkpath -> ext4_symlink expects RSI=symlink_path, RDX=target
+    mov rdx, rdi
+    ; RSI already has linkpath
+    call ext4_symlink
+    cmp rax, -1
+    je .l_symlink_err
+    xor eax, eax
+    ret
+.l_symlink_fault:
+    mov rax, LINUX_EFAULT
+    ret
+.l_symlink_err:
+    mov rax, LINUX_EEXIST
+    ret
+
+.l_symlinkat:
+    ; RDI = target, RSI = newdirfd, RDX = linkpath
+    mov rdi, rdi                     ; target
+    mov rsi, rdx                     ; linkpath
+    jmp .l_symlink
+
+.l_link:
+    ; RDI = oldpath, RSI = newpath
+    push rdi
+    push rsi
+    mov rdi, rdi
+    mov rsi, 64
+    call sys_validate_user_ptr
+    pop rsi
+    pop rdi
+    jc .l_link_fault
+    push rdi
+    push rsi
+    mov rdi, rsi
+    mov rsi, 64
+    call sys_validate_user_ptr
+    pop rsi
+    pop rdi
+    jc .l_link_fault
+    ; 1. Lookup oldpath to get target inode
+    push rsi                         ; newpath
+    mov rsi, rdi
+    call vfs_lookup_with_fallback
+    pop rsi                          ; newpath
+    test eax, eax
+    jz .l_link_noent
+    ; Ensure oldpath is NOT a directory (hard links to directories forbidden)
+    push rax                         ; target inode
+    push rsi                         ; newpath
+    call ext4_inode_load
+    pop rsi
+    pop r12                          ; r12 = target inode
+    jc .l_link_err
+    movzx edx, word [r15 + ext4_inode - kmain + IN_OFF_MODE]
+    and edx, 0xF000
+    cmp edx, 0x4000                  ; S_IFDIR?
+    je .l_link_eperm                 ; EPERM: hard link to dir forbidden!
+    ; 2. Check newpath does not exist
+    push r12
+    push rsi
+    call ext4_lookup
+    pop rsi                          ; newpath
+    pop r12                          ; target inode
+    test eax, eax
+    jnz .l_link_exist
+    ; 3. Resolve parent of newpath
+    sub rsp, 288                     ; [rsp] = basename buffer
+    push r12                         ; target inode
+    lea rdi, [rsp + 8]               ; basename dest
+    call ext4_resolve_parent
+    pop r12                          ; target inode
+    jc .l_link_err_rsp
+    mov r8d, eax                     ; r8d = parent inode
+    ; 4. Add dir entry in parent dir for newpath pointing to r12d
+    mov eax, r8d
+    mov edx, r12d
+    lea rsi, [rsp]                   ; basename
+    mov cl, 1                        ; type = file
+    call ext4_add_dir_entry
+    jc .l_link_err_rsp
+    ; 5. Increment i_links_count on target inode
+    mov eax, r12d
+    call ext4_inode_load
+    jc .l_link_done_flush
+    inc word [r15 + ext4_inode - kmain + 26] ; i_links_count++
+    mov eax, r12d
+    call ext4_inode_save
+.l_link_done_flush:
+    call disk_flush_cache
+    add rsp, 288
+    xor eax, eax
+    ret
+.l_link_err_rsp:
+    add rsp, 288
+.l_link_err:
+    mov rax, LINUX_EIO
+    ret
+.l_link_eperm:
+    mov rax, LINUX_EPERM
+    ret
+.l_link_noent:
+    mov rax, LINUX_ENOENT
+    ret
+.l_link_exist:
+    mov rax, LINUX_EEXIST
+    ret
+.l_link_fault:
+    mov rax, LINUX_EFAULT
+    ret
+
+.l_renameat2:
+    ; RDI = olddirfd, RSI = oldpath, RDX = newdirfd, R10 = newpath, R8 = flags
+    test r8d, r8d
+    jnz .l_rename_einval
+    mov rdi, rsi                     ; oldpath
+    mov rsi, r10                     ; newpath
+    jmp .l_rename
+
+.l_renameat:
+    ; RDI = olddirfd, RSI = oldpath, RDX = newdirfd, R10 = newpath
+    mov rdi, rsi
+    mov rsi, r10
+    jmp .l_rename
+
+.l_rename:
+    ; RDI = oldpath, RSI = newpath
+    push rdi
+    push rsi
+    mov rdi, rdi
+    mov rsi, 64
+    call sys_validate_user_ptr
+    pop rsi
+    pop rdi
+    jc .l_rename_fault
+    push rdi
+    push rsi
+    mov rdi, rsi
+    mov rsi, 64
+    call sys_validate_user_ptr
+    pop rsi
+    pop rdi
+    jc .l_rename_fault
+
+    ; 1. Lookup oldpath to get source inode (do not follow symlink: we want to rename the symlink itself!)
+    push rsi                         ; newpath
+    mov rsi, rdi
+    call ext4_lookup_nofollow
+    pop rsi                          ; newpath
+    test eax, eax
+    jz .l_rename_noent
+    mov r12d, eax                    ; r12d = source inode
+
+    ; 2. Lookup newpath to see if target already exists
+    push r12                         ; source inode
+    push rsi                         ; newpath
+    mov rsi, rsi
+    call ext4_lookup
+    pop rsi                          ; newpath
+    pop r12                          ; source inode
+    test eax, eax
+    jz .l_rename_no_target
+
+    ; Target exists (in EAX): remove target directory entry and decrement link count
+    mov r13d, eax                    ; r13d = existing target inode
+    push r13
+    push r12
+    push rsi
+    push rdi
+    sub rsp, 256                     ; [rsp] = basename buffer (256 bytes)
+    lea rdi, [rsp]                   ; dest buffer
+    ; RSI already has newpath!
+    call ext4_resolve_parent
+    add rsp, 256
+    pop rdi                          ; oldpath
+    pop rsi                          ; newpath
+    pop r12                          ; source inode
+    pop r13                          ; target inode
+    jc .l_rename_err
+    mov r8d, eax                     ; r8d = target parent dir
+    ; Remove old entry from target parent
+    mov eax, r8d
+    mov edx, r13d
+    call ext4_remove_dir_entry
+    ; Decrement target i_links_count
+    mov eax, r13d
+    call ext4_inode_load
+    jc @f
+    dec word [r15 + ext4_inode - kmain + 26]
+    mov eax, r13d
+    call ext4_inode_save
+@@:
+
+.l_rename_no_target:
+    ; 3. Add directory entry in newpath's parent directory pointing to source inode (r12d)
+    push r12
+    push rdi                         ; oldpath
+    push rsi                         ; newpath
+    sub rsp, 256                     ; [rsp] = basename buffer
+    lea rdi, [rsp]                   ; dest buffer
+    ; RSI = newpath
+    call ext4_resolve_parent
+    jc .l_rename_step3_err
+    mov r8d, eax                     ; new parent inode
+    mov eax, r8d
+    mov edx, r12d
+    lea rsi, [rsp]                   ; basename of newpath
+    mov cl, 1                        ; file type
+    call ext4_add_dir_entry
+    jc .l_rename_step3_err
+    add rsp, 256
+    pop rsi                          ; newpath
+    pop rdi                          ; oldpath
+    pop r12                          ; source inode
+
+    ; 4. Remove entry for oldpath from old parent directory
+    push r12
+    push rdi
+    push rsi
+    sub rsp, 256
+    mov rsi, rdi                     ; oldpath
+    lea rdi, [rsp]                   ; basename
+    call ext4_resolve_parent
+    jc .l_rename_step4_err
+    mov r8d, eax                     ; old parent inode
+    mov eax, r8d
+    mov edx, r12d
+    call ext4_remove_dir_entry
+    add rsp, 256
+    pop rsi
+    pop rdi
+    pop r12
+
+    call disk_flush_cache
+    xor eax, eax
+    ret
+
+.l_rename_step3_err:
+    add rsp, 256
+    pop rsi
+    pop rdi
+    pop r12
+    jmp .l_rename_err
+
+.l_rename_step4_err:
+    add rsp, 256
+    pop rsi
+    pop rdi
+    pop r12
+    jmp .l_rename_err
+.l_rename_err:
+    mov rax, LINUX_EIO
+    ret
+.l_rename_einval:
+    mov rax, LINUX_EINVAL
+    ret
+.l_rename_noent:
+    mov rax, LINUX_ENOENT
+    ret
+.l_rename_fault:
+    mov rax, LINUX_EFAULT
+    ret
+
+.l_linkat:
+    ; RDI = olddirfd, RSI = oldpath, RDX = newdirfd, R10 = newpath, R8 = flags
+    mov rdi, rsi
+    mov rsi, r10
+    jmp .l_link
 
 .l_arch_prctl:
     ; RDI = code (ARCH_SET_FS = 0x1002, ARCH_GET_FS = 0x1003)
@@ -2862,13 +3898,447 @@ linux_syscall_dispatch:
     ret
 
 .l_set_tid_address:
-    ; RDI = tidptr (mock: return current PID)
+    ; RDI = tidptr
+    mov eax, [r15 + sched_curr_task - kmain]
+    imul eax, TCB_SIZE
+    lea rbx, [r15 + task_table - kmain + rax]
+    mov [rbx + TCB_CLEAR_CHILD_TID], rdi
     mov eax, [r15 + sched_curr_task - kmain]
     inc eax
     ret
 
-.l_zero_id:
+.l_getuid:
+    mov eax, [r15 + sched_curr_task - kmain]
+    imul eax, TCB_SIZE
+    mov eax, [r15 + task_table - kmain + rax + TCB_UID]
+    ret
+
+.l_getgid:
+    mov eax, [r15 + sched_curr_task - kmain]
+    imul eax, TCB_SIZE
+    mov eax, [r15 + task_table - kmain + rax + TCB_GID]
+    ret
+
+.l_geteuid:
+    mov eax, [r15 + sched_curr_task - kmain]
+    imul eax, TCB_SIZE
+    mov eax, [r15 + task_table - kmain + rax + TCB_EUID]
+    ret
+
+.l_getegid:
+    mov eax, [r15 + sched_curr_task - kmain]
+    imul eax, TCB_SIZE
+    mov eax, [r15 + task_table - kmain + rax + TCB_EGID]
+    ret
+
+.l_setuid:
+    ; RDI = uid
+    mov eax, [r15 + sched_curr_task - kmain]
+    imul eax, TCB_SIZE
+    lea rbx, [r15 + task_table - kmain + rax]
+    mov [rbx + TCB_UID], edi
+    mov [rbx + TCB_EUID], edi
+    mov [rbx + TCB_SUID], edi
     xor eax, eax
+    ret
+
+.l_setgid:
+    ; RDI = gid
+    mov eax, [r15 + sched_curr_task - kmain]
+    imul eax, TCB_SIZE
+    lea rbx, [r15 + task_table - kmain + rax]
+    mov [rbx + TCB_GID], edi
+    mov [rbx + TCB_EGID], edi
+    mov [rbx + TCB_SGID], edi
+    xor eax, eax
+    ret
+
+.l_setreuid:
+    ; RDI = ruid, RSI = euid
+    mov eax, [r15 + sched_curr_task - kmain]
+    imul eax, TCB_SIZE
+    lea rbx, [r15 + task_table - kmain + rax]
+    cmp edi, -1
+    je @f
+    mov [rbx + TCB_UID], edi
+@@:
+    cmp esi, -1
+    je @f
+    mov [rbx + TCB_EUID], esi
+@@:
+    xor eax, eax
+    ret
+
+.l_setregid:
+    ; RDI = rgid, RSI = egid
+    mov eax, [r15 + sched_curr_task - kmain]
+    imul eax, TCB_SIZE
+    lea rbx, [r15 + task_table - kmain + rax]
+    cmp edi, -1
+    je @f
+    mov [rbx + TCB_GID], edi
+@@:
+    cmp esi, -1
+    je @f
+    mov [rbx + TCB_EGID], esi
+@@:
+    xor eax, eax
+    ret
+
+.l_setresuid:
+    ; RDI = ruid, RSI = euid, RDX = suid
+    mov eax, [r15 + sched_curr_task - kmain]
+    imul eax, TCB_SIZE
+    lea rbx, [r15 + task_table - kmain + rax]
+    cmp edi, -1
+    je @f
+    mov [rbx + TCB_UID], edi
+@@:
+    cmp esi, -1
+    je @f
+    mov [rbx + TCB_EUID], esi
+@@:
+    cmp edx, -1
+    je @f
+    mov [rbx + TCB_SUID], edx
+@@:
+    xor eax, eax
+    ret
+
+.l_getresuid:
+    ; RDI = *ruid, RSI = *euid, RDX = *suid
+    mov eax, [r15 + sched_curr_task - kmain]
+    imul eax, TCB_SIZE
+    lea rbx, [r15 + task_table - kmain + rax]
+    test rdi, rdi
+    jz @f
+    mov ecx, [rbx + TCB_UID]
+    mov [rdi], ecx
+@@:
+    test rsi, rsi
+    jz @f
+    mov ecx, [rbx + TCB_EUID]
+    mov [rsi], ecx
+@@:
+    test rdx, rdx
+    jz @f
+    mov ecx, [rbx + TCB_SUID]
+    mov [rdx], ecx
+@@:
+    xor eax, eax
+    ret
+
+.l_setresGID:
+    ; RDI = rgid, RSI = egid, RDX = sgid
+    mov eax, [r15 + sched_curr_task - kmain]
+    imul eax, TCB_SIZE
+    lea rbx, [r15 + task_table - kmain + rax]
+    cmp edi, -1
+    je @f
+    mov [rbx + TCB_GID], edi
+@@:
+    cmp esi, -1
+    je @f
+    mov [rbx + TCB_EGID], esi
+@@:
+    cmp edx, -1
+    je @f
+    mov [rbx + TCB_SGID], edx
+@@:
+    xor eax, eax
+    ret
+
+.l_getresGID:
+    ; RDI = *rgid, RSI = *egid, RDX = *sgid
+    mov eax, [r15 + sched_curr_task - kmain]
+    imul eax, TCB_SIZE
+    lea rbx, [r15 + task_table - kmain + rax]
+    test rdi, rdi
+    jz @f
+    mov ecx, [rbx + TCB_GID]
+    mov [rdi], ecx
+@@:
+    test rsi, rsi
+    jz @f
+    mov ecx, [rbx + TCB_EGID]
+    mov [rsi], ecx
+@@:
+    test rdx, rdx
+    jz @f
+    mov ecx, [rbx + TCB_SGID]
+    mov [rdx], ecx
+@@:
+    xor eax, eax
+    ret
+
+.l_getgroups:
+    ; int size = RDI, gid_t *list = RSI
+    ; If size == 0, return number of supplementary groups (1: gid 0)
+    test edi, edi
+    jz .l_gg_count
+    test rsi, rsi
+    jz .l_gg_fault
+    mov dword [rsi], 0               ; root group
+    mov eax, 1
+    ret
+.l_gg_count:
+    mov eax, 1
+    ret
+.l_gg_fault:
+    mov rax, LINUX_EFAULT
+    ret
+
+.l_setgroups:
+    ; size_t size = RDI, const gid_t *list = RSI
+    xor eax, eax
+    ret
+
+.l_umask:
+    ; mode_t mask = EDI
+    mov eax, [r15 + sched_curr_task - kmain]
+    imul eax, TCB_SIZE
+    lea rbx, [r15 + task_table - kmain + rax]
+    mov eax, [rbx + TCB_UMASK]        ; return old mask
+    and edi, 0777o
+    mov [rbx + TCB_UMASK], edi        ; set new mask
+    ret
+
+.l_chroot:
+    ; const char *path = RDI
+    ; DP-kg / debootstrap uses chroot; mock success for root
+    xor eax, eax
+    ret
+
+.l_fsync:
+    ; RDI = fd
+    call vfs_get_fd_ptr
+    test rax, rax
+    jz .l_fsync_ebadf
+    xor eax, eax
+    ret
+.l_fsync_ebadf:
+    mov rax, LINUX_EBADF
+    ret
+
+.l_ftruncate:
+    ; RDI = fd, RSI = length
+    call vfs_get_fd_ptr
+    test rax, rax
+    jz .l_trunc_ebadf
+    cmp byte [rax], FD_TYPE_FILE
+    jne .l_trunc_ebadf
+    movzx eax, word [rax + 2]        ; inode
+    test eax, eax
+    jz .l_trunc_ebadf
+    mov rdx, rsi                     ; target size
+    call ext4_truncate_file
+    xor eax, eax
+    ret
+.l_trunc_ebadf:
+    mov rax, LINUX_EBADF
+    ret
+
+.l_truncate:
+    ; RDI = path, RSI = length
+    push rsi
+    call ext4_lookup
+    pop rsi
+    test eax, eax
+    jz .l_trunc_enoent
+    mov rdx, rsi                     ; target size
+    call ext4_truncate_file
+    xor eax, eax
+    ret
+.l_trunc_enoent:
+    mov rax, LINUX_ENOENT
+    ret
+
+.l_chmod:
+    ; RDI = pathname, RSI = mode
+    mov eax, esi                     ; mode
+    call .l_attr_lookup
+    test eax, eax
+    jz .l_attr_enoent
+    ; EAX = inode, EBX = mode
+    push rax
+    call ext4_inode_load
+    pop rdi
+    jc .l_attr_eio
+    ; Preserve file type (top 4 bits), replace low 12 bits with new mode
+    and word [r15 + ext4_inode - kmain + IN_OFF_MODE], 0xF000
+    and bx, 0x0FFF
+    or  word [r15 + ext4_inode - kmain + IN_OFF_MODE], bx
+    mov eax, edi
+    call ext4_inode_save
+    jc .l_attr_eio
+    xor eax, eax
+    ret
+
+.l_fchmod:
+    ; RDI = fd, RSI = mode
+    mov ebx, esi
+    call vfs_get_fd_ptr
+    test rax, rax
+    jz .l_attr_ebadf
+    cmp byte [rax], FD_TYPE_FILE
+    jne .l_attr_ebadf
+    movzx eax, word [rax + 2]        ; inode
+    test eax, eax
+    jz .l_attr_ebadf
+    push rax
+    call ext4_inode_load
+    pop rdi
+    jc .l_attr_eio
+    and word [r15 + ext4_inode - kmain + IN_OFF_MODE], 0xF000
+    and bx, 0x0FFF
+    or  word [r15 + ext4_inode - kmain + IN_OFF_MODE], bx
+    mov eax, edi
+    call ext4_inode_save
+    jc .l_attr_eio
+    xor eax, eax
+    ret
+
+.l_fchmodat:
+    ; RDI = dirfd, RSI = pathname, RDX = mode, R10 = flags
+    mov rdi, rsi
+    mov rsi, rdx
+    jmp .l_chmod
+
+.l_chown:
+    ; RDI = pathname, ESI = owner (uid), EDX = group (gid)
+    push rdx                         ; gid
+    push rsi                         ; uid
+    call vfs_lookup_with_fallback
+    pop rsi
+    pop rdx
+    test eax, eax
+    jz .l_attr_enoent
+    push rax                         ; inode
+    call ext4_inode_load
+    pop rdi
+    jc .l_attr_eio
+    cmp esi, -1
+    je @f
+    mov word [r15 + ext4_inode - kmain + 2], si   ; i_uid
+@@:
+    cmp edx, -1
+    je @f
+    mov word [r15 + ext4_inode - kmain + 24], dx  ; i_gid
+@@:
+    mov eax, edi
+    call ext4_inode_save
+    jc .l_attr_eio
+    xor eax, eax
+    ret
+
+.l_fchown:
+    ; RDI = fd, ESI = owner, EDX = group
+    push rdx
+    push rsi
+    call vfs_get_fd_ptr
+    pop rsi
+    pop rdx
+    test rax, rax
+    jz .l_attr_ebadf
+    cmp byte [rax], FD_TYPE_FILE
+    jne .l_attr_ebadf
+    movzx eax, word [rax + 2]        ; inode
+    test eax, eax
+    jz .l_attr_ebadf
+    push rax
+    call ext4_inode_load
+    pop rdi
+    jc .l_attr_eio
+    cmp esi, -1
+    je @f
+    mov word [r15 + ext4_inode - kmain + 2], si   ; i_uid
+@@:
+    cmp edx, -1
+    je @f
+    mov word [r15 + ext4_inode - kmain + 24], dx  ; i_gid
+@@:
+    mov eax, edi
+    call ext4_inode_save
+    jc .l_attr_eio
+    xor eax, eax
+    ret
+
+.l_fchownat:
+    ; RDI = dirfd, RSI = pathname, RDX = owner, R10 = group, R8 = flags
+    mov rdi, rsi
+    mov rsi, rdx
+    mov rdx, r10
+    jmp .l_chown
+
+.l_utimensat:
+    ; RDI = dirfd, RSI = pathname, RDX = struct timespec times[2], R10 = flags
+    test rdx, rdx
+    jz .l_utimens_now
+    push rdx
+    mov rdi, rdx
+    mov rsi, 32
+    call sys_validate_user_ptr
+    pop rdx
+    jc .l_attr_efault
+    ; RDX = valid timespec array
+    ; times[0] = atime, times[1] = mtime
+    mov r8,  [rdx + 0]               ; atime.tv_sec
+    mov r9,  [rdx + 16]              ; mtime.tv_sec
+    jmp .l_utimens_apply
+
+.l_utimens_now:
+    ; Fake timestamp if NULL
+    mov r8d, 0x68E50000              ; fixed epoch timestamp
+    mov r9d, 0x68E50000
+
+.l_utimens_apply:
+    ; Resolve pathname in RSI
+    push r9
+    push r8
+    mov rdi, rsi
+    call vfs_lookup_with_fallback
+    pop r8
+    pop r9
+    test eax, eax
+    jz .l_attr_enoent
+    push rax
+    call ext4_inode_load
+    pop rdi
+    jc .l_attr_eio
+    mov dword [r15 + ext4_inode - kmain + 8], r8d   ; i_atime
+    mov dword [r15 + ext4_inode - kmain + 16], r9d  ; i_mtime
+    mov dword [r15 + ext4_inode - kmain + 12], r9d  ; i_ctime
+    mov eax, edi
+    call ext4_inode_save
+    jc .l_attr_eio
+    xor eax, eax
+    ret
+
+.l_attr_lookup:
+    ; RDI = pathname, EAX = mode. Returns EAX = inode, EBX = mode
+    mov ebx, eax
+    push rbx
+    mov rsi, rdi
+    call vfs_lookup_with_fallback
+    pop rbx
+    ret
+
+.l_attr_enoent:
+    mov rax, LINUX_ENOENT
+    ret
+.l_attr_ebadf:
+    mov rax, LINUX_EBADF
+    ret
+.l_attr_eio:
+    mov rax, LINUX_EIO
+    ret
+.l_attr_efault:
+    mov rax, LINUX_EFAULT
+    ret
+
+.l_statx:
+    ; glibc attempts statx first on Linux 4.11+; returning -ENOSYS cleanly falls back to stat/fstat/newfstatat
+    mov rax, LINUX_ENOSYS
     ret
 
 .l_poll:
@@ -2912,6 +4382,18 @@ str_l_call_log db "[Linux ABI] Call: #", 0
 str_l_fb_log db "[Linux ABI] fallback: #", 0
 str_l_exit_log db "[Linux ABI] Exit with code: ", 0
 str_l_sigkill db "[Linux ABI] Terminated by signal ", 0
+str_l_write_dbg db "[Linux ABI] write: fd=", 0
+str_l_write_dbg2 db " -> ", 0
 
 align 8
 linux_mmap_next dq 0x20000000
+
+MAX_INODE_LOCKS = 16
+INODE_LOCK_ENTRY_SIZE = 16
+; Each entry:
+; +0: uint32 inode (0 = free)
+; +4: uint32 owner_tgid
+; +8: uint32 lock_type (1 = read / shared, 2 = write / exclusive)
+; +12: uint32 reserved
+align 16
+inode_lock_table: rb (MAX_INODE_LOCKS * INODE_LOCK_ENTRY_SIZE)

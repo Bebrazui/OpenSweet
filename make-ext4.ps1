@@ -22,9 +22,12 @@ PutU32 ($sb + 0x04) 16384                   # blocks_count_lo
 PutU32 ($sb + 0x14) 1                       # first_data_block (1KB blocks)
 PutU32 ($sb + 0x18) 0                       # log_block_size = 0 -> 1024
 PutU32 ($sb + 0x20) 8192                    # blocks_per_group (standard 8192 blocks per group)
+PutU32 ($sb + 0x24) 8192                    # clusters_per_group / frags_per_group
 PutU32 ($sb + 0x28) 64                      # inodes_per_group
-PutU16 ($sb + 0x36) 1                       # state = clean
+PutU16 ($sb + 0x36) 0xFFFF                  # max_mnt_count
 PutU16 ($sb + 0x38) 0xEF53                  # magic
+PutU16 ($sb + 0x3A) 1                       # state = clean (EXT2_VALID_FS)
+PutU16 ($sb + 0x3C) 1                       # errors = EXT2_ERRORS_CONTINUE
 PutU32 ($sb + 0x4C) 1                       # rev_level = dynamic
 PutU32 ($sb + 0x54) 11                      # first_ino
 PutU16 ($sb + 0x58) 128                     # inode_size
@@ -39,15 +42,25 @@ PutU32 ($gdt + 0)  3                        # bg_block_bitmap
 PutU32 ($gdt + 4)  4                        # bg_inode_bitmap
 PutU32 ($gdt + 8)  10                       # bg_inode_table (blocks 10..17, 8 blocks)
 # Group 1:
-PutU32 ($gdt + 32 + 0) 8192                 # bg_block_bitmap
-PutU32 ($gdt + 32 + 4) 8193                 # bg_inode_bitmap
-PutU32 ($gdt + 32 + 8) 8194                 # bg_inode_table (blocks 8194..8201)
+# Block 8192 is last block of Group 0.
+# In Group 1 (blocks 8193..16383):
+# Block 8193: Backup superblock
+# Block 8194: Backup GDT
+# Block 8195: bg_block_bitmap
+# Block 8196: bg_inode_bitmap
+# Block 8197: bg_inode_table (blocks 8197..8204, 8 blocks)
+PutU32 ($gdt + 32 + 0) 8195                 # bg_block_bitmap
+PutU32 ($gdt + 32 + 4) 8196                 # bg_inode_bitmap
+PutU32 ($gdt + 32 + 8) 8197                 # bg_inode_table (blocks 8197..8204)
 
 # ---- helper: write an extents-root inode into inode table ----
 function ExtentLeaf([long]$inoOff, [long]$fsBlock, [int]$len, [int]$size, [int]$mode) {
     PutU16 $inoOff $mode                    # i_mode
     PutU16 ($inoOff + 2) 0                  # i_uid
     PutU32 ($inoOff + 4) $size              # i_size_lo
+    $links = if (($mode -band 0xF000) -eq 0x4000) { 2 } else { 1 }
+    PutU16 ($inoOff + 26) $links            # i_links_count
+    PutU32 ($inoOff + 28) ($len * 2)        # i_blocks_lo (512-byte sectors = 1KB blocks * 2)
     PutU32 ($inoOff + 32) 0x80000           # i_flags = EXTENTS
 
     # extent header at i_block (offset 40)
@@ -261,15 +274,26 @@ if ($hasDebHello) {
     ExtentLeaf ($itable + 23 * 128) $debHelloStartBlock $debHelloBlocks $debHelloBytes.Length 0x81ED
 }
 
+$debThreadPath = Join-Path $PSScriptRoot "build\debian_test\debian_thread"
+$hasDebThread = Test-Path $debThreadPath
+$debThreadBlocks = 0
+$debThreadStartBlock = $debHelloStartBlock + $debHelloBlocks
+if ($hasDebThread) {
+    $debThreadBytes = [IO.File]::ReadAllBytes($debThreadPath)
+    $debThreadBlocks = [int][Math]::Ceiling($debThreadBytes.Length / 1024.0)
+    # inode 25 = debian_thread
+    ExtentLeaf ($itable + 24 * 128) $debThreadStartBlock $debThreadBlocks $debThreadBytes.Length 0x81ED
+}
+
 $ldPath = Join-Path $PSScriptRoot "build\debian_test\lib64\ld-linux-x86-64.so.2"
 $hasLd = Test-Path $ldPath
 $ldBlocks = 0
-$ldStartBlock = $debHelloStartBlock + $debHelloBlocks
+$ldStartBlock = $debThreadStartBlock + $debThreadBlocks
 if ($hasLd) {
     $ldBytes = [IO.File]::ReadAllBytes($ldPath)
     $ldBlocks = [int][Math]::Ceiling($ldBytes.Length / 1024.0)
-    # inode 25 = ld-linux-x86-64.so.2
-    ExtentLeaf ($itable + 24 * 128) $ldStartBlock $ldBlocks $ldBytes.Length 0x81ED
+    # inode 26 = ld-linux-x86-64.so.2
+    ExtentLeaf ($itable + 25 * 128) $ldStartBlock $ldBlocks $ldBytes.Length 0x81ED
 }
 
 $libcPath = Join-Path $PSScriptRoot "build\debian_test\lib\x86_64-linux-gnu\libc.so.6"
@@ -279,15 +303,15 @@ $libcStartBlock = $ldStartBlock + $ldBlocks
 if ($hasLibc) {
     $libcBytes = [IO.File]::ReadAllBytes($libcPath)
     $libcBlocks = [int][Math]::Ceiling($libcBytes.Length / 1024.0)
-    # inode 26 = libc.so.6
-    ExtentLeaf ($itable + 25 * 128) $libcStartBlock $libcBlocks $libcBytes.Length 0x81ED
+    # inode 27 = libc.so.6
+    ExtentLeaf ($itable + 26 * 128) $libcStartBlock $libcBlocks $libcBytes.Length 0x81ED
 }
 
 
 $wadPath = Join-Path $PSScriptRoot "user\doomgeneric\doom1.wad"
 $hasWad = $includeDoom -and (Test-Path $wadPath)
 $wadBlocks = 0
-$wadStartBlock = 8202
+$wadStartBlock = 8205
 if ($hasWad) {
     $wadBytes = [IO.File]::ReadAllBytes($wadPath)
     $wadBlocks = [int][Math]::Ceiling($wadBytes.Length / 1024.0)
@@ -356,18 +380,23 @@ if ($hasDoom) {
     $curOff += 20
 }
 if ($hasDebHello) {
-    $rec = if ($hasLd -or $hasLibc -or $hasWad) { 24 } else { $d + 1024 - $curOff }
+    $rec = if ($hasDebThread -or $hasLd -or $hasLibc -or $hasWad) { 24 } else { $d + 1024 - $curOff }
     DirEntry $curOff 24 'debian_hello' 1 $rec
+    $curOff += 24
+}
+if ($hasDebThread) {
+    $rec = if ($hasLd -or $hasLibc -or $hasWad) { 24 } else { $d + 1024 - $curOff }
+    DirEntry $curOff 25 'debian_thread' 1 $rec
     $curOff += 24
 }
 if ($hasLd) {
     $rec = if ($hasLibc -or $hasWad) { 32 } else { $d + 1024 - $curOff }
-    DirEntry $curOff 25 'ld-linux-x86-64.so.2' 1 $rec
+    DirEntry $curOff 26 'ld-linux-x86-64.so.2' 1 $rec
     $curOff += 32
 }
 if ($hasLibc) {
     $rec = if ($hasWad) { 20 } else { $d + 1024 - $curOff }
-    DirEntry $curOff 26 'libc.so.6' 1 $rec
+    DirEntry $curOff 27 'libc.so.6' 1 $rec
     $curOff += 20
 }
 if ($hasWad) {
@@ -425,6 +454,10 @@ if ($hasDebHello) {
     Put ($debHelloStartBlock * $BS) $debHelloBytes
     echo "Added debian_hello ($($debHelloBytes.Length) bytes, $debHelloBlocks blocks) to disk image"
 }
+if ($hasDebThread) {
+    Put ($debThreadStartBlock * $BS) $debThreadBytes
+    echo "Added debian_thread ($($debThreadBytes.Length) bytes, $debThreadBlocks blocks) to disk image"
+}
 if ($hasLd) {
     Put ($ldStartBlock * $BS) $ldBytes
     echo "Added ld-linux-x86-64.so.2 ($($ldBytes.Length) bytes, $ldBlocks blocks) to disk image"
@@ -443,6 +476,8 @@ $totalAllocatedBlocksGrp0 = if ($hasLibc) {
     $libcStartBlock + $libcBlocks
 } elseif ($hasLd) {
     $ldStartBlock + $ldBlocks
+} elseif ($hasDebThread) {
+    $debThreadStartBlock + $debThreadBlocks
 } elseif ($hasDebHello) {
     $debHelloStartBlock + $debHelloBlocks
 } elseif ($hasDoom) {
@@ -457,41 +492,87 @@ $totalAllocatedBlocksGrp0 = if ($hasLibc) {
     26
 }
 
-# Block bitmap at block 3 (mark blocks 0..totalAllocatedBlocksGrp0-1 in group 0 as used)
-$grp0Blocks = [Math]::Min($totalAllocatedBlocksGrp0, 8192)
-for ($b = 0; $b -lt $grp0Blocks; $b++) {
-    $byteIdx = $b -shr 3
-    $bitIdx  = $b -band 7
+# Block bitmap at block 3:
+# In Group 0 with 1KB block size, first_data_block = 1.
+# Valid blocks in Group 0 are 1..8192 (relative bits 0..8191 in bitmap 0 correspond to blocks 1..8192).
+# Metadata: block 1 (SB), block 2 (GDT), block 3 (blk_bm), block 4 (ino_bm), blocks 10..17 (itable, 8 blocks)
+# Root dir: block 20
+# User files: blocks 21 up to ($totalAllocatedBlocksGrp0 - 1)
+[Array]::Clear($img, 3 * $BS, $BS)
+$allocatedBlocksGrp0 = [System.Collections.Generic.HashSet[int]]::new()
+$allocatedBlocksGrp0.Add(1) | Out-Null
+$allocatedBlocksGrp0.Add(2) | Out-Null
+$allocatedBlocksGrp0.Add(3) | Out-Null
+$allocatedBlocksGrp0.Add(4) | Out-Null
+for ($b = 10; $b -le 17; $b++) { $allocatedBlocksGrp0.Add($b) | Out-Null }
+$allocatedBlocksGrp0.Add(20) | Out-Null
+for ($b = 21; $b -lt $totalAllocatedBlocksGrp0; $b++) { $allocatedBlocksGrp0.Add($b) | Out-Null }
+
+foreach ($b in $allocatedBlocksGrp0) {
+    $relBlock = $b - 1
+    $byteIdx = $relBlock -shr 3
+    $bitIdx  = $relBlock -band 7
     $img[(3 * $BS) + $byteIdx] = $img[(3 * $BS) + $byteIdx] -bor (1 -shl $bitIdx)
 }
 
-# Inode bitmap at block 4 (inodes 1..lastIno are used)
-# Must cover the HIGHEST inode actually written above (index+1), else a
-# free-but-used inode gets handed out by the allocator and corrupts a file.
-$lastIno = if ($hasLibc) { 26 } elseif ($hasLd) { 25 } elseif ($hasDebHello) { 24 } elseif ($hasBusybox) { 23 } elseif ($hasLinuxTest) { 22 } elseif ($hasDoom) { 21 } elseif ($hasWad) { 20 } elseif ($hasFiles) { 19 } elseif ($hasTerm) { 18 } elseif ($hasNote) { 17 } elseif ($hasCalc) { 16 } elseif ($hasGui) { 15 } elseif ($hasElf) { 14 } elseif ($hasWall) { 13 } else { 12 }
+# Inode bitmap at block 4:
+# Inodes 1..10 are reserved by ext4 (bad blocks, root, acl, journal, etc.).
+# Regular user files start at 11 up to $lastIno.
 [Array]::Clear($img, 4 * $BS, $BS)
-for ($ino = 1; $ino -le $lastIno; $ino++) {
+# Inodes 1..8 (byte 0 = 0xFF)
+$img[(4 * $BS) + 0] = 0xFF
+# Inodes 9..10 (bits 0,1 of byte 1 = 3)
+$img[(4 * $BS) + 1] = 0x03
+$usedInoCountGrp0 = 10
+$lastIno = 27
+for ($ino = 11; $ino -le $lastIno; $ino++) {
     $bit = $ino - 1
     $byteIdx = $bit -shr 3
     $bitIdx  = $bit -band 7
     $img[(4 * $BS) + $byteIdx] = $img[(4 * $BS) + $byteIdx] -bor (1 -shl $bitIdx)
+    $usedInoCountGrp0++
+}
+# Set padding bits at the end of inode bitmap (bits 64..8191 must be 1 per ext4 spec)
+for ($i = 8; $i -lt $BS; $i++) {
+    $img[(4 * $BS) + $i] = 0xFF
 }
 
-
-# Group 1 block bitmap at block 8192:
-# Mark 10 metadata blocks of Group 1 + wadBlocks
-$grp1Blocks = if ($hasWad) { 10 + $wadBlocks } else { 10 }
-for ($b = 0; $b -lt $grp1Blocks; $b++) {
+# Group 1 block bitmap at block 8195:
+# In Group 1, blocks 8193..16383 correspond to relative bits 0..8190 (8191 blocks).
+# Metadata blocks of Group 1: 8193(SB), 8194(GDT), 8195(blk_bm), 8196(ino_bm), 8197..8204(itable, 8 blocks)
+# Total metadata = 12 blocks (relative blocks 0..11 in Group 1)
+# wad file: blocks wadStartBlock..(wadStartBlock + wadBlocks - 1)
+[Array]::Clear($img, 8195 * $BS, $BS)
+$allocatedBlocksGrp1Count = 12
+for ($b = 0; $b -lt 12; $b++) {
     $byteIdx = $b -shr 3
     $bitIdx  = $b -band 7
-    $img[(8192 * $BS) + $byteIdx] = $img[(8192 * $BS) + $byteIdx] -bor (1 -shl $bitIdx)
+    $img[(8195 * $BS) + $byteIdx] = $img[(8195 * $BS) + $byteIdx] -bor (1 -shl $bitIdx)
+}
+if ($hasWad) {
+    for ($b = 0; $b -lt $wadBlocks; $b++) {
+        $relBlock = ($wadStartBlock - 8193) + $b
+        $byteIdx = $relBlock -shr 3
+        $bitIdx  = $relBlock -band 7
+        $img[(8195 * $BS) + $byteIdx] = $img[(8195 * $BS) + $byteIdx] -bor (1 -shl $bitIdx)
+        $allocatedBlocksGrp1Count++
+    }
+}
+# Bit 8191 in Group 1 is beyond the 16384 total blocks (since Group 1 has 8191 blocks: 8193..16383).
+# Set padding bit 8191 (bit 7 of byte 1023)
+$img[(8195 * $BS) + 1023] = $img[(8195 * $BS) + 1023] -bor 0x80
+
+# Group 1 inode bitmap at block 8196: all 64 inodes free, padding bits (64..8191) set to 1
+[Array]::Clear($img, 8196 * $BS, $BS)
+for ($i = 8; $i -lt $BS; $i++) {
+    $img[(8196 * $BS) + $i] = 0xFF
 }
 
-$freeBlocksGrp0 = 8192 - $grp0Blocks
-$freeBlocksGrp1 = 8192 - $grp1Blocks
+$freeBlocksGrp0 = 8192 - $allocatedBlocksGrp0.Count
+$freeBlocksGrp1 = 8191 - $allocatedBlocksGrp1Count
 $freeBlocksTotal = $freeBlocksGrp0 + $freeBlocksGrp1
 
-$freeInodesGrp0 = 64 - $lastIno
+$freeInodesGrp0 = 64 - $usedInoCountGrp0
 $freeInodesGrp1 = 64
 $freeInodesTotal = $freeInodesGrp0 + $freeInodesGrp1
 
@@ -506,6 +587,15 @@ PutU16 ($gdt + 0x10) 1                      # bg_used_dirs_count_lo
 # Group 1 descriptor:
 PutU16 ($gdt + 32 + 0x0C) $freeBlocksGrp1   # bg_free_blocks_count_lo
 PutU16 ($gdt + 32 + 0x0E) $freeInodesGrp1   # bg_free_inodes_count_lo
+
+# Backup superblock at block 8193: copy primary SB and set block_group_nr = 1
+[Array]::Copy($img, $sb, $img, 8193 * $BS, 1024)
+PutU16 (8193 * $BS + 0x3A) 0               # s_state = 0 in backup
+PutU16 (8193 * $BS + 0x5A) 1               # s_block_group_nr = 1
+
+# Backup GDT at block 8194: copy primary GDT
+[Array]::Copy($img, $gdt, $img, 8194 * $BS, 64)
+
 $diskOut = Join-Path $PSScriptRoot 'build\disk.img'
 [IO.File]::WriteAllBytes($diskOut, $img)
 echo "Build OK: $diskOut (minimal 2-group ext4, 1KB blocks)"

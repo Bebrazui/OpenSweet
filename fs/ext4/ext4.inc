@@ -400,10 +400,11 @@ ext4_alloc_blocks:
     sub dword [r15 + ext4_sb - kmain + 0x0C], r8d
     call ext4_sb_save
 
-    ; Compute physical block number: RAX = r12d * ext4_bpg + r11d
+    ; Compute physical block number: RAX = r12d * ext4_bpg + r11d + s_first_data_block
     mov eax, r12d
     mul dword [r15 + ext4_bpg - kmain]
     add eax, r11d
+    add eax, dword [r15 + ext4_sb - kmain + SB_FDB]
     clc
 .abk_pop:
     pop r13
@@ -450,6 +451,7 @@ ext4_free_blocks:
     mov r9d, esi                            ; r9d = count
 
     mov eax, edi
+    sub eax, dword [r15 + ext4_sb - kmain + SB_FDB] ; make relative to first data block
     xor edx, edx
     div dword [r15 + ext4_bpg - kmain]      ; eax = group G, edx = bit in group
     mov r12d, eax                           ; r12d = group G
@@ -695,14 +697,41 @@ ext4_free_inode:
     call ext4_blk_read
     jc .fi_err
 
-    ; Clear bit r13d in bitmap
-    mov eax, r13d
-    btr dword [r15 + ext4_bbuf - kmain], eax
+    ; Clear bit r13d in bitmap (r13d: 0..ipg-1)
+    mov ecx, r13d
+    shr ecx, 3                              ; ecx = byte index
+    mov edx, r13d
+    and edx, 7                              ; edx = bit index 0..7
+    mov al, 1
+    push rcx
+    mov cl, dl
+    shl al, cl
+    pop rcx
+    not al
+    and [r15 + ext4_bbuf - kmain + rcx], al
 
     ; Write inode bitmap back to disk
     mov eax, dword [r15 + e4w_bmp_blk - kmain]
     lea rsi, [r15 + ext4_bbuf - kmain]
     call ext4_blk_write
+    jc .fi_err
+
+    ; 1. Zero out the inode table entry on disk first
+    push r12
+    push r13
+    lea rdi, [r15 + ext4_inode - kmain]
+    mov ecx, 128 / 8
+    xor eax, eax
+    rep stosq
+    mov eax, [rsp + 8 + 8 + 16]             ; original 1-based inode from saved RDI
+    call ext4_inode_save
+    pop r13
+    pop r12
+
+    ; 2. Re-read GDT into ext4_nbuf since ext4_inode_save overwrote it with its own block
+    mov eax, dword [r15 + ext4_gdtb - kmain]
+    lea rsi, [r15 + ext4_nbuf - kmain]
+    call ext4_blk_read
     jc .fi_err
 
     ; Increment free inodes in GDT descriptor for group r12d
@@ -1433,6 +1462,181 @@ ext4_mkdir:
     stc
     jmp .mkdir_pop
 
+; ================= create fast symlink =================
+; RSI = symlink path (ASCIIZ), RDX = target path string (ASCIIZ)
+; Out: RAX = new inode or -1 on error. CF=0 on success, 1 on error.
+ext4_symlink:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r12
+    push r13
+    push r14
+    push r15
+    sub rsp, 288                        ; [rsp]: basename buffer
+
+    mov r14, rsi                        ; r14 = symlink path
+    mov r12, rdx                        ; r12 = target string
+
+    ; 1. Check if symlink path already exists
+    mov rsi, r14
+    call ext4_lookup
+    test eax, eax
+    jnz .sym_err                        ; already exists!
+
+    ; 2. Calculate length of target string (must be <= 59 for fast symlink)
+    mov rsi, r12
+    xor ecx, ecx
+.sym_len_loop:
+    cmp byte [rsi + rcx], 0
+    je .sym_len_done
+    inc ecx
+    cmp ecx, 59
+    ja .sym_err                         ; target too long for fast symlink (> 59 bytes)
+    jmp .sym_len_loop
+.sym_len_done:
+    mov ebx, ecx                        ; ebx = target len
+
+    ; 3. Resolve parent directory inode and basename
+    mov rsi, r14
+    lea rdi, [rsp]
+    call ext4_resolve_parent
+    jc .sym_err
+    mov r8d, eax                        ; r8d = parent inode
+
+    ; 4. Allocate free inode
+    call ext4_alloc_inode
+    cmp eax, -1
+    je .sym_err
+    mov r13d, eax                       ; r13d = new symlink inode
+
+    ; 5. Initialize inode structure
+    lea rdi, [r15 + ext4_inode - kmain]
+    mov ecx, 128 / 8
+    xor eax, eax
+    rep stosq
+
+    ; S_IFLNK (0xA000) | 0777 = 0xA1FF
+    mov word  [r15 + ext4_inode - kmain + IN_OFF_MODE], 0xA1FF
+    mov dword [r15 + ext4_inode - kmain + IN_OFF_SIZE], ebx
+    mov word  [r15 + ext4_inode - kmain + 26], 1                  ; i_links_count = 1
+    mov dword [r15 + ext4_inode - kmain + IN_OFF_BLOCKS], 0       ; 0 blocks used
+    mov dword [r15 + ext4_inode - kmain + IN_OFF_FLAGS], 0        ; not extents!
+
+    ; Copy target string directly into i_block (starts at offset 40)
+    lea rdi, [r15 + ext4_inode - kmain + IN_OFF_BLOCK]
+    mov rsi, r12
+    mov ecx, ebx
+    rep movsb
+    mov byte [rdi], 0
+
+    ; 6. Save inode to disk
+    mov eax, r13d
+    call ext4_inode_save
+    jc .sym_err_free_ino
+
+    ; 7. Add directory entry to parent directory (type 7 = DT_LNK)
+    mov eax, r8d                        ; parent inode
+    mov edx, r13d                       ; child inode
+    lea rsi, [rsp]                      ; basename
+    mov cl, 7                           ; type 7 = symlink
+    call ext4_add_dir_entry
+    jc .sym_err_free_ino
+
+    call disk_flush_cache
+    mov rax, r13                        ; return inode
+    clc
+.sym_pop:
+    add rsp, 288
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+.sym_err_free_ino:
+    mov edi, r13d
+    call ext4_free_inode
+.sym_err:
+    mov rax, -1
+    stc
+    jmp .sym_pop
+
+; ================= read symlink target from inode =================
+; EAX = inode, RDI = user buffer, RSI = buffer capacity
+; Out: RAX = bytes read or -1 on error.
+ext4_readlink_inode:
+    push rbx
+    push rdi
+    push rsi
+    call ext4_inode_load
+    jc .rli_err
+
+    ; Check if symlink
+    movzx edx, word [r15 + ext4_inode - kmain + IN_OFF_MODE]
+    and edx, 0xF000
+    cmp edx, 0xA000
+    jne .rli_err
+
+    mov eax, dword [r15 + ext4_inode - kmain + IN_OFF_SIZE]
+    cmp rax, rsi                        ; capacity check
+    jbe @f
+    mov rax, rsi                        ; truncate to capacity
+@@:
+    mov ecx, eax                        ; count
+
+    ; If i_size <= 59, read from inline i_block (fast symlink)
+    cmp dword [r15 + ext4_inode - kmain + IN_OFF_SIZE], 59
+    ja .rli_long
+
+    lea rsi, [r15 + ext4_inode - kmain + IN_OFF_BLOCK]
+    rep movsb
+    jmp .rli_done
+
+.rli_long:
+    ; Long symlink: target path is stored in data block(s)
+    push rax                            ; save return byte count
+    push rcx                            ; save count
+    push rdi                            ; save dest buf
+    xor eax, eax                        ; logical block 0
+    call ext4_map
+    pop rdi
+    pop rcx
+    cmp rax, -1
+    je .rli_long_fail
+    ; Read block into ext4_wbuf
+    lea rsi, [r15 + ext4_wbuf - kmain]
+    call ext4_blk_read
+    jc .rli_long_fail
+    ; Copy ecx bytes from ext4_wbuf to dest rdi
+    lea rsi, [r15 + ext4_wbuf - kmain]
+    rep movsb
+    pop rax                             ; restore return byte count
+    jmp .rli_done
+
+.rli_long_fail:
+    pop rax
+    jmp .rli_err
+
+.rli_err:
+    mov rax, -1
+.rli_done:
+    pop rsi
+    pop rdi
+    pop rbx
+    ret
+
 ; ================= remove directory (rmdir) =================
 ; RSI = directory path (ASCIIZ)
 ; Out: RAX = 0 on success, -1 on error. CF=0 on success, 1 on error.
@@ -2108,7 +2312,8 @@ ext4_dir_find:
     mov ecx, [r15 + ext4_lbs - kmain]
     add ecx, 10
     shl rax, cl                             ; logical byte offset
-    cmp rax, qword [r15 + ext4_inode - kmain + IN_OFF_SIZE]
+    mov r10d, dword [r15 + ext4_inode - kmain + IN_OFF_SIZE]
+    cmp rax, r10
     jae .notfound
     mov eax, dword [r15 + e4t_lb - kmain]
     call ext4_map
@@ -2210,7 +2415,8 @@ ext4_read_dir:
     mov ecx, [r15 + ext4_lbs - kmain]
     add ecx, 10
     shl rax, cl                 ; logical byte offset of this block
-    cmp rax, qword [r15 + ext4_inode - kmain + IN_OFF_SIZE]
+    mov r10d, dword [r15 + ext4_inode - kmain + IN_OFF_SIZE]
+    cmp rax, r10
     jae .rd_done
 
     mov eax, dword [rsp + 8]    ; blk_idx
@@ -2265,8 +2471,12 @@ ext4_read_dir:
     mov rax, r14
     add rax, rdx
     cmp rax, r13
-    ja .rd_done                 ; buffer full, stop and return what we have
-
+    jbe @f
+    ; Buffer cannot fit this entry: if nothing written yet, return EINVAL (-2)
+    test r14, r14
+    jz .rd_einval
+    jmp .rd_done                 ; buffer full, stop and return what we have
+@@:
     ; Fill struct linux_dirent64 at [r12 + r14]:
     mov eax, [r11 + 0]          ; inode
     mov [r12 + r14 + 0], rax    ; d_ino (64-bit zero extended)
@@ -2276,7 +2486,14 @@ ext4_read_dir:
     mov [r12 + r14 + 8], rax    ; d_off
 
     mov [r12 + r14 + 16], dx    ; d_reclen (16-bit)
-    mov [r12 + r14 + 18], bpl   ; d_type (8-bit)
+
+    ; Translate ext4 file_type to Linux dirent64 d_type:
+    cmp ebp, 7
+    jbe .rd_type_ok
+    xor ebp, ebp
+.rd_type_ok:
+    movzx eax, byte [r15 + ext4_dtype_to_dirent - kmain + rbp]
+    mov [r12 + r14 + 18], al    ; d_type (8-bit)
 
     ; Copy name into d_name (starts at offset 19)
     push rcx
@@ -2313,6 +2530,16 @@ ext4_read_dir:
     pop rbx
     ret
 
+.rd_einval:
+    mov rax, -2                 ; -EINVAL
+    add rsp, 32
+    pop rbp
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
 .rd_err:
     mov rax, -1
     add rsp, 32
@@ -2323,16 +2550,47 @@ ext4_read_dir:
     pop rbx
     ret
 
-; ================= resolve path "/a/b/c" =================
+; ================= resolve path without following final symlink =================
+; RSI = ASCIIZ path -> RAX = inode or 0.
+; ================= resolve path at base directory inode =================
+; EAX = base dir inode (for relative paths), RSI = ASCIIZ path -> RAX = inode or 0.
+ext4_lookup_at_nofollow:
+    mov edx, 1                          ; nofollow = 1
+    jmp ext4_lookup_at_common
+
+ext4_lookup_at:
+    xor edx, edx                        ; nofollow = 0
+    jmp ext4_lookup_at_common
+
+; ================= resolve path without following final symlink =================
+; RSI = ASCIIZ path -> RAX = inode or 0.
+ext4_lookup_nofollow:
+    mov eax, [r15 + ext4_cwd_inode - kmain]
+    mov edx, 1                          ; nofollow = 1
+    jmp ext4_lookup_at_common
+
+; ================= resolve path "/a/b/c" following symlinks =================
 ; RSI = ASCIIZ path -> RAX = inode or 0. Path buffer is not modified.
 ext4_lookup:
+    mov eax, [r15 + ext4_cwd_inode - kmain]
+    xor edx, edx                        ; nofollow = 0
+    jmp ext4_lookup_at_common
+
+ext4_lookup_at_common:
     push rbx
     push rsi
     push rdi
-    mov ebx, [r15 + ext4_cwd_inode - kmain] ; default to cwd
+    push r12
+    push r13
+    push rax                            ; [rsp + 8] = base inode
+    push rdx                            ; [rsp + 0] = nofollow flag
+    mov r12, rdx                        ; r12 = nofollow flag
+    mov ebx, eax                        ; ebx = base inode default
+    mov r13d, eax                       ; r13d = parent directory inode (init to base)
     cmp byte [rsi], '/'
     jne .have_comp
-    mov ebx, 2                              ; absolute -> root inode
+    mov ebx, 2                          ; absolute -> root inode
+    mov r13d, 2
 .skip_slash:
     cmp byte [rsi], '/'
     jne .have_comp
@@ -2366,17 +2624,134 @@ ext4_lookup:
     jc .fail_pop
     lea rsi, [r15 + e4t_name - kmain]
     call ext4_dir_find
- 
-   test eax, eax
+
+    test eax, eax
     jz .fail_pop
+    mov r13d, ebx                           ; r13d = parent directory inode!
     mov ebx, eax                            ; new cur
     call ext4_inode_load
     jc .fail_pop
+
+    ; Check if this inode is a symlink (S_IFLNK = 0xA000)
+    movzx edx, word [r15 + ext4_inode - kmain + IN_OFF_MODE]
+    and edx, 0xF000
+    cmp edx, 0xA000
+    jne .not_symlink
+
+    ; Check if we should follow this symlink:
+    ; Always follow if more components follow in path (byte [rsi] != 0).
+    ; If this is the LAST component, follow only if r12 == 0 (follow mode).
+    mov rdx, [rsp]                           ; saved path pointer
+    cmp byte [rdx], 0
+    jne .do_follow
+    test r12, r12
+    jnz .not_symlink                         ; do not follow last component!
+
+.do_follow:
+    ; Symlink loop guard: max 40 symlink hops
+    cmp dword [r15 + ext4_lookup_depth - kmain], 40
+    jae .fail_pop                           ; too many symlink levels (ELOOP) -> fail lookup
+
+    inc dword [r15 + ext4_lookup_depth - kmain]
+
+    ; Check if target is fast symlink (i_size <= 59)
+    mov edx, dword [r15 + ext4_inode - kmain + IN_OFF_SIZE]
+    cmp edx, 59
+    ja .do_follow_long
+
+    ; Fast symlink: target is in i_block (starts at offset 40)
+    ; Allocate 64 bytes on stack to hold target path string
+    sub rsp, 64
+    push rdi
+    push rsi
+    push rcx
+    lea rsi, [r15 + ext4_inode - kmain + IN_OFF_BLOCK]
+    lea rdi, [rsp + 24]
+    mov ecx, edx
+    cmp ecx, 63
+    jbe @f
+    mov ecx, 63
+@@:
+    rep movsb
+    mov byte [rdi], 0                       ; null-terminate
+    pop rcx
+    pop rsi
+    pop rdi
+
+    ; Recursively resolve fast symlink target relative to parent directory (r13d)
+    lea rsi, [rsp]
+    mov eax, r13d
+    call ext4_lookup_at
+    add rsp, 64
+    dec dword [r15 + ext4_lookup_depth - kmain]
+    test eax, eax
+    jz .fail_pop
+    mov ebx, eax                            ; update current inode to resolved target
+    call ext4_inode_load                    ; load target inode
+    jc .fail_pop
+    jmp .not_symlink
+
+.do_follow_long:
+    ; Long symlink: target path is stored in data block
+    ; Allocate 256 bytes on stack to hold target path string
+    sub rsp, 256
+    push rsi                                ; save outer path pointer
+    push rdi
+    push rcx
+    xor eax, eax                            ; logical block 0
+    call ext4_map
+    cmp rax, -1
+    je .follow_long_fail
+    ; Read block into ext4_wbuf
+    lea rsi, [r15 + ext4_wbuf - kmain]
+    call ext4_blk_read
+    jc .follow_long_fail
+
+    ; Copy up to 255 bytes from ext4_wbuf to stack buffer [rsp + 24]
+    mov eax, dword [r15 + ext4_inode - kmain + IN_OFF_SIZE]
+    cmp eax, 254
+    jbe @f
+    mov eax, 254
+@@:
+    mov ecx, eax
+    lea rsi, [r15 + ext4_wbuf - kmain]
+    lea rdi, [rsp + 24]
+    rep movsb
+    mov byte [rdi], 0                       ; null-terminate
+
+    ; Recursively resolve long symlink target!
+    lea rsi, [rsp + 24]
+    mov eax, r13d                           ; parent directory inode
+    call ext4_lookup_at
+    pop rcx
+    pop rdi
+    pop rsi                                 ; restore outer path pointer
+    add rsp, 256
+    dec dword [r15 + ext4_lookup_depth - kmain]
+    test eax, eax
+    jz .fail_pop
+    mov ebx, eax                            ; update current inode to resolved target
+    call ext4_inode_load                    ; load target inode
+    jc .fail_pop
+    jmp .not_symlink
+
+.follow_long_fail:
+    pop rcx
+    pop rdi
+    pop rsi
+    add rsp, 256
+    dec dword [r15 + ext4_lookup_depth - kmain]
+    jmp .fail_pop
+
+.not_symlink:
     pop rsi                                 ; restore path pointer!
     jmp .skip_slash                         ; handles '/' and end-of-path
 .done:
     mov eax, ebx
 .pop3:
+    add rsp, 16                             ; discard rax (base inode) and rdx (nofollow flag)
+    pop r13
+    pop r12
     pop rdi
     pop rsi
     pop rbx
@@ -2406,7 +2781,8 @@ ext4_ls_print:                    ; loaded dir inode
     mov ecx, dword [r15 + ext4_lbs - kmain]
     add ecx, 10
     shl rax, cl
-    cmp rax, qword [r15 + ext4_inode - kmain + IN_OFF_SIZE]
+    mov r10d, dword [r15 + ext4_inode - kmain + IN_OFF_SIZE]
+    cmp rax, r10
     jae .lsdone
     mov eax, dword [r15 + e4t_lb - kmain]
     call ext4_map
@@ -2594,7 +2970,8 @@ ext4_read_file_chunk_inode:
     jne .rfc_err
 
     ; Step 4: get file size
-    mov rax, qword [r15 + ext4_inode - kmain + IN_OFF_SIZE]
+    mov eax, dword [r15 + ext4_inode - kmain + IN_OFF_SIZE]
+    mov dword [r15 + ext4_inode - kmain + IN_OFF_SIZE + 4], 0
 
     ; Check if offset >= file size (EOF)
     cmp r14, rax
@@ -2929,7 +3306,7 @@ ext4_stat_print:
     call puts
     mov eax, FB_CLR_NUMBER
     call fb_console_set_color
-    mov rax, qword [r15 + ext4_inode - kmain + IN_OFF_SIZE]
+    mov eax, dword [r15 + ext4_inode - kmain + IN_OFF_SIZE]
     call putdec64
     lea rsi, [r15 + str_stat_bytes - kmain]
     call puts
@@ -3058,8 +3435,14 @@ e4t_name    rb 256
 e4t_path    rb 256
 
 ext4_cwd_inode dd 2
+ext4_lookup_depth dd 0
 ext4_cwd_path  db "/", 0
                rb 62
+
+; ext4 file_type -> linux dirent64 d_type mapping:
+; ext4: 0=unknown, 1=REG, 2=DIR, 3=CHR, 4=BLK, 5=FIFO, 6=SOCK, 7=LNK
+; dirent64: 0=DT_UNKNOWN, 8=DT_REG, 4=DT_DIR, 2=DT_CHR, 6=DT_BLK, 1=DT_FIFO, 12=DT_SOCK, 10=DT_LNK
+ext4_dtype_to_dirent db 0, 8, 4, 2, 6, 1, 12, 10
 
 str_cd_notdir   db "cd: not a directory", 10, 0
 str_cd_notfound db "cd: no such file or directory", 10, 0

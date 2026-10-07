@@ -57,6 +57,7 @@ sys_kstack_top:
 
 str_sys_crash      db 10, "[Kernel] Ring 3 user task crashed. Terminating task.", 10, 0
 str_sys_nosys      db "[Syscall] Unimplemented syscall: 0x", 0
+str_pipe_read_dbg  db "[Syscall] read(fd>=3) -> ", 0
 
 ; ==============================================================================
 ; syscall_init: Enable System Call Extensions and configure MSRs
@@ -264,6 +265,21 @@ end if
 .do_read:
     ; RDI = fd, RSI = buffer, RDX = count
     call vfs_read_fd
+    push rax
+    cmp edi, 3
+    jb @f
+    push rdi
+    push rsi
+    lea rsi, [r15 + str_pipe_read_dbg - kmain]
+    call puts
+    mov rax, [rsp + 16]                 ; result
+    call putdec64
+    mov al, 10
+    call putc
+    pop rsi
+    pop rdi
+@@:
+    pop rax
     jmp .syscall_ret
 
 .do_open:
@@ -789,7 +805,7 @@ sys_handler_listdir:
     call ext4_inode_load
     jc .ld_err
 
-    mov r12, qword [r15 + ext4_inode - kmain + IN_OFF_SIZE] ; dir size
+    mov r12d, dword [r15 + ext4_inode - kmain + IN_OFF_SIZE] ; dir size
     xor ebp, ebp                      ; ebp = entries count returned
     mov dword [r15 + e4t_lb - kmain], 0
 
@@ -867,7 +883,7 @@ sys_handler_listdir:
     push r9
     call ext4_inode_load
     jc .ld_sz_zero
-    mov rax, qword [r15 + ext4_inode - kmain + IN_OFF_SIZE]
+    mov eax, dword [r15 + ext4_inode - kmain + IN_OFF_SIZE]
     mov [r14 + 8], rax
     jmp .ld_sz_ok
 .ld_sz_zero:

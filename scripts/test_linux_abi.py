@@ -45,9 +45,9 @@ def run():
                     send(f'sendkey {ch}')
             send('sendkey ret')
 
-        print("Sending 'debian_hello'...")
-        send_text('debian_hello')
-        time.sleep(6)
+        print("Sending 'linux_test.elf'...")
+        send_text('linux_test.elf')
+        time.sleep(10)
 
         send('screendump build/linux_test_result.ppm')
         time.sleep(1)

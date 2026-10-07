@@ -64,6 +64,7 @@ str_elf_abi_log       db "[ELF] ABI detect -> ", 0
 str_elf_interp_log    db "[ELF] PT_INTERP interpreter: '", 0
 str_elf_quote_nl      db "'", 10, 0
 str_elf_nl            db 10, 0
+str_elf_arg_log       db "[ELF_ARG] ", 0
 
 align 8
 elf_has_interp        dq 0
@@ -127,7 +128,14 @@ elf_load_from_ext4:
     mov eax, ELF_ERR_NOT_FOUND
     lea rsi, [r15 + str_elf_err_fnf - kmain]
     call puts
+    lea rsi, [r15 + .str_fnf_path - kmain]
+    call puts
+    mov rsi, r14
+    call puts
+    mov al, 10
+    call putc
     jmp .elff_ret
+.str_fnf_path: db "[ELF] Requested path: ", 0
 @@:
 
     ; 3. Load inode details
@@ -150,8 +158,18 @@ elf_load_from_ext4:
     jmp .elff_ret
 @@:
 
-    ; 5. Verify file size
-    mov rax, qword [r15 + ext4_inode - kmain + IN_OFF_SIZE]
+    ; 5. Verify file size (i_size_lo is 32-bit dword at offset 4)
+    mov eax, dword [r15 + ext4_inode - kmain + IN_OFF_SIZE]
+    push rax
+    lea rsi, [r15 + .str_dbg_sz - kmain]
+    call puts
+    pop rax
+    push rax
+    call puthex64
+    mov al, 10
+    call putc
+    pop rax
+
     cmp rax, 64                       ; sizeof(Elf64_Ehdr)
     jae @f
     mov eax, ELF_ERR_TOO_SMALL
@@ -163,6 +181,7 @@ elf_load_from_ext4:
     jbe @f
     mov eax, ELF_ERR_TOO_SMALL
     jmp .elff_ret
+.str_dbg_sz: db "[ELF_DBG] inode.i_size=", 0
 @@:
     mov r12, rax                      ; r12 = file size
 
@@ -600,7 +619,7 @@ elf_load_exec:
     cmp qword [r15 + sys_spawn_exec_mode - kmain], 0
     jne @f
     mov rdi, r9
-    mov rsi, 128
+    mov rsi, 8
     call sys_validate_user_ptr
     jmp .argv_arr_checked
 @@: clc
@@ -632,8 +651,8 @@ elf_load_exec:
     clc
     jmp .str_checked
 .str_validate:
-    mov rdi, rsi                      ; called with rsi = length, which would
-    mov rsi, 128                      ; otherwise leave the copy reading [128]
+    mov rdi, rsi
+    mov rsi, 1
     call sys_validate_user_ptr
 .str_checked:
     pop rsi
@@ -651,6 +670,31 @@ elf_load_exec:
 
     ; Store virtual address in argv[rcx] table
     mov [r10 + 0x1FFE00 + 8 + rcx*8], r13
+
+    push rsi
+    push r12
+    push r13
+    push rcx
+    lea rsi, [r15 + str_elf_arg_log - kmain]
+    call puts
+    pop rcx
+    push rcx
+    mov rax, rcx
+    call putdec64
+    mov al, '='
+    call putc
+    mov al, 39
+    call putc
+    mov rsi, [rsp + 24]                 ; original rsi
+    call puts
+    mov al, 39
+    call putc
+    mov al, 10
+    call putc
+    pop rcx
+    pop r13
+    pop r12
+    pop rsi
 
     ; Copy string characters
     mov edx, 127                       ; max 127 bytes per arg
@@ -1055,7 +1099,7 @@ elf_load_interp:
     call ext4_inode_load
     jc .li_fail
 
-    mov r12, qword [r15 + ext4_inode - kmain + IN_OFF_SIZE]
+    mov r12d, dword [r15 + ext4_inode - kmain + IN_OFF_SIZE]
     cmp r12, 64
     jb .li_fail
 

@@ -94,6 +94,16 @@ vfs_get_fd_ptr:
 
     push rdx
     mov eax, [r15 + sched_curr_task - kmain]
+    imul eax, eax, TCB_SIZE
+    lea rax, [r15 + task_table - kmain + rax]
+    cmp dword [rax + TCB_IS_THREAD], 1
+    jne @f
+    mov eax, [rax + TCB_TGID]
+    dec eax                     ; leader slot = TGID - 1
+    jmp .vg_slot
+@@:
+    mov eax, [r15 + sched_curr_task - kmain]
+.vg_slot:
     imul eax, eax, (MAX_FDS_PER_TASK * FD_ENTRY_SIZE)
     imul edx, edi, FD_ENTRY_SIZE
     add eax, edx
@@ -269,7 +279,7 @@ vfs_open:
     call ext4_inode_load
     jc .open_fail
 
-    mov rax, qword [r15 + ext4_inode - kmain + IN_OFF_SIZE]
+    mov eax, dword [r15 + ext4_inode - kmain + IN_OFF_SIZE]
     mov dword [r14 + 8], eax            ; file size
 
     ; Check O_TRUNC (0x200): truncate file to 0 on disk

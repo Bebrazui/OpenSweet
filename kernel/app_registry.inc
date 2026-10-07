@@ -479,7 +479,7 @@ app_reg_install_by_path:
     jc .inst_fail
 
     ; 5. Verify file size >= 8000 bytes (header + icon)
-    mov rax, qword [r15 + ext4_inode - kmain + IN_OFF_SIZE]
+    mov eax, dword [r15 + ext4_inode - kmain + IN_OFF_SIZE]
     cmp rax, 8000
     jb .inst_fail
     cmp rax, 16*1024*1024             ; max 16MB

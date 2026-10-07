@@ -107,7 +107,28 @@ kmain:
     call kheap_init
     call fb_console_init
     call ata_init
+    lea rsi, [r15 + .str_ata_log - kmain]
+    call puts
+    movzx eax, byte [r15 + ata_drv - kmain]
+    call puthex8
+    mov al, ' '
+    call putc
+    mov rax, [r15 + ata_sectors - kmain]
+    call puthex64
+    mov al, 10
+    call putc
+
     call ext4_mount
+    lea rsi, [r15 + .str_ext4_log - kmain]
+    call puts
+    movzx eax, byte [r15 + ext4_ok - kmain]
+    call puthex8
+    mov al, 10
+    call putc
+    jmp .after_boot_dbg
+.str_ata_log: db "[BOOT] ata_drv=", 0
+.str_ext4_log: db "[BOOT] ext4_ok=", 0
+.after_boot_dbg:
 
     ; --- CPU vendor via CPUID ---
     xor eax, eax
@@ -166,7 +187,15 @@ kmain:
     ; Launch Native C Terminal in Ring 3 as the default desktop shell
     lea rsi, [r15 + str_reg_term_path - kmain]
     call elf_load_from_ext4
+    push rax
+    lea rsi, [r15 + .str_elf_boot_res - kmain]
+    call puts
+    pop rax
+    call putdec64
+    mov al, 10
+    call putc
     jmp .shell
+.str_elf_boot_res: db "[BOOT] elf_load_from_ext4 returned: ", 0
 
 .shell:
     call md_handle_mouse
