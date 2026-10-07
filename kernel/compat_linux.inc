@@ -1177,7 +1177,7 @@ linux_syscall_dispatch:
     jz .l_wv_next
     push rsi
     push rdx
-    call sys_handler_write
+    call vfs_write_fd
     pop rdx
     pop rsi
     js .l_wv_err

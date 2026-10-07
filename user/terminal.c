@@ -742,7 +742,7 @@ static void execute_command(const char *cmd) {
         }
 
         const char *exe_name = argv[0];
-        char exec_path[64];
+        char exec_path[128];
         int pfd[2] = { -1, -1 };
         int spawned = -1;
 
@@ -758,7 +758,7 @@ static void execute_command(const char *cmd) {
                 spawned = os_spawn_args(exec_path, (const char *const*)argv);
             }
         } else {
-            /* Try "/<name>.elf" */
+            /* 1. Try "/<name>.elf" */
             os_strcpy(exec_path, "/");
             os_strcpy(exec_path + os_strlen(exec_path), exe_name);
             os_strcpy(exec_path + os_strlen(exec_path), ".elf");
@@ -768,8 +768,28 @@ static void execute_command(const char *cmd) {
                 spawned = os_spawn_args(exec_path, (const char *const*)argv);
             }
             if (spawned < 0) {
-                /* Try "/<name>" */
+                /* 2. Try "/<name>" */
                 os_strcpy(exec_path, "/");
+                os_strcpy(exec_path + os_strlen(exec_path), exe_name);
+                if (pfd[1] >= 0) {
+                    spawned = os_spawn_stdio(exec_path, (const char *const*)argv, -1, pfd[1], pfd[1]);
+                } else {
+                    spawned = os_spawn_args(exec_path, (const char *const*)argv);
+                }
+            }
+            if (spawned < 0) {
+                /* 3. Try "/bin/<name>" */
+                os_strcpy(exec_path, "/bin/");
+                os_strcpy(exec_path + os_strlen(exec_path), exe_name);
+                if (pfd[1] >= 0) {
+                    spawned = os_spawn_stdio(exec_path, (const char *const*)argv, -1, pfd[1], pfd[1]);
+                } else {
+                    spawned = os_spawn_args(exec_path, (const char *const*)argv);
+                }
+            }
+            if (spawned < 0) {
+                /* 4. Try "/usr/bin/<name>" */
+                os_strcpy(exec_path, "/usr/bin/");
                 os_strcpy(exec_path + os_strlen(exec_path), exe_name);
                 if (pfd[1] >= 0) {
                     spawned = os_spawn_stdio(exec_path, (const char *const*)argv, -1, pfd[1], pfd[1]);

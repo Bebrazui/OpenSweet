@@ -83,22 +83,36 @@
   - [x] Управление правами и группами: `umask`, `setuid`, `setgid`, `setreuid`, `setregid`, `setresuid`, `getresuid`, `setresgid`, `getresgid`, `getgroups`, `setgroups`, `chroot`
   - [x] Сессии и PGID: `setpgid`, `getpgrp`, `setsid`, `getpgid`, `getsid`
 
+### Этап 4: FHS, дерево каталогов и базовый набор утилит Linux [ВЫПОЛНЕНО 100%]
+1. **Каталоги и FHS в ext4 (`make-ext4.ps1`)**:
+   - Создан каталог `/bin` (Inode 28).
+   - В `/bin` развернуты утилиты: `echo`, `sh`, `ls`, `cat`, `tar`, `dpkg`, `busybox`.
+   - Созданы корневые симлинки стандарта Linux: `/usr -> .`, `/lib -> .`, `/lib64 -> .`.
+2. **Поддержка $PATH в Terminal (`user/terminal.c`)**:
+   - Команды ищутся последовательно: `/<cmd>.elf` -> `/<cmd>` -> `/bin/<cmd>` -> `/usr/bin/<cmd>`.
+   - Команды `echo`, `cat`, `ls`, `busybox` работают как с префиксом `/bin/`, так и напрямую по имени.
+3. **Исправление векторного вывода `writev` (Syscall #20)**:
+   - `.l_writev` перенаправлен в `vfs_write_fd`, благодаря чему вывод glibc/coreutils через pipe попадает прямо в окно терминала.
+   - Проверена и работает цветная раскраска ANSI для файлов, папок и бинарников (`ls /`).
+4. **Официальный пакетный менеджер и архивы**:
+   - В образ ext4 добавлен тестовый пакет `test.deb` (Inode 32).
+
 ---
 
 ## Текущая задача в процессе (где остановились)
-- Подготовка полноценного каталога `/bin` в образе `disk.img` (через `make-ext4.ps1`) или symlink на `busybox`/Debian `echo`, чтобы команды вида `/bin/echo` и утилиты coreutils запускались напрямую из терминала OpenSweet.
+- Реализация утилиты распаковки и установки `.deb` (`/bin/dpkg-deb` / `undeb`), извлекающей `data.tar.*` в дерево ext4.
+- Переход к реализации X11-стека (UNIX-сокеты `/tmp/.X11-unix/X0` + обработчик X11-протокола) для полноценных GUI-приложений Debian (GTK / Qt).
 
 ---
 
-### Этап 4: Сетевой стек и события (для утилит типа curl, apt, wget)
-1. `socket`, `connect`, `bind`, `listen`, `accept`, `sendto`, `recvfrom`
-2. `epoll_create1`, `epoll_ctl`, `epoll_wait` (цикл событий glibc)
-3. Интеграция с драйвером сетевой карты (E1000)
+### Этап 5: Распаковка и запуск реальных .deb пакетов
+1. Утилита `dpkg-deb -x <pkg.deb> <target_dir>` (распаковка `ar` + `tar.xz`/`tar.gz`).
+2. Установка реальных бинарников из Debian репозитория (`nano`, `coreutils`) в `/usr/bin`.
 
-### Этап 5: Распаковка и установка .deb
-1. `dpkg-deb` / `ar` + `tar.xz` (через busybox или утилиту)
-2. Извлечение `data.tar.xz` в корень VFS ext4
-3. Запуск бинарников из `/usr/bin/`
+### Этап 6: Полноценные графические приложения Debian (X11 / GTK / Qt)
+1. UNIX Domain Sockets (`AF_UNIX` `/tmp/.X11-unix/X0`).
+2. X11 протокол и интеграция с композитором OpenSweet (Acrylic R2D Window Manager).
+3. Разделяемая память MIT-SHM (`shmget` / `shmat`).
 
 ---
 

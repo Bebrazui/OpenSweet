@@ -76,6 +76,17 @@ function ExtentLeaf([long]$inoOff, [long]$fsBlock, [int]$len, [int]$size, [int]$
     PutU32 ($ext + 20) $fsBlock             # ee_start_lo
 }
 
+function FastSymlink([long]$inoOff, [string]$target) {
+    [Array]::Clear($img, $inoOff, 128)
+    $tb = [Text.Encoding]::ASCII.GetBytes($target)
+    PutU16 $inoOff 0xA1FF                 # i_mode = S_IFLNK | 0777
+    PutU32 ($inoOff + 4) $tb.Length       # i_size_lo
+    PutU16 ($inoOff + 26) 1               # i_links_count = 1
+    PutU32 ($inoOff + 28) 0               # i_blocks_lo = 0
+    PutU32 ($inoOff + 32) 0               # i_flags = 0 (no extents)
+    Put ($inoOff + 40) $tb                # i_block contains target string
+}
+
 $itable = 10 * $BS
 # inode 2 = root dir -> block 20
 ExtentLeaf ($itable + 1 * 128) 20 1 1024 0x41ED
@@ -307,6 +318,27 @@ if ($hasLibc) {
     ExtentLeaf ($itable + 26 * 128) $libcStartBlock $libcBlocks $libcBytes.Length 0x81ED
 }
 
+$binStartBlock = if ($hasLibc) { $libcStartBlock + $libcBlocks } elseif ($hasLd) { $ldStartBlock + $ldBlocks } else { 26 }
+# inode 28 = /bin directory
+ExtentLeaf ($itable + 27 * 128) $binStartBlock 1 1024 0x41ED
+# inode 29 = usr symlink -> .
+FastSymlink ($itable + 28 * 128) '.'
+# inode 30 = lib symlink -> .
+FastSymlink ($itable + 29 * 128) '.'
+# inode 31 = lib64 symlink -> .
+FastSymlink ($itable + 30 * 128) '.'
+
+$debPkgPath = Join-Path $PSScriptRoot "build\test.deb"
+$hasDebPkg = Test-Path $debPkgPath
+$debPkgBlocks = 0
+$debPkgStartBlock = $binStartBlock + 1
+if ($hasDebPkg) {
+    $debPkgBytes = [IO.File]::ReadAllBytes($debPkgPath)
+    $debPkgBlocks = [int][Math]::Ceiling($debPkgBytes.Length / 1024.0)
+    # inode 32 = test.deb
+    ExtentLeaf ($itable + 31 * 128) $debPkgStartBlock $debPkgBlocks $debPkgBytes.Length 0x81A4
+}
+
 
 $wadPath = Join-Path $PSScriptRoot "user\doomgeneric\doom1.wad"
 $hasWad = $includeDoom -and (Test-Path $wadPath)
@@ -395,9 +427,22 @@ if ($hasLd) {
     $curOff += 32
 }
 if ($hasLibc) {
-    $rec = if ($hasWad) { 20 } else { $d + 1024 - $curOff }
-    DirEntry $curOff 27 'libc.so.6' 1 $rec
+    $rec = if ($hasWad) { 20 } else { 20 }
+    DirEntry $curOff 27 'libc.so.6' 1 20
     $curOff += 20
+}
+DirEntry $curOff 28 'bin' 2 16
+$curOff += 16
+DirEntry $curOff 29 'usr' 7 16
+$curOff += 16
+DirEntry $curOff 30 'lib' 7 16
+$curOff += 16
+DirEntry $curOff 31 'lib64' 7 16
+$curOff += 16
+if ($hasDebPkg) {
+    $rec = if ($hasWad) { 16 } else { $d + 1024 - $curOff }
+    DirEntry $curOff 32 'test.deb' 1 $rec
+    $curOff += 16
 }
 if ($hasWad) {
     DirEntry $curOff 20 'doom1.wad' 1 ($d + 1024 - $curOff)
@@ -466,31 +511,35 @@ if ($hasLibc) {
     Put ($libcStartBlock * $BS) $libcBytes
     echo "Added libc.so.6 ($($libcBytes.Length) bytes, $libcBlocks blocks) to disk image"
 }
+
+# ---- /bin dir data @ block $binStartBlock ----
+$bOff = $binStartBlock * $BS
+[Array]::Clear($img, $bOff, $BS)
+DirEntry $bOff        28 '.'       2 12
+DirEntry ($bOff + 12) 2  '..'      2 12
+DirEntry ($bOff + 24) 23 'echo'     1 16
+DirEntry ($bOff + 40) 23 'sh'       1 16
+DirEntry ($bOff + 56) 23 'ls'       1 16
+DirEntry ($bOff + 72) 23 'cat'      1 16
+DirEntry ($bOff + 88) 23 'ar'       1 16
+DirEntry ($bOff + 104) 23 'tar'     1 16
+DirEntry ($bOff + 120) 23 'dpkg'    1 16
+DirEntry ($bOff + 136) 23 'dpkg-deb' 1 20
+DirEntry ($bOff + 156) 23 'busybox' 1 ($BS - 156)
+echo "Added /bin directory (echo, sh, ls, cat, ar, tar, dpkg, dpkg-deb, busybox) and /usr, /lib, /lib64 symlinks to disk image"
+
+if ($hasDebPkg) {
+    Put ($debPkgStartBlock * $BS) $debPkgBytes
+    echo "Added test.deb ($($debPkgBytes.Length) bytes, $debPkgBlocks blocks) to disk image"
+}
+
 if ($hasWad) {
     Put ($wadStartBlock * $BS) $wadBytes
     echo "Added doom1.wad ($($wadBytes.Length) bytes, $wadBlocks blocks) to disk image"
 }
 
 # ---- populate block and inode bitmaps and free counts ----
-$totalAllocatedBlocksGrp0 = if ($hasLibc) {
-    $libcStartBlock + $libcBlocks
-} elseif ($hasLd) {
-    $ldStartBlock + $ldBlocks
-} elseif ($hasDebThread) {
-    $debThreadStartBlock + $debThreadBlocks
-} elseif ($hasDebHello) {
-    $debHelloStartBlock + $debHelloBlocks
-} elseif ($hasDoom) {
-    $doomStartBlock + $doomBlocks
-} elseif ($hasBusybox) {
-    $busyboxStartBlock + $busyboxBlocks
-} elseif ($hasLinuxTest) {
-    $linuxTestStartBlock + $linuxTestBlocks
-} elseif ($hasFiles) {
-    $filesStartBlock + $filesBlocks
-} else {
-    26
-}
+$totalAllocatedBlocksGrp0 = if ($hasDebPkg) { $debPkgStartBlock + $debPkgBlocks } else { $binStartBlock + 1 }
 
 # Block bitmap at block 3:
 # In Group 0 with 1KB block size, first_data_block = 1.
@@ -524,7 +573,7 @@ $img[(4 * $BS) + 0] = 0xFF
 # Inodes 9..10 (bits 0,1 of byte 1 = 3)
 $img[(4 * $BS) + 1] = 0x03
 $usedInoCountGrp0 = 10
-$lastIno = 27
+$lastIno = if ($hasDebPkg) { 32 } else { 31 }
 for ($ino = 11; $ino -le $lastIno; $ino++) {
     $bit = $ino - 1
     $byteIdx = $bit -shr 3

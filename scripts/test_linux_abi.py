@@ -45,8 +45,8 @@ def run():
                     send(f'sendkey {ch}')
             send('sendkey ret')
 
-        print("Sending 'linux_test.elf'...")
-        send_text('linux_test.elf')
+        print("Sending 'busybox'...")
+        send_text('busybox')
         time.sleep(10)
 
         send('screendump build/linux_test_result.ppm')
