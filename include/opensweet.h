@@ -69,6 +69,16 @@ typedef _Bool bool;
 #define SYS_MKDIR          33
 #define SYS_RMDIR          34
 #define SYS_SYMLINK        35
+#define SYS_NET_INFO       36
+
+typedef struct {
+    uint8_t  present;
+    uint8_t  mac[6];
+    uint8_t  ip[4];
+    uint16_t io_base;
+    uint8_t  irq;
+    uint16_t reserved;
+} __attribute__((packed)) os_net_info_t;
 
 #define WNOHANG            1
 #define WIFEXITED(s)       (((s) & 0x7f) == 0)
@@ -292,6 +302,11 @@ typedef struct {
 static inline int os_get_sysinfo(os_sysinfo_t *info) {
     if (!info) return -1;
     return (int)os_syscall1(SYS_SYSINFO, (int64_t)info);
+}
+
+static inline int os_get_netinfo(os_net_info_t *info) {
+    if (!info) return -1;
+    return (int)os_syscall1(SYS_NET_INFO, (int64_t)info);
 }
 
 

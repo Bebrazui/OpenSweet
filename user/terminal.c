@@ -256,8 +256,57 @@ static void execute_command(const char *cmd) {
         term_print_line("  notepad       Launch Desktop Notepad (Ring 3)", OS_COLOR_SLATE_300);
         term_print_line("  files         Launch File Explorer (Ring 3)", OS_COLOR_SLATE_300);
         term_print_line("  doom          Launch DOOM (Shareware) (Ring 3)", OS_COLOR_SLATE_300);
+        term_print_line("  ifconfig / ip Show network interface and IP/MAC info", OS_COLOR_SLATE_300);
         term_print_line("  version       Show kernel architecture and build", OS_COLOR_SLATE_300);
         term_print_line("  exit          Close terminal window", OS_COLOR_SLATE_300);
+    } else if (os_strcmp(cmd, "ifconfig") == 0 || os_strcmp(cmd, "net") == 0 || os_strcmp(cmd, "ip") == 0) {
+        os_net_info_t net;
+        if (os_get_netinfo(&net) < 0 || !net.present) {
+            term_print_line("No network interface active.", OS_COLOR_ROSE);
+        } else {
+            term_print_line("eth0: flags=4163<UP,BROADCAST,RUNNING,MULTICAST> mtu 1500", OS_COLOR_CYAN_NEON);
+            char ip_line[80];
+            char p0[8], p1[8], p2[8], p3[8];
+            os_itoa(net.ip[0], p0); os_itoa(net.ip[1], p1);
+            os_itoa(net.ip[2], p2); os_itoa(net.ip[3], p3);
+            os_strcpy(ip_line, "      inet ");
+            os_strcpy(ip_line + os_strlen(ip_line), p0); os_strcpy(ip_line + os_strlen(ip_line), ".");
+            os_strcpy(ip_line + os_strlen(ip_line), p1); os_strcpy(ip_line + os_strlen(ip_line), ".");
+            os_strcpy(ip_line + os_strlen(ip_line), p2); os_strcpy(ip_line + os_strlen(ip_line), ".");
+            os_strcpy(ip_line + os_strlen(ip_line), p3);
+            os_strcpy(ip_line + os_strlen(ip_line), "  netmask 255.255.255.0  broadcast 10.0.2.255");
+            term_print_line(ip_line, OS_COLOR_EMERALD_LT);
+
+            char mac_line[96];
+            char hex_chars[] = "0123456789abcdef";
+            char mac_str[18];
+            int mi = 0;
+            for (int i = 0; i < 6; i++) {
+                mac_str[mi++] = hex_chars[(net.mac[i] >> 4) & 0x0F];
+                mac_str[mi++] = hex_chars[net.mac[i] & 0x0F];
+                if (i < 5) mac_str[mi++] = ':';
+            }
+            mac_str[mi] = '\0';
+            os_strcpy(mac_line, "      ether ");
+            os_strcpy(mac_line + os_strlen(mac_line), mac_str);
+            os_strcpy(mac_line + os_strlen(mac_line), " (Realtek RTL8139 Fast Ethernet)");
+            term_print_line(mac_line, OS_COLOR_SLATE_200);
+
+            char io_line[64];
+            char io_str[8];
+            io_str[0] = hex_chars[(net.io_base >> 12) & 0x0F];
+            io_str[1] = hex_chars[(net.io_base >> 8) & 0x0F];
+            io_str[2] = hex_chars[(net.io_base >> 4) & 0x0F];
+            io_str[3] = hex_chars[net.io_base & 0x0F];
+            io_str[4] = '\0';
+            os_strcpy(io_line, "      device io 0x");
+            os_strcpy(io_line + os_strlen(io_line), io_str);
+            os_strcpy(io_line + os_strlen(io_line), "  irq ");
+            char irq_str[8];
+            os_itoa(net.irq, irq_str);
+            os_strcpy(io_line + os_strlen(io_line), irq_str);
+            term_print_line(io_line, OS_COLOR_SLATE_400);
+        }
     } else if (os_strcmp(cmd, "fetch") == 0 || os_strcmp(cmd, "sweetfetch") == 0 || os_strcmp(cmd, "neofetch") == 0) {
         print_fetch();
     } else if (os_strcmp(cmd, "clear") == 0 || os_strcmp(cmd, "cls") == 0) {

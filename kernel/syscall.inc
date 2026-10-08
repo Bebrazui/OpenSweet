@@ -35,6 +35,7 @@ SYS_SPAWN_STDIO    = 32
 SYS_MKDIR          = 33
 SYS_RMDIR          = 34
 SYS_SYMLINK        = 35
+SYS_NET_INFO       = 36
 
 align 16
 sys_user_rsp       dq 0
@@ -229,6 +230,8 @@ end if
     je .do_rmdir
     cmp eax, SYS_SYMLINK
     je .do_symlink
+    cmp eax, SYS_NET_INFO
+    je .do_net_info
 
 if defined CONFIG_LINUX_COMPAT
     ; Fallback to Linux ABI for undeclared syscall numbers (marked distinctly
@@ -441,6 +444,29 @@ end if
     cli
     call sys_handler_symlink
     popfq
+    jmp .syscall_ret
+
+.do_net_info:
+    ; RDI = user pointer to os_net_info_t (16 bytes)
+    test rdi, rdi
+    jz .do_net_info_err
+    mov al, [r15 + rtl_present - kmain]
+    mov [rdi + 0], al                   ; present
+    mov eax, dword [r15 + rtl_mac - kmain]
+    mov [rdi + 1], eax
+    mov ax, word [r15 + rtl_mac + 4 - kmain]
+    mov [rdi + 5], ax
+    mov eax, dword [r15 + net_ip - kmain]
+    mov [rdi + 7], eax
+    mov ax, word [r15 + rtl_io_base - kmain]
+    mov [rdi + 11], ax
+    mov al, [r15 + rtl_irq - kmain]
+    mov [rdi + 13], al
+    mov word [rdi + 14], 0
+    xor eax, eax                        ; return 0 (success)
+    jmp .syscall_ret
+.do_net_info_err:
+    mov rax, -1
     jmp .syscall_ret
 
 .do_get_time:

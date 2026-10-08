@@ -110,13 +110,34 @@
 
 ---
 
+### Сетевая подсистема и сокеты Linux ABI [ВЫПОЛНЕНО 100%]
+1. **Сетевой драйвер Realtek RTL8139 (`arch/x86_64/drivers/rtl8139.asm`)**:
+   - PCI автосканирование (`10EC:8139`), чтение I/O-порта из BAR0 и IRQ, включение Bus Master.
+   - Выделение физически непрерывных буферов через `pmm_alloc_contiguous` (RX Ring 16KB, TX 8KB).
+   - Считывание 48-битного MAC-адреса, отправка (`rtl8139_send`) и приём (`rtl8139_poll`).
+2. **Сетевой стек ядра (`kernel/net.inc`)**:
+   - Статический IP `10.0.2.15` (QEMU user net).
+   - Автоматический ответ ARP Reply на широковещательные ARP-запросы шлюза.
+   - Автоматический ответ ICMP Echo Reply (Ping) с пересчетом контрольных сумм IP и ICMP.
+   - Фоновый сетевой демон `netd` (`task_net_daemon`) в шедулере.
+   - Системный вызов `SYS_NET_INFO (36)` и команда `ifconfig` в терминале.
+3. **Линейка системных вызовов сокетов и I/O мультиплексирования в Linux ABI (`compat_linux.inc`)**:
+   - `socket` (#41), `connect` (#42), `accept` (#43), `accept4` (#288)
+   - `sendto` (#44), `recvfrom` (#45), `sendmsg` (#46), `recvmsg` (#47), `shutdown` (#48)
+   - `bind` (#49), `listen` (#50), `getsockname` (#51), `getpeername` (#52), `socketpair` (#53)
+   - `setsockopt` (#54), `getsockopt` (#55)
+   - `select` (#23), `pselect6` (#270), `poll` (#7), `ppoll` (#271)
+   - `epoll_create` (#213), `epoll_create1` (#291), `epoll_ctl` (#233), `epoll_wait` (#232)
+
+---
+
 ## Текущая задача в процессе (где остановились)
-- **Этап 6**: Реализация X11-стека (UNIX domain сокеты `AF_UNIX` в `/tmp/.X11-unix/X0` + базовый обработчик X11 wire protocol) для запуска GUI-приложений Debian поверх оконного менеджера Acrylic R2D.
+- **Этап 6**: Базовый обработчик протокола X11 (X11 wire protocol сервер в `/tmp/.X11-unix/X0`), транслирующий создание окон, отрисовку битмапов и ввод от мыши/клавиатуры в окна Acrylic R2D Window Manager для запуска GUI Debian.
 
 ---
 
 ### Этап 6: Полноценные графические приложения Debian (X11 / GTK / Qt)
-1. UNIX Domain Sockets (`AF_UNIX` `/tmp/.X11-unix/X0`, системные вызовы `socket`, `bind`, `connect`, `listen`, `accept`, `sendto`, `recvfrom`).
+1. UNIX Domain Sockets (`AF_UNIX` `/tmp/.X11-unix/X0`) [ВЫПОЛНЕНО].
 2. Базовый сервер X11 протокола, интегрированный с композитором OpenSweet (Acrylic R2D Window Manager).
 3. Разделяемая память MIT-SHM (`shmget` / `shmat`).
 

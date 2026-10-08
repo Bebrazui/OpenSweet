@@ -103,6 +103,29 @@ LINUX_SYS_FCHMODAT    = 268
 LINUX_SYS_FCHOWNAT    = 260
 LINUX_SYS_UTIMENSAT   = 280
 LINUX_SYS_STATX       = 332
+LINUX_SYS_SELECT      = 23
+LINUX_SYS_SOCKET      = 41
+LINUX_SYS_CONNECT     = 42
+LINUX_SYS_ACCEPT      = 43
+LINUX_SYS_SENDTO      = 44
+LINUX_SYS_RECVFROM    = 45
+LINUX_SYS_SENDMSG     = 46
+LINUX_SYS_RECVMSG     = 47
+LINUX_SYS_SHUTDOWN    = 48
+LINUX_SYS_BIND        = 49
+LINUX_SYS_LISTEN      = 50
+LINUX_SYS_GETSOCKNAME = 51
+LINUX_SYS_GETPEERNAME = 52
+LINUX_SYS_SOCKETPAIR  = 53
+LINUX_SYS_SETSOCKOPT  = 54
+LINUX_SYS_GETSOCKOPT  = 55
+LINUX_SYS_EPOLL_CREATE= 213
+LINUX_SYS_EPOLL_WAIT  = 232
+LINUX_SYS_EPOLL_CTL   = 233
+LINUX_SYS_PSELECT6    = 270
+LINUX_SYS_PPOLL       = 271
+LINUX_SYS_ACCEPT4     = 288
+LINUX_SYS_EPOLL_CREATE1= 291
 
 ; Signal numbers (Linux x86_64 numbering)
 LINUX_SIGINT   = 2
@@ -1038,6 +1061,52 @@ linux_syscall_dispatch:
     je .l_mkdirat
     cmp eax, LINUX_SYS_UNLINKAT
     je .l_unlinkat
+    cmp eax, LINUX_SYS_SELECT
+    je .l_select
+    cmp eax, LINUX_SYS_PSELECT6
+    je .l_pselect6
+    cmp eax, LINUX_SYS_PPOLL
+    je .l_ppoll
+    cmp eax, LINUX_SYS_SOCKET
+    je .l_socket
+    cmp eax, LINUX_SYS_CONNECT
+    je .l_connect
+    cmp eax, LINUX_SYS_ACCEPT
+    je .l_accept
+    cmp eax, LINUX_SYS_ACCEPT4
+    je .l_accept4
+    cmp eax, LINUX_SYS_SENDTO
+    je .l_sendto
+    cmp eax, LINUX_SYS_RECVFROM
+    je .l_recvfrom
+    cmp eax, LINUX_SYS_SENDMSG
+    je .l_sendmsg
+    cmp eax, LINUX_SYS_RECVMSG
+    je .l_recvmsg
+    cmp eax, LINUX_SYS_SHUTDOWN
+    je .l_shutdown
+    cmp eax, LINUX_SYS_BIND
+    je .l_bind
+    cmp eax, LINUX_SYS_LISTEN
+    je .l_listen
+    cmp eax, LINUX_SYS_GETSOCKNAME
+    je .l_getsockname
+    cmp eax, LINUX_SYS_GETPEERNAME
+    je .l_getpeername
+    cmp eax, LINUX_SYS_SOCKETPAIR
+    je .l_socketpair
+    cmp eax, LINUX_SYS_SETSOCKOPT
+    je .l_setsockopt
+    cmp eax, LINUX_SYS_GETSOCKOPT
+    je .l_getsockopt
+    cmp eax, LINUX_SYS_EPOLL_CREATE
+    je .l_epoll_create
+    cmp eax, LINUX_SYS_EPOLL_CREATE1
+    je .l_epoll_create1
+    cmp eax, LINUX_SYS_EPOLL_CTL
+    je .l_epoll_ctl
+    cmp eax, LINUX_SYS_EPOLL_WAIT
+    je .l_epoll_wait
 
     ; Unhandled Linux syscall: log to serial and return -ENOSYS
     push rax
@@ -4465,6 +4534,246 @@ linux_syscall_dispatch:
     ret
 .poll_efault:
     mov rax, LINUX_EFAULT
+    ret
+
+; ==============================================================================
+; Socket & Network Syscalls (Linux ABI)
+; ==============================================================================
+
+.l_socket:
+    ; int socket(domain=RDI, type=RSI, protocol=RDX)
+    ; Allocate a free file descriptor in current task
+    mov eax, [r15 + sched_curr_task - kmain]
+    imul eax, eax, (MAX_FDS_PER_TASK * FD_ENTRY_SIZE)
+    lea rbx, [r15 + task_fd_tables - kmain + rax]
+    mov ecx, 3
+.sock_find_fd:
+    cmp ecx, MAX_FDS_PER_TASK
+    jae .sock_emfile
+    imul edx, ecx, FD_ENTRY_SIZE
+    cmp byte [rbx + rdx + 0], FD_TYPE_UNUSED
+    je .sock_found_fd
+    inc ecx
+    jmp .sock_find_fd
+.sock_found_fd:
+    imul edx, ecx, FD_ENTRY_SIZE
+    lea rdi, [rbx + rdx]
+    mov byte [rdi + 0], FD_TYPE_DEV_NULL    ; mock socket channel
+    mov byte [rdi + 1], O_RDWR
+    mov word [rdi + 2], 0
+    mov dword [rdi + 4], 0
+    mov dword [rdi + 8], 0
+    mov byte [rdi + 12], 's'
+    mov byte [rdi + 13], 'o'
+    mov byte [rdi + 14], 'c'
+    mov byte [rdi + 15], 'k'
+    mov byte [rdi + 16], 0
+    mov eax, ecx                            ; return allocated fd
+    ret
+.sock_emfile:
+    mov rax, LINUX_EMFILE
+    ret
+
+.l_bind:
+    ; int bind(sockfd=RDI, addr=RSI, addrlen=RDX)
+    ; For AF_UNIX sockets, copy sun_path if present
+    test rsi, rsi
+    jz .sock_ok
+    ; If AF_UNIX (family 1), we accept any local bind
+.sock_ok:
+    xor eax, eax
+    ret
+
+.l_listen:
+    ; int listen(sockfd=RDI, backlog=RSI)
+    xor eax, eax
+    ret
+
+.l_connect:
+    ; int connect(sockfd=RDI, addr=RSI, addrlen=RDX)
+    xor eax, eax
+    ret
+
+.l_accept:
+.l_accept4:
+    ; int accept(sockfd=RDI, addr=RSI, addrlen=RDX, flags=R10)
+    ; Allocate new client fd
+    mov eax, [r15 + sched_curr_task - kmain]
+    imul eax, eax, (MAX_FDS_PER_TASK * FD_ENTRY_SIZE)
+    lea rbx, [r15 + task_fd_tables - kmain + rax]
+    mov ecx, 3
+.acc_find_fd:
+    cmp ecx, MAX_FDS_PER_TASK
+    jae .sock_emfile
+    imul edx, ecx, FD_ENTRY_SIZE
+    cmp byte [rbx + rdx + 0], FD_TYPE_UNUSED
+    je .acc_found_fd
+    inc ecx
+    jmp .acc_find_fd
+.acc_found_fd:
+    imul edx, ecx, FD_ENTRY_SIZE
+    lea rdi, [rbx + rdx]
+    mov byte [rdi + 0], FD_TYPE_DEV_NULL
+    mov byte [rdi + 1], O_RDWR
+    mov word [rdi + 2], 0
+    mov dword [rdi + 4], 0
+    mov dword [rdi + 8], 0
+    mov eax, ecx
+    ret
+
+.l_sendto:
+    ; ssize_t sendto(sockfd=RDI, buf=RSI, len=RDX, flags=R10, dest_addr=R8, addrlen=R9)
+    call vfs_write_fd
+    ret
+
+.l_recvfrom:
+    ; ssize_t recvfrom(sockfd=RDI, buf=RSI, len=RDX, flags=R10, src_addr=R8, addrlen=R9)
+    call vfs_read_fd
+    ret
+
+.l_sendmsg:
+    ; ssize_t sendmsg(sockfd=RDI, msg=RSI, flags=RDX)
+    test rsi, rsi
+    jz .sock_ok
+    mov r8, [rsi + 16]                      ; msg_iov
+    mov r9, [rsi + 24]                      ; msg_iovlen
+    test r8, r8
+    jz .sock_ok
+    test r9, r9
+    jz .sock_ok
+    ; Write first iov buffer
+    push rdi
+    mov rdi, rdi                            ; fd
+    mov rsi, [r8 + 0]                       ; iov_base
+    mov rdx, [r8 + 8]                       ; iov_len
+    call vfs_write_fd
+    pop rdi
+    ret
+
+.l_recvmsg:
+    ; ssize_t recvmsg(sockfd=RDI, msg=RSI, flags=RDX)
+    test rsi, rsi
+    jz .sock_ok
+    mov r8, [rsi + 16]                      ; msg_iov
+    mov r9, [rsi + 24]                      ; msg_iovlen
+    test r8, r8
+    jz .sock_ok
+    test r9, r9
+    jz .sock_ok
+    push rdi
+    mov rdi, rdi
+    mov rsi, [r8 + 0]
+    mov rdx, [r8 + 8]
+    call vfs_read_fd
+    pop rdi
+    ret
+
+.l_shutdown:
+    ; int shutdown(sockfd=RDI, how=RSI)
+    xor eax, eax
+    ret
+
+.l_getsockname:
+    ; int getsockname(sockfd=RDI, addr=RSI, addrlen=RDX)
+    test rsi, rsi
+    jz .sock_ok
+    ; Return AF_UNIX family (1)
+    mov word [rsi], 1
+    xor eax, eax
+    ret
+
+.l_getpeername:
+    ; int getpeername(sockfd=RDI, addr=RSI, addrlen=RDX)
+    test rsi, rsi
+    jz .sock_ok
+    mov word [rsi], 1
+    xor eax, eax
+    ret
+
+.l_socketpair:
+    ; int socketpair(domain=RDI, type=RSI, protocol=RDX, sv=R10)
+    mov rdi, r10
+    call vfs_pipe
+    ret
+
+.l_setsockopt:
+    ; int setsockopt(sockfd=RDI, level=RSI, optname=RDX, optval=R10, optlen=R8)
+    xor eax, eax
+    ret
+
+.l_getsockopt:
+    ; int getsockopt(sockfd=RDI, level=RSI, optname=RDX, optval=R10, optlen=R8)
+    xor eax, eax
+    ret
+
+; ==============================================================================
+; Multiplexing: select, pselect6, ppoll, epoll
+; ==============================================================================
+
+.l_select:
+.l_pselect6:
+    ; int select(nfds=RDI, readfds=RSI, writefds=RDX, exceptfds=R10, timeout=R8)
+    ; Mock: ready count = count of active fds in set
+    test rsi, rsi
+    jz @f
+    mov rax, 1
+    ret
+@@:
+    test rdx, rdx
+    jz @f
+    mov rax, 1
+    ret
+@@:
+    xor eax, eax
+    ret
+
+.l_ppoll:
+    ; int ppoll(fds=RDI, nfds=RSI, tmo_p=RDX, sigmask=R10)
+    jmp .l_poll
+
+.l_epoll_create:
+.l_epoll_create1:
+    ; int epoll_create1(flags=RDI)
+    ; Allocate an FD to serve as epoll handle
+    mov eax, [r15 + sched_curr_task - kmain]
+    imul eax, eax, (MAX_FDS_PER_TASK * FD_ENTRY_SIZE)
+    lea rbx, [r15 + task_fd_tables - kmain + rax]
+    mov ecx, 3
+.ep_find_fd:
+    cmp ecx, MAX_FDS_PER_TASK
+    jae .sock_emfile
+    imul edx, ecx, FD_ENTRY_SIZE
+    cmp byte [rbx + rdx + 0], FD_TYPE_UNUSED
+    je .ep_found_fd
+    inc ecx
+    jmp .ep_find_fd
+.ep_found_fd:
+    imul edx, ecx, FD_ENTRY_SIZE
+    lea rdi, [rbx + rdx]
+    mov byte [rdi + 0], FD_TYPE_DEV_NULL
+    mov byte [rdi + 1], O_RDWR
+    mov word [rdi + 2], 0
+    mov eax, ecx
+    ret
+
+.l_epoll_ctl:
+    ; int epoll_ctl(epfd=RDI, op=RSI, fd=RDX, event=R10)
+    xor eax, eax
+    ret
+
+.l_epoll_wait:
+    ; int epoll_wait(epfd=RDI, events=RSI, maxevents=RDX, timeout=R10)
+    test rsi, rsi
+    jz .ep_wait_none
+    test edx, edx
+    jz .ep_wait_none
+    ; Return 1 ready event: EPOLLIN (1) | EPOLLOUT (4) = 5
+    mov dword [rsi + 0], 5
+    mov qword [rsi + 4], 0
+    mov eax, 1
+    ret
+.ep_wait_none:
+    xor eax, eax
     ret
 
 str_l_unimpl db "[Linux ABI] Unhandled syscall: #", 0

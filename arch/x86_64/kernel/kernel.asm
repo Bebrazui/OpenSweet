@@ -139,6 +139,7 @@ kmain:
     mov byte [r15 + vendor - kmain+12], 0
 
     call mouse_init
+    call net_init
     call modern_desktop_init
 
     ; Initialize Preemptive Multitasking Scheduler
@@ -152,6 +153,11 @@ kmain:
     ; Spawn Background System Monitor Daemon (Task 2)
     lea rsi, [r15 + str_name_sysmon - kmain]
     lea rdx, [r15 + task_sysmon_daemon - kmain]
+    call task_create
+
+    ; Spawn Background Network Daemon (Task 3)
+    lea rsi, [r15 + str_name_net - kmain]
+    lea rdx, [r15 + task_net_daemon - kmain]
     call task_create
 
     ; Welcome Banner
@@ -3465,6 +3471,8 @@ db 0x80,0,0,0x82,0,0x83,0,0,0x81,0,0,0 ; 0x48 - 0x53 (0x80=Up, 0x82=Left, 0x83=R
 
 include '..\drivers\ata.asm'
 include '..\drivers\mouse.asm'
+include '..\drivers\rtl8139.asm'
+include 'D:\Opensweet\kernel\net.inc'
 include 'D:\Opensweet\fs\ext4\ext4.inc'
 include '..\drivers\console.asm'
 include 'D:\Opensweet\gui\modern_desktop.inc'
