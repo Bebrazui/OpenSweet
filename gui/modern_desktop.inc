@@ -235,6 +235,9 @@ modern_desktop_render:
     ; 2. Top Menu Bar
     call md_render_menubar
 
+    ; 2.5 Window animations (smooth Ease-Out PiP morphing transitions)
+    call wm_update_animations
+
     ; 3. Render all active open windows in Z-order
     call wm_render_all
 

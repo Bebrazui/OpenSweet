@@ -257,6 +257,7 @@ static void execute_command(const char *cmd) {
         term_print_line("  files         Launch File Explorer (Ring 3)", OS_COLOR_SLATE_300);
         term_print_line("  doom          Launch DOOM (Shareware) (Ring 3)", OS_COLOR_SLATE_300);
         term_print_line("  ifconfig / ip Show network interface and IP/MAC info", OS_COLOR_SLATE_300);
+        term_print_line("  pip           Toggle Picture-in-Picture (PiP) mode (or Ctrl+P)", OS_COLOR_SLATE_300);
         term_print_line("  version       Show kernel architecture and build", OS_COLOR_SLATE_300);
         term_print_line("  exit          Close terminal window", OS_COLOR_SLATE_300);
     } else if (os_strcmp(cmd, "ifconfig") == 0 || os_strcmp(cmd, "net") == 0 || os_strcmp(cmd, "ip") == 0) {
@@ -307,6 +308,9 @@ static void execute_command(const char *cmd) {
             os_strcpy(io_line + os_strlen(io_line), irq_str);
             term_print_line(io_line, OS_COLOR_SLATE_400);
         }
+    } else if (os_strcmp(cmd, "pip") == 0) {
+        term_print_line("Picture-in-Picture mode toggled (drag 3-dot bar or press Ctrl+P)", OS_COLOR_CYAN_NEON);
+        os_toggle_pip(-1);
     } else if (os_strcmp(cmd, "fetch") == 0 || os_strcmp(cmd, "sweetfetch") == 0 || os_strcmp(cmd, "neofetch") == 0) {
         print_fetch();
     } else if (os_strcmp(cmd, "clear") == 0 || os_strcmp(cmd, "cls") == 0) {

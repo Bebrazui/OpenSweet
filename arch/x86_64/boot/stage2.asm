@@ -3,7 +3,7 @@
 
 KERNEL_LBA     = 33                  ; LBA0=MBR, LBA1..32=stage2(16KB)
 KERNEL_ADDR    = 0x10000
-KERNEL_SECTORS = 820                 ; 410KB kernel window (fits before EBDA/video RAM)
+KERNEL_SECTORS = 920                 ; 460KB kernel window (fits before stack 0x90000 / EBDA)
 
 org 0x0600
 use16

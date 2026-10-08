@@ -239,6 +239,13 @@ kmain:
 .key:
     ; AH = event type (4 = KEY_DOWN, 6 = KEY_UP)
     ; AL = key code
+    cmp ah, 4
+    jne .not_pip_hotkey
+    cmp al, 16                         ; Ctrl+P -> Toggle PiP (Picture-in-Picture)
+    jne .not_pip_hotkey
+    call wm_toggle_pip_focused
+    jmp .shell
+.not_pip_hotkey:
     movzx ebx, byte [r15 + wm_focus_app - kmain]
     cmp bl, APP_COUNT
     jae .term_key_check

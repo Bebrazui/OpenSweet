@@ -358,6 +358,107 @@ r2d_blit_bitmap:
     ret
 
 ; ==============================================================================
+; r2d_blit_bitmap_stride: Copy w*h pixels with custom source stride
+; ECX = dst_x, EDX = dst_y, ESI = w, EDI = h, R8 = src_buf, EBX = src_stride_pixels
+; ==============================================================================
+r2d_blit_bitmap_stride:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+
+    test esi, esi
+    jle .bbs_done
+    test edi, edi
+    jle .bbs_done
+    test r8, r8
+    jz .bbs_done
+
+    mov r9d, ecx                      ; cur_x
+    mov r10d, edx                     ; cur_y
+    mov r11d, esi                     ; draw_w
+    mov r12d, edi                     ; remaining height
+    mov r13d, ebx                     ; src_stride_pixels
+
+.bbs_row_loop:
+    test r12d, r12d
+    jz .bbs_done
+
+    cmp r10d, 0
+    jl .bbs_skip_row
+    cmp r10d, R2D_SCREEN_H
+    jge .bbs_done
+
+    mov eax, r9d
+    mov ecx, r11d
+    mov rsi, r8
+
+    test eax, eax
+    jns .bbs_left_ok
+    neg eax
+    cmp eax, ecx
+    jae .bbs_skip_row
+    sub ecx, eax
+    shl eax, 2
+    add rsi, rax
+    xor eax, eax
+.bbs_left_ok:
+    cmp eax, R2D_SCREEN_W
+    jae .bbs_skip_row
+    mov edx, eax
+    add edx, ecx
+    cmp edx, R2D_SCREEN_W
+    jbe .bbs_right_ok
+    mov ecx, R2D_SCREEN_W
+    sub ecx, eax
+.bbs_right_ok:
+    test ecx, ecx
+    jle .bbs_skip_row
+
+    push rdx
+    mov edx, r10d
+    imul edx, R2D_PITCH
+    lea rdi, [R2D_BACKBUFFER + rdx]
+    lea rdi, [rdi + rax*4]
+    pop rdx
+
+    push rcx
+    cld
+    rep movsd
+    pop rcx
+
+.bbs_skip_row:
+    mov eax, r13d
+    shl eax, 2
+    add r8, rax
+    inc r10d
+    dec r12d
+    jmp .bbs_row_loop
+
+.bbs_done:
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; ==============================================================================
 ; r2d_draw_ambient_wallpaper: Blit pre-rendered wallpaper cache to Backbuffer (<0.3 ms)
 ; ==============================================================================
 r2d_draw_ambient_wallpaper:
@@ -1272,6 +1373,147 @@ r2d_draw_traffic_lights:
     pop rdx
     pop rcx
     pop rbx
+    pop rax
+    ret
+
+; ==============================================================================
+; PiP (Picture-in-Picture) Drag Handle 3-Dot Widget Rendering
+; ==============================================================================
+align 16
+pip_dot_4_aa_mask:
+    db 0x60, 0xE0, 0xE0, 0x60
+    db 0xE0, 0xFF, 0xFF, 0xE0
+    db 0xE0, 0xFF, 0xFF, 0xE0
+    db 0x60, 0xE0, 0xE0, 0x60
+
+r2d_draw_dot_4_aa:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+
+    mov r8d, ecx                      ; x
+    mov r9d, edx                      ; y
+    mov r10d, eax                     ; color
+
+    lea rsi, [r15 + pip_dot_4_aa_mask - kmain]
+    xor r11d, r11d                    ; py = 0..3
+.d4_y_loop:
+    cmp r11d, 4
+    jae .d4_done
+
+    mov eax, r9d
+    add eax, r11d                     ; abs_y
+    cmp eax, R2D_SCREEN_H
+    jae .d4_done
+
+    imul eax, R2D_PITCH
+    lea rdx, [rax + R2D_BACKBUFFER]
+    mov eax, r8d
+    shl eax, 2
+    add rdx, rax                      ; rdx = line dst ptr
+
+    xor r12d, r12d                    ; px = 0..3
+.d4_x_loop:
+    cmp r12d, 4
+    jae .d4_next_line
+
+    mov eax, r8d
+    add eax, r12d
+    cmp eax, R2D_SCREEN_W
+    jae .d4_next_px
+
+    movzx eax, byte [rsi]             ; alpha (0..255)
+    test eax, eax
+    jz .d4_next_px
+
+    mov ebx, [rdx + r12*4]
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    mov ecx, eax                      ; alpha (0..255)
+    mov edx, r10d                     ; src color
+    mov esi, ebx                      ; dst color
+    call r2d_blend_pixel
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    mov [rdx + r12*4], eax
+
+.d4_next_px:
+    inc rsi
+    inc r12d
+    jmp .d4_x_loop
+
+.d4_next_line:
+    inc r11d
+    jmp .d4_y_loop
+
+.d4_done:
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; ==============================================================================
+; r2d_draw_pip_dots: Draws 3 horizontal dots for PiP drag handle at ECX=center_x, EDX=center_y
+; EAX = color (e.g. 0xFF38BDF8)
+; ==============================================================================
+r2d_draw_pip_dots:
+    push rax
+    push rcx
+    push rdx
+
+    ; Left dot: cx - 7, cy - 2
+    push rcx
+    push rdx
+    push rax
+    sub ecx, 7
+    sub edx, 2
+    call r2d_draw_dot_4_aa
+    pop rax
+    pop rdx
+    pop rcx
+
+    ; Center dot: cx - 2, cy - 2
+    push rcx
+    push rdx
+    push rax
+    sub ecx, 2
+    sub edx, 2
+    call r2d_draw_dot_4_aa
+    pop rax
+    pop rdx
+    pop rcx
+
+    ; Right dot: cx + 3, cy - 2
+    push rcx
+    push rdx
+    push rax
+    add ecx, 3
+    sub edx, 2
+    call r2d_draw_dot_4_aa
+    pop rax
+    pop rdx
+    pop rcx
+
+    pop rdx
+    pop rcx
     pop rax
     ret
 

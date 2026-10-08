@@ -70,6 +70,7 @@ typedef _Bool bool;
 #define SYS_RMDIR          34
 #define SYS_SYMLINK        35
 #define SYS_NET_INFO       36
+#define SYS_GUI_TOGGLE_PIP 37
 
 typedef struct {
     uint8_t  present;
@@ -351,6 +352,10 @@ static inline void os_close_window(os_window_t *win) {
     os_syscall1(SYS_GUI_CLOSE_WIN, win->win_id);
     win->win_id = -1;
     win->canvas = NULL;
+}
+
+static inline void os_toggle_pip(int win_id) {
+    os_syscall1(SYS_GUI_TOGGLE_PIP, win_id);
 }
 
 /* =============================================================================

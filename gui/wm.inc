@@ -33,6 +33,18 @@ wm_saved_y    dd 0, 0, 0, 0, 0, 0, 0, 0
 wm_saved_w    dd 0, 0, 0, 0, 0, 0, 0, 0
 wm_saved_h    dd 0, 0, 0, 0, 0, 0, 0, 0
 
+; Picture-in-Picture (PiP) State & Smooth Ease-Out Transition Targets
+wm_pip_mode        db 0, 0, 0, 0, 0, 0, 0, 0
+wm_pip_saved_x     dd 0, 0, 0, 0, 0, 0, 0, 0
+wm_pip_saved_y     dd 0, 0, 0, 0, 0, 0, 0, 0
+wm_pip_saved_w     dd 0, 0, 0, 0, 0, 0, 0, 0
+wm_pip_saved_h     dd 0, 0, 0, 0, 0, 0, 0, 0
+wm_anim_active     db 0, 0, 0, 0, 0, 0, 0, 0
+wm_anim_target_x   dd 0, 0, 0, 0, 0, 0, 0, 0
+wm_anim_target_y   dd 0, 0, 0, 0, 0, 0, 0, 0
+wm_anim_target_w   dd 0, 0, 0, 0, 0, 0, 0, 0
+wm_anim_target_h   dd 0, 0, 0, 0, 0, 0, 0, 0
+
 ; Global Compositor / WM State
 wm_z_order    db 0, 1, 2, 3, 4, 5, 6, 7         ; App IDs from back (0) to front (open_count - 1)
 wm_open_count db 1                              ; Number of active open windows
@@ -530,6 +542,10 @@ wm_render_window:
     mov r10d, [r15 + wm_w - kmain + r13*4] ; ww
     mov r11d, [r15 + wm_h - kmain + r13*4] ; wh
 
+    ; Check if window is in PiP mode
+    cmp byte [r15 + wm_pip_mode - kmain + r13], 1
+    je .render_pip_window
+
     ; 1. Soft Ambient Drop Shadow
     mov ecx, r8d
     mov edx, r9d
@@ -625,6 +641,92 @@ wm_render_window:
     jz .win_rendered
 
     call r2d_blit_bitmap
+    jmp .win_rendered
+
+.render_pip_window:
+    ; 1. Soft Ambient Drop Shadow
+    mov ecx, r8d
+    mov edx, r9d
+    mov esi, r10d
+    mov edi, r11d
+    mov ebx, 16                         ; 16px radius for PiP
+    call r2d_draw_shadow
+
+    ; 2. Window Card Background (Dark Slate #131822)
+    mov ecx, r8d
+    mov edx, r9d
+    mov esi, r10d
+    mov edi, r11d
+    mov ebx, 16
+    mov eax, 0xFF131822
+    call r2d_draw_rounded_rect_aa
+
+    ; 2b. Accent Neon Border Sheen (Sky Blue #38bdf8 at top)
+    mov ecx, r8d
+    add ecx, 16
+    mov edx, r9d
+    mov esi, r10d
+    sub esi, 32
+    mov edi, 1
+    mov eax, 0x6038BDF8                 ; Sky Blue accent glow
+    call r2d_fill_rect_alpha
+
+    ; 3. PiP Drag Handle (Height: 26px)
+    ; Center Drag-Dots Capsule
+    mov ecx, r8d
+    mov eax, r10d
+    shr eax, 1                          ; ww / 2
+    add ecx, eax                        ; center_x
+    sub ecx, 18                         ; capsule start x
+    mov edx, r9d
+    add edx, 6                          ; capsule start y
+    mov esi, 36                         ; capsule w
+    mov edi, 14                         ; capsule h
+    mov eax, 0x18FFFFFF                 ; translucent background
+    call r2d_fill_rect_alpha
+
+    ; 3b. Draw 3 Dots inside Handle
+    mov ecx, r8d
+    mov eax, r10d
+    shr eax, 1
+    add ecx, eax                        ; center_x
+    mov edx, r9d
+    add edx, 13                         ; center_y
+    test r12d, r12d
+    jz .pip_dots_unfocused
+    mov eax, 0xFF38BDF8                 ; Bright Sky Blue when focused
+    jmp .draw_pip_dots
+.pip_dots_unfocused:
+    mov eax, 0x8094A3B8                 ; Muted Slate when unfocused
+.draw_pip_dots:
+    call r2d_draw_pip_dots
+
+    ; 3c. Handle Bottom 1px Divider
+    mov ecx, r8d
+    mov edx, r9d
+    add edx, 26
+    mov esi, r10d
+    mov edi, 1
+    mov eax, 0x18FFFFFF
+    call r2d_fill_rect_alpha
+
+    ; 4. Blit Client Content (wx, wy + 27, ww, wh - 27)
+    mov ecx, r8d
+    mov edx, r9d
+    add edx, 27
+    mov esi, r10d
+    mov edi, r11d
+    sub edi, 27
+    mov eax, r13d
+    mov r8, [r15 + wm_user_canvas - kmain + rax*8]
+    test r8, r8
+    jz .win_rendered
+    mov ebx, [r15 + wm_pip_saved_w - kmain + rax*4]
+    test ebx, ebx
+    jnz @f
+    mov ebx, 760                      ; fallback stride
+@@:
+    call r2d_blit_bitmap_stride
 
 .win_rendered:
     pop r13
@@ -971,6 +1073,9 @@ wm_handle_mouse:
     ja .win_hit_loop
 
     ; HIT WINDOW ebx!
+    cmp byte [r15 + wm_pip_mode - kmain + rbx], 1
+    je .pip_hit_check
+
     ; Check 1: Traffic Lights (Close = Red, Minimize = Yellow, Maximize = Green)
     mov ecx, r9d
     add ecx, 6
@@ -1027,6 +1132,13 @@ wm_handle_mouse:
     mov al, bl
     call wm_toggle_maximize_app
     jmp .mouse_ret
+
+.pip_hit_check:
+    mov ecx, r9d
+    add ecx, 26
+    cmp edx, ecx
+    jbe .not_traffic_lights
+    jmp .body_click
 
 .not_traffic_lights:
     ; Check 2: Title bar drag region (wy to wy + 32)
@@ -1934,6 +2046,202 @@ wm_update_user_window:
 
 .uuw_err:
     mov rax, -1
+    ret
+
+; ==============================================================================
+; Picture-in-Picture (PiP) Management & Smooth Transition Animations
+; ==============================================================================
+
+; wm_toggle_pip: Toggle Picture-in-Picture mode for window EBX (0..7)
+wm_toggle_pip:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    movzx ebx, bl
+    cmp ebx, APP_COUNT
+    jae .toggle_pip_done
+
+    cmp byte [r15 + wm_pip_mode - kmain + rbx], 1
+    je .restore_from_pip
+
+.enter_pip:
+    ; 1. Save current window geometry
+    mov eax, [r15 + wm_x - kmain + rbx*4]
+    mov [r15 + wm_pip_saved_x - kmain + rbx*4], eax
+    mov eax, [r15 + wm_y - kmain + rbx*4]
+    mov [r15 + wm_pip_saved_y - kmain + rbx*4], eax
+    mov eax, [r15 + wm_w - kmain + rbx*4]
+    mov [r15 + wm_pip_saved_w - kmain + rbx*4], eax
+    mov eax, [r15 + wm_h - kmain + rbx*4]
+    mov [r15 + wm_pip_saved_h - kmain + rbx*4], eax
+
+    ; 2. Target PiP geometry: vertical card 250x380 at bottom-right
+    mov byte [r15 + wm_pip_mode - kmain + rbx], 1
+    mov dword [r15 + wm_anim_target_w - kmain + rbx*4], 250
+    mov dword [r15 + wm_anim_target_h - kmain + rbx*4], 380
+    mov dword [r15 + wm_anim_target_x - kmain + rbx*4], (1920 - 250 - 24) ; 1646
+    mov dword [r15 + wm_anim_target_y - kmain + rbx*4], (1080 - 380 - 72) ; 628
+    mov byte [r15 + wm_anim_active - kmain + rbx], 1
+    mov byte [r15 + md_term_dirty - kmain], 1
+    jmp .toggle_pip_done
+
+.restore_from_pip:
+    ; Restore saved normal geometry
+    mov byte [r15 + wm_pip_mode - kmain + rbx], 0
+    mov eax, [r15 + wm_pip_saved_x - kmain + rbx*4]
+    test eax, eax
+    jnz @f
+    mov eax, 120                        ; fallback x
+@@:
+    mov [r15 + wm_anim_target_x - kmain + rbx*4], eax
+
+    mov eax, [r15 + wm_pip_saved_y - kmain + rbx*4]
+    test eax, eax
+    jnz @f
+    mov eax, 80                         ; fallback y
+@@:
+    mov [r15 + wm_anim_target_y - kmain + rbx*4], eax
+
+    mov eax, [r15 + wm_pip_saved_w - kmain + rbx*4]
+    test eax, eax
+    jnz @f
+    mov eax, 680                        ; fallback w
+@@:
+    mov [r15 + wm_anim_target_w - kmain + rbx*4], eax
+
+    mov eax, [r15 + wm_pip_saved_h - kmain + rbx*4]
+    test eax, eax
+    jnz @f
+    mov eax, 600                        ; fallback h
+@@:
+    mov [r15 + wm_anim_target_h - kmain + rbx*4], eax
+
+    mov byte [r15 + wm_anim_active - kmain + rbx], 1
+    mov byte [r15 + md_term_dirty - kmain], 1
+
+.toggle_pip_done:
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; wm_toggle_pip_focused: Toggle PiP for the currently focused window
+wm_toggle_pip_focused:
+    push rax
+    push rbx
+    push rdx
+    movzx ebx, byte [r15 + wm_focus_app - kmain]
+    cmp bl, APP_COUNT
+    jb .have_focus
+    ; Fallback to top-most active window
+    movzx edx, byte [r15 + wm_open_count - kmain]
+    test edx, edx
+    jz .done
+    mov bl, [r15 + wm_z_order - kmain + rdx - 1]
+    cmp bl, APP_COUNT
+    jae .done
+.have_focus:
+    call wm_toggle_pip
+.done:
+    pop rdx
+    pop rbx
+    pop rax
+    ret
+
+; ==============================================================================
+; wm_update_animations: Update Ease-Out window geometry transitions each frame
+; ==============================================================================
+wm_update_animations:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    xor ebx, ebx
+.anim_loop:
+    cmp ebx, APP_COUNT
+    jae .anim_done
+    cmp byte [r15 + wm_anim_active - kmain + rbx], 1
+    jne .anim_next
+
+    ; Flag compositor dirty for next animation step
+    mov byte [r15 + md_term_dirty - kmain], 1
+
+    ; --- Ease-Out step for X ---
+    mov eax, [r15 + wm_anim_target_x - kmain + rbx*4]
+    sub eax, [r15 + wm_x - kmain + rbx*4]
+    mov edx, eax
+    imul eax, 3
+    sar eax, 3                          ; step = (target - curr) * 3 / 8
+    test eax, eax
+    jnz @f
+    mov eax, edx
+@@:
+    add [r15 + wm_x - kmain + rbx*4], eax
+
+    ; --- Ease-Out step for Y ---
+    mov eax, [r15 + wm_anim_target_y - kmain + rbx*4]
+    sub eax, [r15 + wm_y - kmain + rbx*4]
+    mov edx, eax
+    imul eax, 3
+    sar eax, 3
+    test eax, eax
+    jnz @f
+    mov eax, edx
+@@:
+    add [r15 + wm_y - kmain + rbx*4], eax
+
+    ; --- Ease-Out step for W ---
+    mov eax, [r15 + wm_anim_target_w - kmain + rbx*4]
+    sub eax, [r15 + wm_w - kmain + rbx*4]
+    mov edx, eax
+    imul eax, 3
+    sar eax, 3
+    test eax, eax
+    jnz @f
+    mov eax, edx
+@@:
+    add [r15 + wm_w - kmain + rbx*4], eax
+
+    ; --- Ease-Out step for H ---
+    mov eax, [r15 + wm_anim_target_h - kmain + rbx*4]
+    sub eax, [r15 + wm_h - kmain + rbx*4]
+    mov edx, eax
+    imul eax, 3
+    sar eax, 3
+    test eax, eax
+    jnz @f
+    mov eax, edx
+@@:
+    add [r15 + wm_h - kmain + rbx*4], eax
+
+    ; Check if reached target
+    mov eax, [r15 + wm_x - kmain + rbx*4]
+    cmp eax, [r15 + wm_anim_target_x - kmain + rbx*4]
+    jne .anim_next
+    mov eax, [r15 + wm_y - kmain + rbx*4]
+    cmp eax, [r15 + wm_anim_target_y - kmain + rbx*4]
+    jne .anim_next
+    mov eax, [r15 + wm_w - kmain + rbx*4]
+    cmp eax, [r15 + wm_anim_target_w - kmain + rbx*4]
+    jne .anim_next
+    mov eax, [r15 + wm_h - kmain + rbx*4]
+    cmp eax, [r15 + wm_anim_target_h - kmain + rbx*4]
+    jne .anim_next
+
+    ; Target reached! Stop animation.
+    mov byte [r15 + wm_anim_active - kmain + rbx], 0
+
+.anim_next:
+    inc ebx
+    jmp .anim_loop
+
+.anim_done:
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
     ret
 
 

@@ -36,6 +36,7 @@ SYS_MKDIR          = 33
 SYS_RMDIR          = 34
 SYS_SYMLINK        = 35
 SYS_NET_INFO       = 36
+SYS_GUI_TOGGLE_PIP = 37
 
 align 16
 sys_user_rsp       dq 0
@@ -232,6 +233,8 @@ end if
     je .do_symlink
     cmp eax, SYS_NET_INFO
     je .do_net_info
+    cmp eax, SYS_GUI_TOGGLE_PIP
+    je .do_gui_toggle_pip
 
 if defined CONFIG_LINUX_COMPAT
     ; Fallback to Linux ABI for undeclared syscall numbers (marked distinctly
@@ -467,6 +470,21 @@ end if
     jmp .syscall_ret
 .do_net_info_err:
     mov rax, -1
+    jmp .syscall_ret
+
+.do_gui_toggle_pip:
+    ; RDI = app_id (-1 for focused window)
+    cmp rdi, -1
+    je .pip_focus_sc
+    cmp edi, APP_COUNT
+    jae .pip_focus_sc
+    mov ebx, edi
+    call wm_toggle_pip
+    xor eax, eax
+    jmp .syscall_ret
+.pip_focus_sc:
+    call wm_toggle_pip_focused
+    xor eax, eax
     jmp .syscall_ret
 
 .do_get_time:
