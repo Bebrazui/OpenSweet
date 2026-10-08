@@ -87,6 +87,15 @@ function FastSymlink([long]$inoOff, [string]$target) {
     Put ($inoOff + 40) $tb                # i_block contains target string
 }
 
+function EmptyFile([long]$inoOff) {
+    [Array]::Clear($img, $inoOff, 128)
+    PutU16 $inoOff 0x81A4                 # i_mode = S_IFREG | 0644
+    PutU32 ($inoOff + 4) 0                # i_size_lo = 0
+    PutU16 ($inoOff + 26) 1               # i_links_count = 1
+    PutU32 ($inoOff + 28) 0               # i_blocks_lo = 0
+    PutU32 ($inoOff + 32) 0x80000         # i_flags = EXTENTS
+}
+
 $itable = 10 * $BS
 # inode 2 = root dir -> block 20
 ExtentLeaf ($itable + 1 * 128) 20 1 1024 0x41ED

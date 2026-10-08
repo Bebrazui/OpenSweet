@@ -45,9 +45,13 @@ def run():
                     send(f'sendkey {ch}')
             send('sendkey ret')
 
-        print("Sending 'busybox'...")
-        send_text('busybox')
-        time.sleep(10)
+        print("Sending 'dpkg-deb -x /test.deb /'...")
+        send_text('dpkg-deb -x /test.deb /')
+        time.sleep(6)
+
+        print("Sending 'cat /hello_from_deb.txt'...")
+        send_text('cat /hello_from_deb.txt')
+        time.sleep(4)
 
         send('screendump build/linux_test_result.ppm')
         time.sleep(1)

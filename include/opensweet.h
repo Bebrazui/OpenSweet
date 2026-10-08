@@ -68,6 +68,7 @@ typedef _Bool bool;
 #define SYS_SPAWN_STDIO    32
 #define SYS_MKDIR          33
 #define SYS_RMDIR          34
+#define SYS_SYMLINK        35
 
 #define WNOHANG            1
 #define WIFEXITED(s)       (((s) & 0x7f) == 0)
@@ -390,6 +391,12 @@ static inline int os_mkdir(const char *path, uint32_t mode) {
 static inline int os_rmdir(const char *path) {
     if (!path) return -1;
     return (int)os_syscall1(SYS_RMDIR, (int64_t)path);
+}
+
+/* Create a symbolic link in ext4 filesystem */
+static inline int os_symlink(const char *target, const char *linkpath) {
+    if (!target || !linkpath) return -1;
+    return (int)os_syscall2(SYS_SYMLINK, (int64_t)target, (int64_t)linkpath);
 }
 
 /* =============================================================================

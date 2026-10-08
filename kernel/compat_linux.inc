@@ -1055,7 +1055,14 @@ linux_syscall_dispatch:
 
 .l_read:
     ; RDI = fd, RSI = buf, RDX = count
+    push rdi
+    push rsi
+    push rdx
     call vfs_read_fd
+    pop rdx
+    pop rsi
+    pop rdi
+    ; Return value is in RAX from vfs_read
     cmp rax, -1
     jne .l_read_ret
     mov eax, [r15 + vfs_last_err - kmain]   ; positive errno from vfs
@@ -1072,73 +1079,7 @@ linux_syscall_dispatch:
     pop rdx
     pop rsi
     pop rdi
-    push rax
-    push rsi
-    push rdi
-    push rdx
-    lea rsi, [r15 + str_l_write_dbg - kmain]
-    call puts
-    mov rax, [rsp + 8]                  ; saved rdi (fd)
-    call putdec64
-    mov al, ','
-    call putc
-    mov al, ' '
-    call putc
-    mov rax, [rsp + 0]                  ; saved rdx (count)
-    call putdec64
-    lea rsi, [r15 + str_l_write_dbg2 - kmain]
-    call puts
-    mov rax, [rsp + 24]                 ; saved rax (result)
-    call putdec64
-    mov al, ' '
-    call putc
-    mov al, '['
-    call putc
-    push rsi
-    push rcx
-    mov rcx, [rsp + 16]                 ; count (saved rdx)
-    cmp rcx, 40
-    jbe @f
-    mov rcx, 40
-@@:
-    mov rsi, [rsp + 32]                 ; buf (saved rsi)
-.dbg_str_loop:
-    test rcx, rcx
-    jz .dbg_str_done
-    mov al, ' '
-    call putc
-    movzx eax, byte [rsi]
-    push rax
-    shr al, 4
-    and al, 0x0F
-    add al, '0'
-    cmp al, '9'
-    jbe @f
-    add al, 'A' - '0' - 10
-@@:
-    call putc
-    pop rax
-    and al, 0x0F
-    add al, '0'
-    cmp al, '9'
-    jbe @f
-    add al, 'A' - '0' - 10
-@@:
-    call putc
-    inc rsi
-    dec rcx
-    jmp .dbg_str_loop
-.dbg_str_done:
-    pop rcx
-    pop rsi
-    mov al, ']'
-    call putc
-    mov al, 10
-    call putc
-    pop rdx
-    pop rdi
-    pop rsi
-    pop rax
+    ; Return value in RAX from vfs_write_fd
     cmp rax, -1
     jne .l_write_ret
     mov eax, [r15 + vfs_last_err - kmain]   ; positive errno from vfs
@@ -1294,9 +1235,21 @@ linux_syscall_dispatch:
 
 .l_ioctl:
     ; RDI = fd, RSI = request, RDX = arg
-    ; Check if fd is a console fd (0, 1, 2)
-    cmp rdi, 3
-    jae .l_ioctl_notty
+    push rbx
+    push rdi
+    push rsi
+    push rdx
+    mov edi, edi
+    call vfs_get_fd_ptr
+    pop rdx
+    pop rsi
+    pop rdi
+    pop rbx
+    test rax, rax
+    jz .l_ioctl_badfd
+    cmp byte [rax + 0], FD_TYPE_CONSOLE
+    jne .l_ioctl_notty
+
     ; TIOCGWINSZ = 0x5413: struct winsize { unsigned short ws_row, ws_col, ws_xpixel, ws_ypixel; }
     cmp rsi, 0x5413
     je .l_ioctl_winsz
@@ -1310,6 +1263,11 @@ linux_syscall_dispatch:
     je .l_ioctl_ok
     cmp rsi, 0x5404
     je .l_ioctl_ok
+    jmp .l_ioctl_notty
+
+.l_ioctl_badfd:
+    mov rax, -9                 ; -EBADF
+    ret
 .l_ioctl_notty:
     mov rax, -25                ; -ENOTTY
     ret
@@ -1989,6 +1947,9 @@ linux_syscall_dispatch:
     mov ecx, (2 * 1024 * 1024) / 8
     rep movsq                         ; stack slot
 
+    ; 2b. Clone mmap zone pages into child
+    call .linux_fork_copy_mmap
+
     ; 3. File descriptor table: copy the parent's row, bump pipe refcounts
     ;    (mirrors vfs_dup2; the child's vfs_cleanup_task_fds drops them again)
     mov eax, [r15 + sched_curr_task - kmain]
@@ -2139,6 +2100,135 @@ linux_syscall_dispatch:
 
 .l_fork_eagain:
     mov rax, LINUX_EAGAIN             ; -11: no free task slots
+    ret
+
+; ==============================================================================
+; linux_fork_copy_mmap: Clone parent's mmap zone [0x20000000, linux_mmap_next)
+; R13 = child TCB pointer (contains [r13 + TCB_CR3])
+; Preserves all registers
+; ==============================================================================
+.linux_fork_copy_mmap:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+
+    mov r12, 0x20000000                 ; r12 = current VA
+    mov r14, [r15 + linux_mmap_next - kmain]
+    cmp r12, r14
+    jae .lf_done
+
+.lf_page_loop:
+    cmp r12, r14
+    jae .lf_done
+
+    ; Check if r12 is mapped in parent's CR3
+    mov rdx, r12
+    shr rdx, 39
+    and edx, 511                        ; PML4 idx
+    mov r8, r12
+    shr r8, 30
+    and r8d, 511                        ; PDPT idx
+    mov r9, r12
+    shr r9, 21
+    and r9d, 511                        ; PD idx
+    mov r10, r12
+    shr r10, 12
+    and r10d, 511                       ; PT idx
+
+    mov rsi, cr3
+    and rsi, 0xFFFFFFFFFFFFF000
+    test rsi, rsi
+    jz .lf_next
+
+    mov rax, [rsi + rdx*8]              ; PML4E
+    test al, 1
+    jz .lf_next
+    mov rsi, rax
+    and esi, 0xFFFFF000
+
+    mov rax, [rsi + r8*8]               ; PDPTE
+    test al, 1
+    jz .lf_next
+    mov rsi, rax
+    and esi, 0xFFFFF000
+
+    mov rax, [rsi + r9*8]               ; PDE
+    test al, 1
+    jz .lf_next
+    test al, 0x80                       ; huge page?
+    jnz .lf_next
+    mov rsi, rax
+    and esi, 0xFFFFF000
+
+    mov rax, [rsi + r10*8]              ; PTE
+    test al, 1                          ; Present?
+    jz .lf_next
+
+    ; Page is present in parent!
+    mov r11, rax
+    and r11, 0xFFFFFFFFFFFFF000         ; r11 = parent physical page
+
+    ; Allocate zeroed physical page for child
+    call pmm_alloc_zero
+    test rax, rax
+    jz .lf_next
+    mov rbx, rax                        ; rbx = child new physical page
+
+    ; Copy 4KB from parent's physical page (r11) to child's physical page (rbx)
+    ; In OpenSweet, physical memory 0..1GB is identity mapped in kernel
+    push rsi
+    push rdi
+    push rcx
+    mov rsi, r11                        ; source = parent physical page
+    mov rdi, rbx                        ; dest = identity-mapped physical page
+    mov ecx, 512
+    rep movsq
+    pop rcx
+    pop rdi
+    pop rsi
+
+    ; Map r12 to physical page rbx in child's CR3
+    mov rax, cr3                        ; save parent CR3
+    push rax
+    mov rax, [r13 + TCB_CR3]            ; child CR3
+    mov cr3, rax
+
+    mov rdi, r12                        ; virt
+    mov rax, rbx                        ; phys
+    mov r11b, 7                         ; Present | Writable | User
+    call vmm_map
+
+    pop rax
+    mov cr3, rax                        ; restore parent CR3
+
+.lf_next:
+    add r12, 4096
+    jmp .lf_page_loop
+
+.lf_done:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
     ret
 
 ; ------------------------------------------------------------------------------
@@ -4384,6 +4474,10 @@ str_l_exit_log db "[Linux ABI] Exit with code: ", 0
 str_l_sigkill db "[Linux ABI] Terminated by signal ", 0
 str_l_write_dbg db "[Linux ABI] write: fd=", 0
 str_l_write_dbg2 db " -> ", 0
+str_l_open_dbg db "[Linux ABI] open: ", 0
+str_l_read_dbg db "[Linux ABI] read: fd=", 0
+str_l_mmap_dbg db "[Linux ABI] mmap: ", 0
+str_l_munmap_dbg db "[Linux ABI] munmap: ", 0
 
 align 8
 linux_mmap_next dq 0x20000000

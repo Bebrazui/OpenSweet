@@ -34,6 +34,7 @@ SYS_CHDIR          = 31
 SYS_SPAWN_STDIO    = 32
 SYS_MKDIR          = 33
 SYS_RMDIR          = 34
+SYS_SYMLINK        = 35
 
 align 16
 sys_user_rsp       dq 0
@@ -226,6 +227,8 @@ end if
     je .do_mkdir
     cmp eax, SYS_RMDIR
     je .do_rmdir
+    cmp eax, SYS_SYMLINK
+    je .do_symlink
 
 if defined CONFIG_LINUX_COMPAT
     ; Fallback to Linux ABI for undeclared syscall numbers (marked distinctly
@@ -429,6 +432,14 @@ end if
     pushfq
     cli
     call sys_handler_rmdir
+    popfq
+    jmp .syscall_ret
+
+.do_symlink:
+    ; RDI = target, RSI = linkpath
+    pushfq
+    cli
+    call sys_handler_symlink
     popfq
     jmp .syscall_ret
 
@@ -1808,6 +1819,102 @@ sys_handler_rmdir:
 
 .rd_err:
     add rsp, 64
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    mov rax, -1
+    ret
+
+; ==============================================================================
+; sys_handler_symlink: Create symbolic link in ext4 filesystem
+; RDI = user target path pointer, RSI = user linkpath pointer
+; Returns: RAX = 0 on success, or -1 on error
+; ==============================================================================
+sys_handler_symlink:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r12
+    push r13
+    push r14
+    push r15
+    sub rsp, 128
+
+    test rdi, rdi
+    jz .sl_err
+    test rsi, rsi
+    jz .sl_err
+
+    mov r12, rdi                        ; user target
+    mov r13, rsi                        ; user linkpath
+
+    mov rdi, r12
+    mov rsi, 64
+    call sys_validate_user_ptr
+    jc .sl_err
+
+    mov rdi, r13
+    mov rsi, 64
+    call sys_validate_user_ptr
+    jc .sl_err
+
+    ; Copy target into [rsp]
+    mov rsi, r12
+    lea rdi, [rsp]
+    mov ecx, 63
+.sl_cp_tgt:
+    lodsb
+    stosb
+    test al, al
+    jz .sl_cp_tgt_done
+    dec ecx
+    jnz .sl_cp_tgt
+    mov byte [rdi], 0
+.sl_cp_tgt_done:
+
+    ; Copy linkpath into [rsp + 64]
+    mov rsi, r13
+    lea rdi, [rsp + 64]
+    mov ecx, 63
+.sl_cp_lnk:
+    lodsb
+    stosb
+    test al, al
+    jz .sl_cp_lnk_done
+    dec ecx
+    jnz .sl_cp_lnk
+    mov byte [rdi], 0
+.sl_cp_lnk_done:
+
+    ; ext4_symlink: RSI = symlink path, RDX = target string
+    lea rsi, [rsp + 64]
+    lea rdx, [rsp]
+    call ext4_symlink
+    jc .sl_err
+
+    xor eax, eax
+    add rsp, 128
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+.sl_err:
+    add rsp, 128
     pop r15
     pop r14
     pop r13
