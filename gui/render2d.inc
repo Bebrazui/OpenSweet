@@ -459,6 +459,410 @@ r2d_blit_bitmap_stride:
     ret
 
 ; ==============================================================================
+; r2d_blit_bitmap_bottom_rounded: Blit w*h bitmap with anti-aliased bottom rounded corners
+; ECX = dst_x, EDX = dst_y, ESI = w, EDI = h, R8 = src_buf, EBX = src_stride_pixels, EAX = radius
+; ==============================================================================
+r2d_blit_bitmap_bottom_rounded:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+    push rbp
+    sub rsp, 48
+
+    test esi, esi
+    jle .bbbr_ret
+    test edi, edi
+    jle .bbbr_ret
+    test r8, r8
+    jz .bbbr_ret
+    test ebx, ebx
+    jle .bbbr_ret
+
+    mov [rsp + 0], ecx                  ; dst_x
+    mov [rsp + 4], edx                  ; dst_y
+    mov [rsp + 8], esi                  ; w
+    mov [rsp + 12], edi                 ; h
+    mov [rsp + 16], r8                  ; src_buf
+    mov [rsp + 24], ebx                 ; src_stride
+    mov [rsp + 28], eax                 ; radius
+
+    ; r_outer_sq = (r + 1) * (r + 1)
+    lea edx, [eax + 1]
+    imul edx, edx
+    mov [rsp + 32], edx                 ; r_outer_sq
+
+    ; span_4r = 4 * r
+    shl eax, 2
+    test eax, eax
+    jnz @f
+    mov eax, 1
+@@:
+    mov [rsp + 36], eax                 ; span_4r
+
+    xor r12d, r12d                      ; py = 0
+.bbbr_y_loop:
+    cmp r12d, [rsp + 12]
+    jge .bbbr_ret
+
+    ; screen_y = dst_y + py
+    mov r10d, [rsp + 4]
+    add r10d, r12d
+    cmp r10d, 0
+    jl .bbbr_next_y
+    cmp r10d, R2D_SCREEN_H
+    jge .bbbr_ret
+
+    ; Compute src_row_ptr = src_buf + (py * src_stride) * 4
+    mov eax, r12d
+    imul eax, [rsp + 24]
+    shl rax, 2
+    add rax, [rsp + 16]
+    mov r13, rax                        ; r13 = src_row_ptr
+
+    ; Check if row is in bottom corner region: py >= h - r
+    mov eax, [rsp + 12]
+    sub eax, [rsp + 28]                 ; h - r
+    cmp r12d, eax
+    jae .bbbr_corner_row
+
+    ; --- Top / Middle Row: Fast Blit ---
+    mov eax, [rsp + 0]                  ; cur_x = dst_x
+    mov ecx, [rsp + 8]                  ; draw_w = w
+    mov rsi, r13                        ; src_ptr
+
+    test eax, eax
+    jns .bbbr_left_ok
+    neg eax
+    cmp eax, ecx
+    jae .bbbr_next_y
+    sub ecx, eax
+    shl eax, 2
+    add rsi, rax
+    xor eax, eax
+.bbbr_left_ok:
+    cmp eax, R2D_SCREEN_W
+    jae .bbbr_next_y
+    mov edx, eax
+    add edx, ecx
+    cmp edx, R2D_SCREEN_W
+    jbe .bbbr_right_ok
+    mov ecx, R2D_SCREEN_W
+    sub ecx, eax
+.bbbr_right_ok:
+    test ecx, ecx
+    jle .bbbr_next_y
+
+    mov edx, r10d
+    imul edx, R2D_PITCH
+    lea rdi, [R2D_BACKBUFFER + rdx]
+    lea rdi, [rdi + rax*4]
+
+    cld
+    rep movsd
+    jmp .bbbr_next_y
+
+.bbbr_corner_row:
+    ; dy = py - (h - r - 1)
+    mov eax, [rsp + 12]
+    sub eax, [rsp + 28]
+    dec eax
+    mov ebp, r12d
+    sub ebp, eax                        ; ebp = dy
+
+    xor r14d, r14d                      ; px = 0
+.bbbr_x_loop:
+    cmp r14d, [rsp + 8]
+    jae .bbbr_next_y
+
+    mov eax, [rsp + 0]
+    add eax, r14d                       ; screen_x = dst_x + px
+    cmp eax, 0
+    jl .bbbr_next_x
+    cmp eax, R2D_SCREEN_W
+    jae .bbbr_next_y
+
+    ; Corner region check:
+    ; Left corner: px < r
+    mov ebx, [rsp + 28]                 ; r
+    cmp r14d, ebx
+    jb .bbbr_left_corner
+
+    ; Right corner: px >= w - r
+    mov eax, [rsp + 8]
+    sub eax, ebx
+    cmp r14d, eax
+    jae .bbbr_right_corner
+
+    ; Center pixels of corner row: solid pixel copy
+    mov eax, [r13 + r14*4]
+    mov edx, r10d
+    imul edx, R2D_PITCH
+    mov ecx, [rsp + 0]
+    add ecx, r14d
+    mov [R2D_BACKBUFFER + rdx + rcx*4], eax
+    jmp .bbbr_next_x
+
+.bbbr_left_corner:
+    mov ecx, ebx
+    sub ecx, r14d                       ; dx = r - px
+    jmp .bbbr_calc_dist
+
+.bbbr_right_corner:
+    mov eax, [rsp + 8]
+    sub eax, ebx
+    dec eax
+    mov ecx, r14d
+    sub ecx, eax                        ; dx = px - (w - r - 1)
+
+.bbbr_calc_dist:
+    imul ecx, ecx                       ; dx^2
+    mov eax, ebp
+    imul eax, eax                       ; dy^2
+    add ecx, eax                        ; ecx = dist_sq
+
+    cmp ecx, [rsp + 32]                 ; dist_sq > r_outer_sq?
+    ja .bbbr_next_x                     ; outside circle: clipped to background!
+
+    mov eax, [rsp + 32]
+    sub eax, ecx                        ; delta = r_outer_sq - dist_sq
+    cmp eax, [rsp + 36]
+    jae .bbbr_pixel_solid
+
+    ; Anti-aliased edge: coverage alpha = (delta * 255) / span_4r
+    mov edx, 255
+    imul eax, edx
+    xor edx, edx
+    div dword [rsp + 36]
+    shl eax, 24
+    mov edx, [r13 + r14*4]
+    and edx, 0x00FFFFFF
+    or eax, edx
+
+    mov edx, r10d
+    imul edx, R2D_PITCH
+    mov ecx, [rsp + 0]
+    add ecx, r14d
+    lea rdi, [R2D_BACKBUFFER + rdx + rcx*4]
+    call r2d_blend_pixel
+    jmp .bbbr_next_x
+
+.bbbr_pixel_solid:
+    mov eax, [r13 + r14*4]
+    mov edx, r10d
+    imul edx, R2D_PITCH
+    mov ecx, [rsp + 0]
+    add ecx, r14d
+    mov [R2D_BACKBUFFER + rdx + rcx*4], eax
+
+.bbbr_next_x:
+    inc r14d
+    jmp .bbbr_x_loop
+
+.bbbr_next_y:
+    inc r12d
+    jmp .bbbr_y_loop
+
+.bbbr_ret:
+    add rsp, 48
+    pop rbp
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; ==============================================================================
+; r2d_scale_bitmap_stride: Smoothly scales src_w * src_h bitmap into dst_w * dst_h
+; ECX = dst_x, EDX = dst_y, ESI = dst_w, EDI = dst_h,
+; R8 = src_buf, R9D = src_w, R10D = src_h, EBX = src_stride_pixels
+; ==============================================================================
+r2d_scale_bitmap_stride:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push rbp
+    sub rsp, 48
+
+    ; Validation checks
+    test esi, esi
+    jle .scale_ret
+    test edi, edi
+    jle .scale_ret
+    test r8, r8
+    jz .scale_ret
+    test r9d, r9d
+    jle .scale_ret
+    test r10d, r10d
+    jle .scale_ret
+    test ebx, ebx
+    jle .scale_ret
+
+    ; Save inputs on local frame
+    mov [rsp + 0], ecx                  ; dst_x
+    mov [rsp + 4], edx                  ; dst_y
+    mov [rsp + 8], esi                  ; dst_w
+    mov [rsp + 12], edi                 ; dst_h
+    mov [rsp + 16], r9d                 ; src_w
+    mov [rsp + 20], r10d                ; src_h
+    mov [rsp + 24], ebx                 ; src_stride
+    mov [rsp + 32], r8                  ; src_buf
+
+    ; Compute x_step = (src_w << 16) / dst_w
+    mov eax, r9d
+    shl rax, 16
+    xor edx, edx
+    div esi
+    test eax, eax
+    jnz @f
+    mov eax, 1                          ; fallback min step
+@@:
+    mov [rsp + 40], eax                 ; x_step
+
+    ; Y-loop: dy from 0 to dst_h - 1 (stored in r12d)
+    xor r12d, r12d
+
+.scale_y_loop:
+    cmp r12d, [rsp + 12]                ; dy vs dst_h
+    jge .scale_ret
+
+    ; Calculate screen_y = dst_y + dy
+    mov eax, [rsp + 4]                  ; dst_y
+    add eax, r12d                       ; screen_y
+    cmp eax, 0
+    jl .scale_next_y
+    cmp eax, R2D_SCREEN_H
+    jge .scale_ret                      ; remaining rows will also be off-screen
+
+    ; Compute src_y = (dy * src_h) / dst_h
+    mov eax, r12d
+    imul eax, [rsp + 20]                ; dy * src_h
+    xor edx, edx
+    div dword [rsp + 12]
+    cmp eax, [rsp + 20]
+    jb @f
+    mov eax, [rsp + 20]
+    dec eax
+@@:
+    ; Pointer to source row: src_row = src_buf + (src_y * src_stride) * 4
+    imul eax, [rsp + 24]
+    shl rax, 2
+    add rax, [rsp + 32]
+    mov r8, rax                         ; r8 = src_row_ptr
+
+    ; Horizontal clipping:
+    ; Screen x range: [dst_x .. dst_x + dst_w)
+    mov eax, [rsp + 0]                  ; dst_x
+    mov ecx, [rsp + 8]                  ; dst_w
+    xor ebx, ebx                        ; dx_start = 0
+
+    test eax, eax
+    jns .scale_left_ok
+    neg eax                             ; eax = -dst_x
+    cmp eax, ecx
+    jae .scale_next_y                   ; totally off-screen left
+    sub ecx, eax                        ; remaining width
+    mov ebx, eax                        ; dx_start = -dst_x
+    xor eax, eax                        ; screen_x = 0
+.scale_left_ok:
+    cmp eax, R2D_SCREEN_W
+    jae .scale_next_y                   ; totally off-screen right
+    mov edx, eax
+    add edx, ecx                        ; screen_x + width
+    cmp edx, R2D_SCREEN_W
+    jbe .scale_right_ok
+    mov ecx, R2D_SCREEN_W
+    sub ecx, eax                        ; clip to screen width
+.scale_right_ok:
+    test ecx, ecx
+    jle .scale_next_y
+
+    ; Destination pointer:
+    ; rdi = R2D_BACKBUFFER + screen_y * R2D_PITCH + screen_x * 4
+    mov edx, [rsp + 4]
+    add edx, r12d                       ; screen_y
+    imul edx, R2D_PITCH
+    lea rdi, [R2D_BACKBUFFER + rdx]
+    lea rdi, [rdi + rax*4]
+
+    ; Compute initial x_accum = dx_start * x_step + (x_step >> 1)
+    mov ebp, [rsp + 40]                 ; x_step
+    mov eax, ebx                        ; dx_start
+    imul eax, ebp
+    mov edx, ebp
+    shr edx, 1
+    add eax, edx
+    mov r14d, eax                       ; r14d = x_accum
+    mov r11d, [rsp + 16]                ; src_w
+    dec r11d                            ; max src_x = src_w - 1
+
+.scale_x_loop:
+    mov eax, r14d
+    shr eax, 16
+    cmp eax, r11d
+    jbe @f
+    mov eax, r11d
+@@:
+    mov eax, [r8 + rax*4]
+    mov [rdi], eax
+    add rdi, 4
+    add r14d, ebp
+    dec ecx
+    jnz .scale_x_loop
+
+.scale_next_y:
+    inc r12d
+    jmp .scale_y_loop
+
+.scale_ret:
+    add rsp, 48
+    pop rbp
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; ==============================================================================
 ; r2d_draw_ambient_wallpaper: Blit pre-rendered wallpaper cache to Backbuffer (<0.3 ms)
 ; ==============================================================================
 r2d_draw_ambient_wallpaper:

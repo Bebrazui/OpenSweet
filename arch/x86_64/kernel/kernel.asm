@@ -141,6 +141,8 @@ kmain:
     call mouse_init
     call net_init
     call modern_desktop_init
+    call shm_init
+    call x11_init
 
     ; Initialize Preemptive Multitasking Scheduler
     call sched_init
@@ -3487,6 +3489,8 @@ include 'D:\Opensweet\kernel\sched.inc'
 include 'D:\Opensweet\kernel\heap.inc'
 include 'D:\Opensweet\kernel\vfs.inc'
 include 'D:\Opensweet\kernel\compat_linux.inc'
+include 'D:\Opensweet\kernel\shm.inc'
+include 'D:\Opensweet\kernel\x11.inc'
 include 'D:\Opensweet\kernel\syscall.inc'
 include 'D:\Opensweet\kernel\test_user.inc'
 include 'D:\Opensweet\kernel\elf.inc'

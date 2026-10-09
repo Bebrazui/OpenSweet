@@ -504,6 +504,76 @@ void os_main(int argc, char **argv) {
         print("[Linux ABI] unlink rc=");
         print_dec(unl);
         print("\n");
+
+        /* 9. SysV Shared Memory (shmget, shmat, shmctl, shmdt) */
+        long long shmid = sys3(29, 0, 8192, 0666); /* shmget(IPC_PRIVATE, 8192, 0666) */
+        print("[Linux ABI] shmget shmid=");
+        print_dec(shmid);
+        print("\n");
+
+        if (shmid > 0) {
+            long long shmaddr = sys3(30, shmid, 0, 0); /* shmat(shmid, NULL, 0) */
+            print("[Linux ABI] shmat addr=");
+            print_hex((unsigned long long)shmaddr);
+            print("\n");
+
+            if (shmaddr > 0) {
+                /* Write test pattern into shared memory */
+                char *ptr = (char *)shmaddr;
+                ptr[0] = 'S'; ptr[1] = 'H'; ptr[2] = 'M'; ptr[3] = '\0';
+                print("[Linux ABI] shm readback=");
+                print(ptr);
+                print("\n");
+
+                sys1(67, shmaddr); /* shmdt */
+            }
+            sys3(31, shmid, 0, 0); /* shmctl(shmid, IPC_RMID, NULL) */
+        }
+
+        /* 10. X11 Wire Protocol Test via AF_UNIX socket /tmp/.X11-unix/X0 */
+        long long xsock = sys3(41, 1, 1, 0); /* socket(AF_UNIX, SOCK_STREAM, 0) */
+        print("[Linux ABI] X11 socket fd=");
+        print_dec(xsock);
+        print("\n");
+
+        if (xsock >= 0) {
+            struct {
+                unsigned short family;
+                char path[108];
+            } sun;
+            sun.family = 1; /* AF_UNIX */
+            char *p = sun.path;
+            const char *src_p = "/tmp/.X11-unix/X0";
+            while (*src_p) *p++ = *src_p++;
+            *p = '\0';
+
+            long long cr = sys3(42, xsock, (long long)&sun, 110); /* connect */
+            print("[Linux ABI] X11 connect rc=");
+            print_dec(cr);
+            print("\n");
+
+            /* Send 12-byte X11 Connection Setup request (Little Endian) */
+            char x11_req[12] = {
+                'l', 0,          /* byte order 'l' = LSB */
+                11, 0,           /* major version 11 */
+                0, 0,            /* minor version 0 */
+                0, 0,            /* auth name len 0 */
+                0, 0,            /* auth data len 0 */
+                0, 0             /* unused */
+            };
+            sys3(1, xsock, (long long)x11_req, 12); /* write */
+
+            /* Read X11 Connection Setup Reply */
+            char x11_reply[32];
+            long long rr = sys3(0, xsock, (long long)x11_reply, 32); /* read */
+            print("[Linux ABI] X11 handshake reply bytes=");
+            print_dec(rr);
+            print(" status=");
+            print_dec((unsigned char)x11_reply[0]); /* 1 = Success */
+            print("\n");
+
+            sys1(3, xsock); /* close */
+        }
     }
 
     sys1(60, 0);

@@ -337,10 +337,19 @@ FastSymlink ($itable + 29 * 128) '.'
 # inode 31 = lib64 symlink -> .
 FastSymlink ($itable + 30 * 128) '.'
 
+$tmpStartBlock = $binStartBlock + 1
+$tmpX11StartBlock = $binStartBlock + 2
+# inode 33 = /tmp directory
+ExtentLeaf ($itable + 32 * 128) $tmpStartBlock 1 1024 0x41FF
+# inode 34 = /tmp/.X11-unix directory
+ExtentLeaf ($itable + 33 * 128) $tmpX11StartBlock 1 1024 0x41FF
+# inode 35 = /tmp/.X11-unix/X0 socket (S_IFSOCK = 0xC000 | 0777)
+ExtentLeaf ($itable + 34 * 128) 0 0 0 0xC1FF
+
 $debPkgPath = Join-Path $PSScriptRoot "build\test.deb"
 $hasDebPkg = Test-Path $debPkgPath
 $debPkgBlocks = 0
-$debPkgStartBlock = $binStartBlock + 1
+$debPkgStartBlock = $binStartBlock + 3
 if ($hasDebPkg) {
     $debPkgBytes = [IO.File]::ReadAllBytes($debPkgPath)
     $debPkgBlocks = [int][Math]::Ceiling($debPkgBytes.Length / 1024.0)
@@ -448,6 +457,8 @@ DirEntry $curOff 30 'lib' 7 16
 $curOff += 16
 DirEntry $curOff 31 'lib64' 7 16
 $curOff += 16
+DirEntry $curOff 33 'tmp' 2 16
+$curOff += 16
 if ($hasDebPkg) {
     $rec = if ($hasWad) { 16 } else { $d + 1024 - $curOff }
     DirEntry $curOff 32 'test.deb' 1 $rec
@@ -537,6 +548,22 @@ DirEntry ($bOff + 136) 23 'dpkg-deb' 1 20
 DirEntry ($bOff + 156) 23 'busybox' 1 ($BS - 156)
 echo "Added /bin directory (echo, sh, ls, cat, ar, tar, dpkg, dpkg-deb, busybox) and /usr, /lib, /lib64 symlinks to disk image"
 
+# ---- /tmp dir data @ block $tmpStartBlock ----
+$tOff = $tmpStartBlock * $BS
+[Array]::Clear($img, $tOff, $BS)
+DirEntry $tOff        33 '.'        2 12
+DirEntry ($tOff + 12) 2  '..'       2 12
+DirEntry ($tOff + 24) 34 '.X11-unix' 2 ($BS - 24)
+
+# ---- /tmp/.X11-unix dir data @ block $tmpX11StartBlock ----
+$txOff = $tmpX11StartBlock * $BS
+[Array]::Clear($img, $txOff, $BS)
+DirEntry $txOff        34 '.'       2 12
+DirEntry ($txOff + 12) 33 '..'      2 12
+DirEntry ($txOff + 24) 35 'X0'      6 ($BS - 24)
+
+echo "Added /tmp and /tmp/.X11-unix/X0 socket structure to disk image"
+
 if ($hasDebPkg) {
     Put ($debPkgStartBlock * $BS) $debPkgBytes
     echo "Added test.deb ($($debPkgBytes.Length) bytes, $debPkgBlocks blocks) to disk image"
@@ -548,7 +575,7 @@ if ($hasWad) {
 }
 
 # ---- populate block and inode bitmaps and free counts ----
-$totalAllocatedBlocksGrp0 = if ($hasDebPkg) { $debPkgStartBlock + $debPkgBlocks } else { $binStartBlock + 1 }
+$totalAllocatedBlocksGrp0 = if ($hasDebPkg) { $debPkgStartBlock + $debPkgBlocks } else { $tmpX11StartBlock + 1 }
 
 # Block bitmap at block 3:
 # In Group 0 with 1KB block size, first_data_block = 1.
@@ -582,7 +609,7 @@ $img[(4 * $BS) + 0] = 0xFF
 # Inodes 9..10 (bits 0,1 of byte 1 = 3)
 $img[(4 * $BS) + 1] = 0x03
 $usedInoCountGrp0 = 10
-$lastIno = if ($hasDebPkg) { 32 } else { 31 }
+$lastIno = 35
 for ($ino = 11; $ino -le $lastIno; $ino++) {
     $bit = $ino - 1
     $byteIdx = $bit -shr 3

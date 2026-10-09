@@ -126,6 +126,10 @@ LINUX_SYS_PSELECT6    = 270
 LINUX_SYS_PPOLL       = 271
 LINUX_SYS_ACCEPT4     = 288
 LINUX_SYS_EPOLL_CREATE1= 291
+LINUX_SYS_SHMGET       = 29
+LINUX_SYS_SHMAT        = 30
+LINUX_SYS_SHMCTL       = 31
+LINUX_SYS_SHMDT        = 67
 
 ; Signal numbers (Linux x86_64 numbering)
 LINUX_SIGINT   = 2
@@ -181,6 +185,7 @@ LINUX_EINVAL  = -22
 LINUX_ENFILE  = -23
 LINUX_EMFILE  = -24
 LINUX_ENOTTY = -25
+LINUX_ENOSPC  = -28
 LINUX_EROFS   = -30
 LINUX_EMLINK  = -31
 LINUX_EPIPE   = -32
@@ -1107,6 +1112,14 @@ linux_syscall_dispatch:
     je .l_epoll_ctl
     cmp eax, LINUX_SYS_EPOLL_WAIT
     je .l_epoll_wait
+    cmp eax, LINUX_SYS_SHMGET
+    je sys_linux_shmget
+    cmp eax, LINUX_SYS_SHMAT
+    je sys_linux_shmat
+    cmp eax, LINUX_SYS_SHMCTL
+    je sys_linux_shmctl
+    cmp eax, LINUX_SYS_SHMDT
+    je sys_linux_shmdt
 
     ; Unhandled Linux syscall: log to serial and return -ENOSYS
     push rax
@@ -1127,10 +1140,27 @@ linux_syscall_dispatch:
     push rdi
     push rsi
     push rdx
-    call vfs_read_fd
+    mov edi, edi
+    call vfs_get_fd_ptr
+    test rax, rax
+    jz .l_read_normal
+    cmp word [rax + 2], 35             ; inode 35 = X0 socket?
+    jne .l_read_normal
+    ; X11 client read: RBX = client ptr
+    mov rbx, [rax + 4]
+    test rbx, rbx
+    jz .l_read_normal
+    pop rdx                            ; count
+    pop rdi                            ; user dest buf
+    pop rax                            ; discard saved fd
+    call x11_client_read
+    ret
+
+.l_read_normal:
     pop rdx
     pop rsi
     pop rdi
+    call vfs_read_fd
     ; Return value is in RAX from vfs_read
     cmp rax, -1
     jne .l_read_ret
@@ -1144,10 +1174,29 @@ linux_syscall_dispatch:
     push rdi
     push rsi
     push rdx
-    call vfs_write_fd
+    mov edi, edi
+    call vfs_get_fd_ptr
+    test rax, rax
+    jz .l_write_normal
+    cmp word [rax + 2], 35             ; inode 35 = X0 socket?
+    jne .l_write_normal
+    ; X11 client write: RBX = client ptr
+    mov rbx, [rax + 4]
+    test rbx, rbx
+    jz .l_write_normal
+    pop rdx                            ; count
+    pop rsi                            ; user buf
+    pop rdi                            ; saved fd
+    push rdx
+    call x11_process_rx
+    pop rax                            ; return count written
+    ret
+
+.l_write_normal:
     pop rdx
     pop rsi
     pop rdi
+    call vfs_write_fd
     ; Return value in RAX from vfs_write_fd
     cmp rax, -1
     jne .l_write_ret
@@ -4591,6 +4640,33 @@ linux_syscall_dispatch:
 
 .l_connect:
     ; int connect(sockfd=RDI, addr=RSI, addrlen=RDX)
+    ; Check if connecting to X11 socket (/tmp/.X11-unix/X0 or sun_family == 1)
+    test rsi, rsi
+    jz .conn_ok
+    ; If sockaddr_un (family == 1)
+    cmp word [rsi], 1
+    jne .conn_ok
+
+    ; Allocate X11 client slot
+    call x11_alloc_client
+    test rax, rax
+    jz .conn_ok
+
+    ; Store client pointer in fd entry
+    ; RAX = client pointer
+    push rax
+    mov edi, edi
+    call vfs_get_fd_ptr
+    pop rdx
+    test rax, rax
+    jz .conn_ok
+
+    ; Set fd_entry type to mock/dev_null and store client pointer in offset/size (+4..+11)
+    ; And inode = 35 (X0 socket)
+    mov word  [rax + 2], 35            ; inode 35 = X0 socket
+    mov [rax + 4], rdx                 ; store client pointer (8 bytes: +4 and +8)
+
+.conn_ok:
     xor eax, eax
     ret
 

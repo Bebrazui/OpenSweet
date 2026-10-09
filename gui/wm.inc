@@ -640,7 +640,38 @@ wm_render_window:
     test r8, r8
     jz .win_rendered
 
-    call r2d_blit_bitmap
+    ; Check if window is currently animating (e.g. restoring from PiP)
+    cmp byte [r15 + wm_anim_active - kmain + rax], 1
+    jne .normal_win_blit
+
+    mov r9d, [r15 + wm_pip_saved_w - kmain + rax*4]
+    test r9d, r9d
+    jnz @f
+    mov r9d, 680
+@@:
+    mov r10d, [r15 + wm_pip_saved_h - kmain + rax*4]
+    test r10d, r10d
+    jnz @f
+    mov r10d, 600
+@@:
+    sub r10d, 33
+    cmp r10d, 10
+    jge @f
+    mov r10d, 10
+@@:
+    mov ebx, r9d
+    call r2d_scale_bitmap_stride
+    jmp .win_rendered
+
+.normal_win_blit:
+    ; Use window width as source stride and round bottom corners by 14px
+    mov ebx, [r15 + wm_w - kmain + rax*4]
+    test ebx, ebx
+    jnz @f
+    mov ebx, esi
+@@:
+    mov eax, 14                         ; bottom corner radius = 14px (matching window frame)
+    call r2d_blit_bitmap_bottom_rounded
     jmp .win_rendered
 
 .render_pip_window:
@@ -710,23 +741,35 @@ wm_render_window:
     mov eax, 0x18FFFFFF
     call r2d_fill_rect_alpha
 
-    ; 4. Blit Client Content (wx, wy + 27, ww, wh - 27)
-    mov ecx, r8d
+    ; 4. Blit & Scale Client Content (wx, wy + 27, ww, wh - 27)
+    mov ecx, r8d                        ; dst_x = wx
     mov edx, r9d
-    add edx, 27
-    mov esi, r10d
+    add edx, 27                         ; dst_y = wy + 27
+    mov esi, r10d                       ; dst_w = ww
     mov edi, r11d
-    sub edi, 27
-    mov eax, r13d
+    sub edi, 27                         ; dst_h = wh - 27
+    mov eax, r13d                       ; app_id
     mov r8, [r15 + wm_user_canvas - kmain + rax*8]
     test r8, r8
     jz .win_rendered
-    mov ebx, [r15 + wm_pip_saved_w - kmain + rax*4]
-    test ebx, ebx
+
+    mov r9d, [r15 + wm_pip_saved_w - kmain + rax*4]
+    test r9d, r9d
     jnz @f
-    mov ebx, 760                      ; fallback stride
+    mov r9d, 680                        ; fallback src_w
 @@:
-    call r2d_blit_bitmap_stride
+    mov r10d, [r15 + wm_pip_saved_h - kmain + rax*4]
+    test r10d, r10d
+    jnz @f
+    mov r10d, 600                       ; fallback src_h
+@@:
+    sub r10d, 33                        ; src_h = client canvas height = orig_h - 33
+    cmp r10d, 10
+    jge @f
+    mov r10d, 10
+@@:
+    mov ebx, r9d                        ; src_stride_pixels = src_w
+    call r2d_scale_bitmap_stride
 
 .win_rendered:
     pop r13
@@ -2076,12 +2119,113 @@ wm_toggle_pip:
     mov eax, [r15 + wm_h - kmain + rbx*4]
     mov [r15 + wm_pip_saved_h - kmain + rbx*4], eax
 
-    ; 2. Target PiP geometry: vertical card 250x380 at bottom-right
+    ; 2. Dynamically compute target PiP dimensions preserving window aspect ratio
+    mov ecx, [r15 + wm_pip_saved_w - kmain + rbx*4]     ; orig_w
+    mov edx, [r15 + wm_pip_saved_h - kmain + rbx*4]     ; orig_h
+    cmp ecx, 100
+    jge @f
+    mov ecx, 680
+@@:
+    cmp edx, 100
+    jge @f
+    mov edx, 600
+@@:
+    ; Client dimensions:
+    ; orig_cw = orig_w (ecx)
+    ; orig_ch = orig_h - 33 (edx)
+    sub edx, 33
+    cmp edx, 10
+    jge @f
+    mov edx, 10
+@@:
+
+    ; If orig_cw >= orig_ch (landscape or square)
+    cmp ecx, edx
+    jb .pip_portrait
+
+    ; Landscape/square: base pip_cw = 320
+    mov esi, 320                        ; pip_cw
+    mov eax, 320
+    imul eax, edx                       ; 320 * orig_ch
+    xor edx, edx
+    div ecx                             ; eax = pip_ch
+    mov edi, eax                        ; pip_ch
+
+    cmp edi, 300
+    jle .pip_clamp_landscape_min
+    ; If pip_ch > 300, clamp height to 300 and adjust width
+    mov edi, 300
+    mov eax, 300
+    imul eax, ecx                       ; 300 * orig_cw
+    mov r8d, edx                        ; r8d = divisor (orig_ch)
+    xor edx, edx                        ; clear high 32-bits for div!
+    div r8d                             ; eax = (300 * orig_cw) / orig_ch
+    mov esi, eax                        ; pip_cw
+    jmp .pip_dims_ready
+
+.pip_clamp_landscape_min:
+    cmp edi, 120
+    jge .pip_dims_ready
+    mov edi, 120
+    jmp .pip_dims_ready
+
+.pip_portrait:
+    ; Portrait: base pip_ch = 300
+    ; EDX = orig_ch (> 0), ECX = orig_cw (> 0)
+    mov edi, 300                        ; pip_ch
+    mov eax, 300
+    imul eax, ecx                       ; 300 * orig_cw
+    mov r8d, edx                        ; r8d = divisor (orig_ch)
+    xor edx, edx                        ; clear high 32-bits for div!
+    div r8d                             ; eax = (300 * orig_cw) / orig_ch
+    mov esi, eax                        ; pip_cw
+
+    cmp esi, 180
+    jge @f
+    mov esi, 180
+@@:
+    cmp esi, 360
+    jle .pip_dims_ready
+    mov esi, 360
+
+.pip_dims_ready:
+    ; Total window dimensions:
+    ; target_w = pip_cw (esi)
+    ; target_h = pip_ch + 27 (edi + 27)
+    add edi, 27
+
+    ; Ensure safety bounds:
+    cmp esi, 180
+    jge @f
+    mov esi, 180
+@@:
+    cmp esi, 420
+    jle @f
+    mov esi, 420
+@@:
+    cmp edi, 150
+    jge @f
+    mov edi, 150
+@@:
+    cmp edi, 380
+    jle @f
+    mov edi, 380
+@@:
+
     mov byte [r15 + wm_pip_mode - kmain + rbx], 1
-    mov dword [r15 + wm_anim_target_w - kmain + rbx*4], 250
-    mov dword [r15 + wm_anim_target_h - kmain + rbx*4], 380
-    mov dword [r15 + wm_anim_target_x - kmain + rbx*4], (1920 - 250 - 24) ; 1646
-    mov dword [r15 + wm_anim_target_y - kmain + rbx*4], (1080 - 380 - 72) ; 628
+    mov [r15 + wm_anim_target_w - kmain + rbx*4], esi
+    mov [r15 + wm_anim_target_h - kmain + rbx*4], edi
+
+    ; target_x = 1920 - target_w - 24
+    mov eax, 1920 - 24
+    sub eax, esi
+    mov [r15 + wm_anim_target_x - kmain + rbx*4], eax
+
+    ; target_y = 1080 - target_h - 72
+    mov eax, 1080 - 72
+    sub eax, edi
+    mov [r15 + wm_anim_target_y - kmain + rbx*4], eax
+
     mov byte [r15 + wm_anim_active - kmain + rbx], 1
     mov byte [r15 + md_term_dirty - kmain], 1
     jmp .toggle_pip_done
