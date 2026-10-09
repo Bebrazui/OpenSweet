@@ -49,13 +49,15 @@ static void load_file(const char *path) {
         text_len = (int)n;
         text_buf[text_len] = '\0';
         cursor_pos = text_len;
-        os_strcpy(cur_file_path, path);
+        os_strncpy(cur_file_path, path, sizeof(cur_file_path) - 1);
+        cur_file_path[sizeof(cur_file_path) - 1] = '\0';
         /* Extract file name for title */
         const char *p = path;
         for (int i = 0; path[i]; i++) {
             if (path[i] == '/') p = path + i + 1;
         }
-        os_strcpy(doc_title, p);
+        os_strncpy(doc_title, p, sizeof(doc_title) - 1);
+        doc_title[sizeof(doc_title) - 1] = '\0';
     }
 }
 

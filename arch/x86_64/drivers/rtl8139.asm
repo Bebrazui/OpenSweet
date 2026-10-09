@@ -103,7 +103,10 @@ rtl8139_pci_scan:
     mov dx, 0xCFC
     in eax, dx
 
-    ; If bit 0 == 1, it's I/O port
+    ; Check bit 0: must be 1 for I/O space BAR
+    test al, 1
+    jz .next_func                       ; Not an I/O BAR, skip device
+
     and eax, 0xFFFFFFFC
     mov [r15 + rtl_io_base - kmain], ax
 
@@ -427,10 +430,14 @@ rtl8139_poll:
 
     push rbx
     push rcx
+    push rdx
     push rsi
     push rdi
     push r8
     push r9
+    push r10
+
+    mov r10d, edx               ; r10d = caller's max destination buffer size
 
     movzx edx, word [r15 + rtl_io_base - kmain]
     add edx, RTL_REG_CR
@@ -454,6 +461,14 @@ rtl8139_poll:
     cmp ecx, 4
     jbe .bad_packet
     sub ecx, 4                  ; strip CRC
+
+    ; Bound check: Ethernet frame cannot exceed standard max frame size (1514)
+    cmp ecx, 1514
+    ja .bad_packet
+
+    ; Bound check: Packet must fit into caller's destination buffer
+    cmp ecx, r10d
+    ja .bad_packet
 
     ; Copy Ethernet frame to destination buffer
     mov r8, rsi
@@ -487,10 +502,12 @@ rtl8139_poll:
     out dx, ax
 
     mov eax, r9d                ; return packet length
+    pop r10
     pop r9
     pop r8
     pop rdi
     pop rsi
+    pop rdx
     pop rcx
     pop rbx
     clc
@@ -498,10 +515,12 @@ rtl8139_poll:
 
 .bad_packet:
 .no_packet_pop:
+    pop r10
     pop r9
     pop r8
     pop rdi
     pop rsi
+    pop rdx
     pop rcx
     pop rbx
 .no_packet:

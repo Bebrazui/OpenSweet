@@ -206,7 +206,21 @@ vfs_open:
     imul edx, ecx, FD_ENTRY_SIZE
     lea r14, [rbx + rdx]                ; r14 = pointer to fd_entry
 
-    ; Copy path to local buffer and fd_entry structure (+12)
+    ; Clear destination path buffer (36 bytes) in fd_entry to avoid leftover bytes
+    push rdi
+    lea rdi, [r14 + 12]
+    mov dword [rdi + 0], 0
+    mov dword [rdi + 4], 0
+    mov dword [rdi + 8], 0
+    mov dword [rdi + 12], 0
+    mov dword [rdi + 16], 0
+    mov dword [rdi + 20], 0
+    mov dword [rdi + 24], 0
+    mov dword [rdi + 28], 0
+    mov dword [rdi + 32], 0
+    pop rdi
+
+    ; Copy path to local buffer [rsp..rsp+48] and fd_entry structure (+12, max 35 chars)
     mov rsi, r12
     lea rdi, [rsp]
     lea rdx, [r14 + 12]
@@ -221,7 +235,7 @@ vfs_open:
     dec ecx
     jnz .cp_p
     mov byte [rdi], 0
-    mov byte [rdx], 0
+    mov byte [r14 + 12 + 35], 0        ; force terminate at max boundary
 .cp_p_done:
     ; Check for virtual devices: /dev/null, /dev/zero, /dev/urandom
     cmp dword [rsp], '/dev'
@@ -631,15 +645,19 @@ vfs_lseek:
 .seek_cur:
     mov eax, [rbx + 4]
     add rax, rsi
+    jo .lseek_err
     jmp .seek_apply
 
 .seek_end:
     mov eax, [rbx + 8]
     add rax, rsi
+    jo .lseek_err
 
 .seek_apply:
     test rax, rax
     js .lseek_err                       ; negative offset not allowed
+    cmp rax, 0x7FFFFFFF                 ; max positive signed 32-bit offset
+    ja .lseek_err
     mov [rbx + 4], eax                  ; update offset
     pop rbx
     popfq
@@ -1274,6 +1292,10 @@ vfs_redirect_child_fd:
     cmp edx, MAX_FDS_PER_TASK
     jae .rc_done
     cmp ecx, 3
+    jae .rc_done
+    cmp ebx, MAX_TASKS
+    jae .rc_done
+    cmp eax, MAX_TASKS
     jae .rc_done
 
     ; RSI = parent's fd_entry

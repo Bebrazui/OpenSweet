@@ -954,9 +954,11 @@ sys_handler_listdir:
 
 .ld_skip:
     movzx eax, word [r8 + 4]          ; rec_len
-    test eax, eax
-    jz .ld_block_done
+    cmp eax, 8                        ; minimal valid ext4 directory entry header size
+    jb .ld_block_done                 ; corrupted rec_len: terminate block parsing
     add r8, rax
+    cmp r8, r9                        ; must not advance past block end
+    ja .ld_block_done
     jmp .ld_parse_ent
 
 .ld_block_done:

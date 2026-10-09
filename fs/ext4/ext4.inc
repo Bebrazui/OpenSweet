@@ -874,10 +874,18 @@ jmp .rp_success
     ret
 
 .rp_strcpy:
+    push rcx
+    mov ecx, 255
+.rp_sc_loop:
     lodsb
     stosb
     test al, al
-    jnz .rp_strcpy
+    jz .rp_sc_done
+    dec ecx
+    jnz .rp_sc_loop
+    mov byte [rdi], 0
+.rp_sc_done:
+    pop rcx
     ret
 
 ; ================= add entry to directory =================

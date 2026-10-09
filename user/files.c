@@ -168,14 +168,20 @@ static void render_explorer(os_window_t *win) {
 
     if (entry_count > 0 && selected_idx < entry_count) {
         /* Selected item details */
-        char sel_info[80];
-        os_strcpy(sel_info, "Selected: ");
-        os_strcpy(sel_info + os_strlen(sel_info), entries[selected_idx].name);
-        os_strcpy(sel_info + os_strlen(sel_info), " (");
+        char sel_info[128];
         char sz[32];
         format_size(entries[selected_idx].size, sz);
-        os_strcpy(sel_info + os_strlen(sel_info), sz);
-        os_strcpy(sel_info + os_strlen(sel_info), ")");
+        sel_info[0] = '\0';
+        os_strncpy(sel_info, "Selected: ", sizeof(sel_info) - 1);
+        size_t cur = os_strlen(sel_info);
+        os_strncpy(sel_info + cur, entries[selected_idx].name, sizeof(sel_info) - cur - 1);
+        cur = os_strlen(sel_info);
+        os_strncpy(sel_info + cur, " (", sizeof(sel_info) - cur - 1);
+        cur = os_strlen(sel_info);
+        os_strncpy(sel_info + cur, sz, sizeof(sel_info) - cur - 1);
+        cur = os_strlen(sel_info);
+        os_strncpy(sel_info + cur, ")", sizeof(sel_info) - cur - 1);
+        sel_info[sizeof(sel_info) - 1] = '\0';
         os_draw_text_ui_aa(win, 18, bot_y + 19, sel_info, OS_COLOR_SLATE_200);
 
         /* Action button on bottom right */
@@ -235,9 +241,11 @@ int main(void) {
                 else if (mx >= win.client_w - 150 && mx <= win.client_w - 14 && 
                          my >= win.client_h - BOT_H + 12 && my <= win.client_h - BOT_H + 44) {
                     if (entry_count > 0 && selected_idx < entry_count) {
-                        char path[64];
-                        os_strcpy(path, "/");
-                        os_strcpy(path + 1, entries[selected_idx].name);
+                        char path[128];
+                        path[0] = '/';
+                        path[1] = '\0';
+                        os_strncpy(path + 1, entries[selected_idx].name, sizeof(path) - 2);
+                        path[sizeof(path) - 1] = '\0';
                         int is_elf = (os_strlen(entries[selected_idx].name) > 4 && 
                                       entries[selected_idx].name[os_strlen(entries[selected_idx].name)-1] == 'f');
                         if (is_elf) {

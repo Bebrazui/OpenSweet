@@ -82,11 +82,12 @@ static void render_calc(os_window_t *win) {
     os_fill_rect(win, 24, 17, 270, 1, OS_ARGB(0x25, 0xFF, 0xFF, 0xFF));
 
     /* 2b. Secondary Expression History line */
-    char hist_str[32];
+    char hist_str[64];
     if (has_prev && active_op) {
-        char num_str[24];
+        char num_str[32];
         os_itoa(prev_val, num_str);
-        os_strcpy(hist_str, num_str);
+        hist_str[0] = '\0';
+        os_strncpy(hist_str, num_str, sizeof(hist_str) - 4);
         size_t len = os_strlen(hist_str);
         hist_str[len] = ' ';
         hist_str[len + 1] = active_op;
@@ -100,9 +101,10 @@ static void render_calc(os_window_t *win) {
     os_draw_text_ui_aa(win, hist_x, 24, hist_str, OS_COLOR_SLATE_400);
 
     /* 2c. Main Big Readout (Smooth Anti-Aliased 2x Typography) */
-    char main_str[32];
+    char main_str[64];
     if (has_error) {
-        os_strcpy(main_str, "ERROR");
+        os_strncpy(main_str, "ERROR", sizeof(main_str) - 1);
+        main_str[sizeof(main_str) - 1] = '\0';
     } else {
         os_itoa(current_val, main_str);
     }
@@ -135,18 +137,34 @@ static void render_calc(os_window_t *win) {
 /* Execute arithmetic calculation */
 static void execute_op(void) {
     if (!has_prev || !active_op) return;
+    int64_t res = 0;
     switch (active_op) {
         case '+':
-            current_val = prev_val + current_val;
+            if (__builtin_add_overflow(prev_val, current_val, &res)) {
+                has_error = true;
+                current_val = 0;
+            } else {
+                current_val = res;
+            }
             break;
         case '-':
-            current_val = prev_val - current_val;
+            if (__builtin_sub_overflow(prev_val, current_val, &res)) {
+                has_error = true;
+                current_val = 0;
+            } else {
+                current_val = res;
+            }
             break;
         case '*':
-            current_val = prev_val * current_val;
+            if (__builtin_mul_overflow(prev_val, current_val, &res)) {
+                has_error = true;
+                current_val = 0;
+            } else {
+                current_val = res;
+            }
             break;
         case '/':
-            if (current_val == 0) {
+            if (current_val == 0 || (prev_val == (-9223372036854775807LL - 1LL) && current_val == -1)) {
                 has_error = true;
                 current_val = 0;
             } else {
