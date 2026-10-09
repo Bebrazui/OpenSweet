@@ -333,6 +333,10 @@ x11_process_rx:
     je .x11_create_gc
     cmp al, X11_OP_POLY_FILL_RECT
     je .x11_poly_fill
+    cmp al, X11_OP_INTERN_ATOM
+    je .x11_intern_atom
+    cmp al, X11_OP_GET_PROPERTY
+    je .x11_get_property
 
 .cmd_next:
     pop rsi
@@ -523,6 +527,80 @@ x11_process_rx:
     mov eax, 0xFF1E293B                ; Slate 800 background
     rep stosd
     mov byte [r15 + md_term_dirty - kmain], 1
+    jmp .cmd_next
+
+.x11_intern_atom:
+    ; InternAtom (#16): Client requests an Atom ID for a string
+    ; Wire format:
+    ;   +0: uint8  opcode = 16
+    ;   +1: uint8  only_if_exists
+    ;   +2: uint16 length
+    ;   +4: uint16 name_len
+    ; Send 32-byte Reply:
+    ;   +0: uint8  reply_type = 1
+    ;   +1: uint8  unused = 0
+    ;   +2: uint16 sequence_number
+    ;   +4: uint32 reply_length = 0
+    ;   +8: uint32 atom_id (return hashed/sequential atom, e.g. 0x200 + seq)
+    sub rsp, 32
+    mov rdi, rsp
+    mov ecx, 8
+    xor eax, eax
+    rep stosd
+    mov rdi, rsp
+    mov byte  [rdi + 0], 1             ; Reply
+    mov ax, word [rbx + 48]
+    mov word  [rdi + 2], ax            ; Sequence number
+    mov dword [rdi + 4], 0             ; Length = 0
+    movzx eax, ax
+    add eax, 0x200                     ; Generate stable atom ID
+    mov dword [rdi + 8], eax           ; Atom ID
+
+    push rbx
+    push rsi
+    push rdx
+    mov rsi, rsp
+    mov rdx, 32
+    call x11_client_write
+    pop rdx
+    pop rsi
+    pop rbx
+    add rsp, 32
+    jmp .cmd_next
+
+.x11_get_property:
+    ; GetProperty (#20): Client reads window property
+    ; Send 32-byte Reply indicating property not found / empty:
+    ;   +0: uint8  reply_type = 1
+    ;   +1: uint8  format = 0 (empty)
+    ;   +2: uint16 sequence_number
+    ;   +4: uint32 reply_length = 0
+    ;   +8: uint32 type = 0 (None)
+    ;   +12: uint32 bytes_after = 0
+    ;   +16: uint32 value_len = 0
+    sub rsp, 32
+    mov rdi, rsp
+    mov ecx, 8
+    xor eax, eax
+    rep stosd
+    mov rdi, rsp
+    mov byte  [rdi + 0], 1             ; Reply
+    mov byte  [rdi + 1], 0             ; Format = 0
+    mov ax, word [rbx + 48]
+    mov word  [rdi + 2], ax            ; Sequence number
+    mov dword [rdi + 4], 0             ; Length = 0
+    mov dword [rdi + 8], 0             ; Type = None (0)
+
+    push rbx
+    push rsi
+    push rdx
+    mov rsi, rsp
+    mov rdx, 32
+    call x11_client_write
+    pop rdx
+    pop rsi
+    pop rbx
+    add rsp, 32
     jmp .cmd_next
 
 .proc_done:
