@@ -18,6 +18,7 @@ param(
     [int]$UnpackWaitSec = 60,
     [int]$StepWaitSec = 8,
     [switch]$SkipUnpack,
+    [switch]$RebuildDisk,
     [int]$SerialTail = 60
 )
 
@@ -27,6 +28,14 @@ Set-Location (Join-Path $PSScriptRoot '..')
 if (-not (Test-Path $QemuPath)) { Write-Error "qemu not found at '$QemuPath'"; exit 1 }
 foreach ($img in @('build\os.img', 'build\disk.img')) {
     if (-not (Test-Path $img)) { Write-Error "$img missing - run build.cmd and make-ext4.ps1"; exit 1 }
+}
+
+# A failed extraction leaves partial files behind, so repeated runs against the
+# same disk.img are not comparable. -RebuildDisk gives a clean filesystem.
+if ($RebuildDisk) {
+    Write-Host 'Rebuilding build\disk.img ...' -ForegroundColor Cyan
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot '..\make-ext4.ps1')
+    if ($LASTEXITCODE -ne 0) { Write-Error 'make-ext4.ps1 failed'; exit 1 }
 }
 
 # QEMU monitor key names for the characters the test needs.
