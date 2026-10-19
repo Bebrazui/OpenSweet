@@ -157,6 +157,8 @@ LINUX_SIGWINCH = 28
 SA_RESTORER    = 0x04000000           ; sa_restorer holds the sigreturn trampoline
 SA_NODEFER     = 0x40000000           ; do not block the signal during its handler
 
+LINUX_SYS_GETTIMEOFDAY = 96
+LINUX_SYS_CLOCK_GETTIME = 228
 LINUX_SYS_RENAME      = 82
 LINUX_SYS_LINK        = 86
 LINUX_SYS_SYMLINK     = 88
@@ -895,6 +897,12 @@ linux_syscall_dispatch:
     je .l_dup2
     cmp eax, LINUX_SYS_GETPID
     je .l_getpid
+    cmp eax, LINUX_SYS_GETTIMEOFDAY
+    je .l_gettimeofday
+    cmp eax, LINUX_SYS_CLOCK_GETTIME
+    je .l_clock_gettime
+    cmp eax, LINUX_SYS_NANOSLEEP
+    je .l_nanosleep
     cmp eax, LINUX_SYS_SENDFILE
     je .l_sendfile
     cmp eax, LINUX_SYS_EXIT
@@ -1994,6 +2002,110 @@ linux_syscall_dispatch:
 .l_gettid:
     mov eax, [r15 + sched_curr_task - kmain]
     inc eax                     ; 1-based TID
+    ret
+
+; ------------------------------------------------------------------------------
+; Time syscalls. The kernel clock is timer_ticks (APIC, 1 kHz) = milliseconds
+; since boot. There is no wall clock and no RTC yet, so all three report time
+; since boot; that is enough for glibc/busybox startup and timers.
+; ------------------------------------------------------------------------------
+
+; int gettimeofday(struct timeval *tv, struct timezone *tz)
+;   RDI = tv (may be NULL), RSI = tz (ignored). tv = { int64 tv_sec; int64 tv_usec; }
+.l_gettimeofday:
+    test rdi, rdi
+    jz .l_gtd_ok
+    push rdi
+    mov rsi, 16
+    call sys_validate_user_ptr
+    pop rdi
+    jc .l_gtd_fault
+    mov eax, [r15 + timer_ticks - kmain]
+    xor edx, edx
+    mov ecx, 1000
+    div ecx                     ; eax = seconds, edx = ms remainder
+    mov [rdi + 0], rax
+    imul rdx, rdx, 1000         ; -> microseconds
+    mov [rdi + 8], rdx
+.l_gtd_ok:
+    xor eax, eax
+    ret
+.l_gtd_fault:
+    mov eax, LINUX_EFAULT
+    ret
+
+; int clock_gettime(clockid_t clk_id, struct timespec *tp)
+;   RDI = clockid (ignored), RSI = tp = { int64 tv_sec; int64 tv_nsec; }
+.l_clock_gettime:
+    test rsi, rsi
+    jz .l_cgt_ok
+    push rsi
+    mov rdi, rsi
+    mov rsi, 16
+    call sys_validate_user_ptr
+    pop rsi
+    jc .l_cgt_fault
+    mov eax, [r15 + timer_ticks - kmain]
+    xor edx, edx
+    mov ecx, 1000
+    div ecx                     ; eax = seconds, edx = ms remainder
+    mov [rsi + 0], rax
+    imul rdx, rdx, 1000000      ; -> nanoseconds
+    mov [rsi + 8], rdx
+.l_cgt_ok:
+    xor eax, eax
+    ret
+.l_cgt_fault:
+    mov eax, LINUX_EFAULT
+    ret
+
+; int nanosleep(const struct timespec *req, struct timespec *rem)
+;   RDI = req = { int64 tv_sec; int64 tv_nsec; }, RSI = rem (not filled)
+; Sleeps on the scheduler tick; returns -EINTR if a signal becomes deliverable.
+; rbx is preserved across task_sleep, so the deadline lives there.
+.l_nanosleep:
+    test rdi, rdi
+    jz .l_ns_einval
+    push rsi
+    push rdi
+    mov rsi, 16
+    call sys_validate_user_ptr
+    pop rdi
+    pop rsi
+    jc .l_ns_fault
+
+    mov rbx, [rdi + 0]          ; tv_sec
+    imul rbx, rbx, 1000         ; -> ms
+    mov rax, [rdi + 8]          ; tv_nsec
+    xor edx, edx
+    mov r8, 1000000
+    div r8                      ; rax = tv_nsec / 1e6 = ms
+    add rbx, rax
+    mov eax, [r15 + timer_ticks - kmain]
+    add rbx, rax
+    mov ebx, ebx                ; keep the deadline in 32 bits
+
+.l_ns_loop:
+    call sig_probe_actionable
+    test eax, eax
+    jnz .l_ns_intr
+    mov eax, [r15 + timer_ticks - kmain]
+    cmp eax, ebx
+    jae .l_ns_done
+    mov ecx, 1
+    call task_sleep
+    jmp .l_ns_loop
+.l_ns_done:
+    xor eax, eax
+    ret
+.l_ns_intr:
+    mov eax, LINUX_EINTR
+    ret
+.l_ns_einval:
+    mov eax, LINUX_EINVAL
+    ret
+.l_ns_fault:
+    mov eax, LINUX_EFAULT
     ret
 
 .l_exit_group:
