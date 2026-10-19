@@ -37,10 +37,18 @@ These are confirmed by the serial log of a real headless boot (`scripts/smoke.ps
   #GP, exception 0D). Each slot now owns a private 32 MB physical heap
   (`HEAP_PHYS_BASE = 0x10000000`, above the PMM range) and `fork` deep-copies it.
   With that, `dpkg-deb` no longer crashes and extracts a real `/usr/...` tree.
-  **Still open:** one `read()` on `/bash.deb` returns `-EIO` and `dpkg-deb` then
-  fails with `can't open './usr/share/doc/bash/CHANGES.gz'`, so `/bin/bash` is not
-  produced. Reproduce with `scripts/test_bash.ps1` (rebuild `disk.img` between runs:
-  a failed extraction leaves partial state behind).
+  **Still open — group descriptor corruption.** When the extractor creates enough
+  files that inode allocation reaches a second block group, `ext4_inode_load`
+  reads `bg_inode_table_lo` from that group's descriptor as `0xFFFFFFFF` (the
+  descriptor on disk is not valid), computes a wild block number and hands it to
+  `ext4_blk_read`. The 28-bit ATA LBA then truncates it and reads an unrelated
+  sector. Diagnostics now print `!blk wild ra=<caller> blk=<block>` for this, and
+  the ATA layer retries once (`!ata retry lba=<lba> st=<status>`) so a single
+  failure no longer aborts an extraction. The real fix is to make the writer keep
+  `bg_inode_table` valid for every group it allocates inodes from (or to stop
+  allocating inode numbers outside the group whose table exists).
+  Reproduce with `scripts/test_bash.ps1` (use `-RebuildDisk` for a clean tree; a
+  failed extraction leaves partial state behind).
 - **X11 client (`ico`).** X11 wire protocol lives in `kernel/x11.inc`, SHM in
   `kernel/shm.inc`. Library set is packaged but the client is not confirmed running.
 - **Linux ABI serial tracing.** `compat_linux.inc` prints `openat`/`fstat`/`lseek`/

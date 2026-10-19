@@ -96,21 +96,85 @@ ext4_mount:                       ; CF=0 ok
 ; ================= read one FS block =================
 ; RAX = block, RSI = dest buffer. Preserves rbx,rsi,rdi,r8+.
 ext4_blk_read:
+    ; Reject a block number outside the filesystem.  A wild value here means a
+    ; caller used a stale or invalid mapping (e.g. a group descriptor whose
+    ; bg_inode_table was never filled in).  Letting it through would make the
+    ; 28-bit ATA LBA silently read an unrelated sector instead of failing.
+    ; Skipped while the superblock is not parsed yet, i.e. during mount.
+    mov ecx, dword [r15 + ext4_sb - kmain + 0x04]   ; s_blocks_count_lo
+    test ecx, ecx
+    jz .ebr_rng_ok
+    cmp rax, rcx
+    jb .ebr_rng_ok
+    mov rcx, [rsp]                  ; caller return address
+    push rcx
+    push rax
+    lea rsi, [r15 + str_blk_wild - kmain]
+    call puts
+    mov rax, [rsp + 8]              ; return address
+    call puthex64
+    lea rsi, [r15 + str_blk_b1 - kmain]
+    call puts
+    mov rax, [rsp]                  ; block number as passed
+    call putdec64
+    mov al, 10
+    call putc
+    pop rax
+    pop rcx
+    ; Fall through on purpose: report the bad mapping, then let the read (and its
+    ; retry) proceed. Rejecting it outright makes callers that do not expect a
+    ; failed inode load dereference NULL, which is a worse failure mode until the
+    ; group-descriptor bug below is fixed.
+.ebr_rng_ok:
     push rcx
     push rdx
     push rdi
     push rax
     push rsi
+    push r8
+    push r9
+    push r10
+    push r11
 
     mov rdi, rsi                  ; destination buffer
     movzx ecx, byte [r15 + ext4_lbs - kmain]
     inc ecx                       ; shift count = lbs + 1
     shl rax, cl                   ; LBA = block << (lbs+1)
+    mov r8, rax                   ; r8 = LBA
     mov edx, 1
     shl edx, cl                   ; sectors per block = 1 << (lbs+1)
-    mov ecx, edx                  ; count
+    mov r9d, edx                  ; r9 = sector count
+    mov ecx, r9d                  ; count
     call disk_read_blocks
+    jnc .ebr_out
 
+    ; One retry.  A single ATA poll timeout must not turn into -EIO and abort an
+    ; entire extraction.  Log the LBA and status so a deterministic failure
+    ; (bad LBA / past end of medium) stays visible instead of being masked.
+    lea rsi, [r15 + str_ata_retry - kmain]
+    call puts
+    mov rax, [rsp + 24]           ; saved r8 = LBA
+    call putdec64
+    lea rsi, [r15 + str_ata_st - kmain]
+    call puts
+    mov dx, ATA_STATC
+    in al, dx
+    call puthex8
+    mov al, 10
+    call putc
+
+    mov rdi, [rsp + 48]           ; saved destination buffer
+    mov rax, [rsp + 24]           ; LBA
+    mov ecx, [rsp + 16]           ; sector count
+    call disk_read_blocks
+    jnc .ebr_out
+    stc
+
+.ebr_out:
+    pop r11
+    pop r10
+    pop r9
+    pop r8
     pop rsi
     pop rax
     pop rdi
@@ -3063,7 +3127,11 @@ ext4_read_file_chunk_inode:
     pop rdi
     pop rdx
     pop rbx
-    jc .rfc_err
+    jnc .rfc_blk_ok
+    mov [r15 + ext4_dbg_off - kmain], r14d
+    mov [r15 + ext4_dbg_blk - kmain], eax
+    jmp .rfc_err
+.rfc_blk_ok:
 
     ; Copy rbx bytes from ext4_bbuf + edx to [rdi + r13]
     push rsi
@@ -3449,6 +3517,11 @@ e4t_tblk    dd 0
 e4w_bmp_blk dd 0
 ext4_ok     db 0
 ext4_lbs    dd 0
+
+; Diagnostics for a failed block read on the file-data path.  The Linux ABI
+; read trace prints these when it converts a failure into -EIO.
+ext4_dbg_off dd 0
+ext4_dbg_blk dd 0
 ext4_bpg    dd 0
 ext4_ipg    dd 0
 ext4_isize  dd 0
@@ -3494,6 +3567,13 @@ str_stat_ext_entries db " Entries=", 0
 str_stat_no_ext db "  Extents: none", 10, 0
 str_stat_usage  db "Usage: stat <file>", 10, 0
 str_stat_notfound db "stat: file not found", 10, 0
+
+str_ata_retry   db "!ata retry lba=", 0
+str_ata_st      db " st=", 0
+str_io_off      db "[io] ext4 off=", 0
+str_io_blk      db " blk=", 0
+str_blk_wild    db "!blk wild ra=", 0
+str_blk_b1      db " blk=", 0
 
 
 ; ================= serial wrappers (resolve from this file scope) =================

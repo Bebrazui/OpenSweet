@@ -892,6 +892,18 @@ vfs_read_fd:
     jmp .rfd_err
 .rfd_err_io:
     mov dword [r15 + vfs_last_err - kmain], 5       ; EIO
+    ; Report the ext4 block that failed, so a sporadic ATA error is
+    ; distinguishable from a deterministic bad mapping.
+    lea rsi, [r15 + str_io_off - kmain]
+    call puts
+    mov eax, [r15 + ext4_dbg_off - kmain]
+    call putdec64
+    lea rsi, [r15 + str_io_blk - kmain]
+    call puts
+    mov eax, [r15 + ext4_dbg_blk - kmain]
+    call putdec64
+    mov al, 10
+    call putc
 .rfd_err:
     mov rax, -1
 
