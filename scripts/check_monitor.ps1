@@ -4,7 +4,7 @@ Set-Location $PSScriptRoot\..
 Get-Process qemu-system-* -ErrorAction SilentlyContinue | Stop-Process -Force
 Start-Sleep 1
 
-$qemu = "C:\Program Files\qemu\qemu-system-x86_64.exe"
+$qemu = if ($env:OPENSWEET_QEMU) { $env:OPENSWEET_QEMU } else { "C:\Program Files\qemu\qemu-system-x86_64.exe" }
 $q = Start-Process -FilePath $qemu -ArgumentList `
     "-m","512M", `
     "-drive","format=raw,file=build\os.img", "-drive","format=raw,file=build\disk.img,if=ide,index=1", `

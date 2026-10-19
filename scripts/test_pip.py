@@ -5,7 +5,7 @@ import socket
 import subprocess
 from PIL import Image
 
-QEMU_PATH = r"C:\Program Files\qemu\qemu-system-x86_64.exe"
+QEMU_PATH = os.environ.get("OPENSWEET_QEMU", r"C:\Program Files\qemu\qemu-system-x86_64.exe")
 OS_IMG = r"build\os.img"
 DISK_IMG = r"build\disk.img"
 MONITOR_PORT = 4555

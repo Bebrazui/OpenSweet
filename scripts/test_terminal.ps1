@@ -4,7 +4,7 @@ Set-Location $PSScriptRoot\..
 Get-Process qemu-system-* -ErrorAction SilentlyContinue | Stop-Process -Force
 Start-Sleep 1
 
-$qemu = "C:\Program Files\qemu\qemu-system-x86_64.exe"
+$qemu = if ($env:OPENSWEET_QEMU) { $env:OPENSWEET_QEMU } else { "C:\Program Files\qemu\qemu-system-x86_64.exe" }
 $q = Start-Process -FilePath $qemu -ArgumentList `
     "-accel","whpx","-accel","tcg", `
     "-cpu","max", `

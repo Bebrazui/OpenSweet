@@ -1,18 +1,27 @@
 @echo off
 setlocal
-set FASM=C:\Users\ttt79\Downloads\fasmw17335\FASM.EXE
 cd /d %~dp0
 if not exist build mkdir build
+
+rem Toolchain path. Override from the environment before running:
+rem     set FASM=C:\tools\fasm\FASM.EXE
+if not defined FASM set "FASM=C:\Users\ttt79\Downloads\fasmw17335\FASM.EXE"
+if not exist "%FASM%" (
+    echo BUILD ERROR: FASM not found at "%FASM%"
+    echo Set the FASM environment variable to your FASM.EXE path, e.g.
+    echo     set FASM=C:\tools\fasm\FASM.EXE
+    exit /b 1
+)
 
 rem close any running QEMU - it locks build\os.img
 taskkill /IM qemu-system-x86_64.exe /F >nul 2>&1
 timeout /t 1 /nobreak >nul
 
-%FASM% arch\x86_64\boot\boot.asm build\boot.bin
+"%FASM%" arch\x86_64\boot\boot.asm build\boot.bin
 if errorlevel 1 exit /b 1
-%FASM% arch\x86_64\boot\stage2.asm build\stage2.bin
+"%FASM%" arch\x86_64\boot\stage2.asm build\stage2.bin
 if errorlevel 1 exit /b 1
-%FASM% arch\x86_64\kernel\kernel.asm build\kernel.bin
+"%FASM%" arch\x86_64\kernel\kernel.asm build\kernel.bin
 if errorlevel 1 exit /b 1
 
 del build\os.img 2>nul

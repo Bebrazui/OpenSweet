@@ -8,7 +8,7 @@ def run():
     subprocess.run(["powershell", "-Command", "Get-Process qemu-system-* -ErrorAction SilentlyContinue | Stop-Process -Force"], check=False)
     time.sleep(1)
 
-    qemu_exe = r"C:\Program Files\qemu\qemu-system-x86_64.exe"
+    qemu_exe = os.environ.get("OPENSWEET_QEMU", r"C:\Program Files\qemu\qemu-system-x86_64.exe")
     args = [
         qemu_exe,
         "-accel", "whpx", "-accel", "tcg",
