@@ -30,6 +30,7 @@ LINUX_SYS_DUP         = 32
 LINUX_SYS_DUP2        = 33
 LINUX_SYS_NANOSLEEP   = 35
 LINUX_SYS_GETPID      = 39
+LINUX_SYS_SENDFILE    = 40
 LINUX_SYS_CLONE       = 56
 LINUX_SYS_FORK        = 57
 LINUX_SYS_EXECVE      = 59
@@ -226,8 +227,16 @@ sig_next_actionable:
     and rax, rcx                      ; rax = pending & ~blocked
     jz .sna_none
     bsf rcx, rax                      ; rcx = bit = sig - 1
-    ; Tier A default-ignore set (stop signals are treated as no-ops until
-    ; real job control arrives)
+    ; handler lookup: 0 = DFL, 1 = IGN, else address
+    mov rdx, rcx
+    shl rdx, 5                       ; (sig-1) * 32
+    mov rdx, [rbx + TCB_SIG_ACT + rdx]
+    cmp rdx, 1
+    je .sna_drop                      ; explicitly ignored
+    test rdx, rdx
+    jnz .sna_have_handler             ; has installed custom handler!
+
+    ; Tier A default-ignore set (only ignored if DFL):
     lea esi, [rcx + 1]
     cmp esi, LINUX_SIGCHLD
     je .sna_drop
@@ -245,13 +254,9 @@ sig_next_actionable:
     je .sna_drop
     cmp esi, LINUX_SIGTTOU
     je .sna_drop
-    ; handler lookup: 0 = DFL, 1 = IGN, else address
-    mov rdx, rcx
-    shl rdx, 5                       ; (sig-1) * 32
-    mov rdx, [rbx + TCB_SIG_ACT + rdx]
-    cmp rdx, 1
-    je .sna_drop                      ; explicitly ignored
-    mov eax, esi                      ; EAX = sig, EDX = DFL(0)/handler
+
+.sna_have_handler:
+    lea eax, [rcx + 1]               ; EAX = sig, EDX = DFL(0)/handler
     ret
 .sna_drop:
     btr [rbx + TCB_SIG_PENDING], rcx
@@ -890,6 +895,8 @@ linux_syscall_dispatch:
     je .l_dup2
     cmp eax, LINUX_SYS_GETPID
     je .l_getpid
+    cmp eax, LINUX_SYS_SENDFILE
+    je .l_sendfile
     cmp eax, LINUX_SYS_EXIT
     je .l_exit
     cmp eax, LINUX_SYS_EXIT_GROUP
@@ -1151,15 +1158,15 @@ linux_syscall_dispatch:
     test rbx, rbx
     jz .l_read_normal
     pop rdx                            ; count
-    pop rdi                            ; user dest buf
+    pop rdi                            ; user dest buf (was in rsi!)
     pop rax                            ; discard saved fd
     call x11_client_read
     ret
 
 .l_read_normal:
-    pop rdx
-    pop rsi
-    pop rdi
+    mov rdi, [rsp + 16]                ; saved fd
+    mov rsi, [rsp + 8]                 ; saved buf
+    mov rdx, [rsp + 0]                 ; saved count
     call vfs_read_fd
     ; Return value is in RAX from vfs_read
     cmp rax, -1
@@ -1167,6 +1174,25 @@ linux_syscall_dispatch:
     mov eax, [r15 + vfs_last_err - kmain]   ; positive errno from vfs
     neg rax                                 ; Linux ABI wants -errno
 .l_read_ret:
+    push rax
+    lea rsi, [r15 + str_l_read_dbg - kmain]
+    call puts
+    mov rax, [rsp + 24]                ; saved fd from entry
+    call putdec64
+    mov al, ' '
+    call putc
+    mov al, '='
+    call putc
+    mov al, '>'
+    call putc
+    mov al, ' '
+    call putc
+    mov rax, [rsp]                     ; return value
+    call putdec64
+    mov al, 10
+    call putc
+    pop rax
+    add rsp, 24                        ; pop rdi, rsi, rdx
     ret
 
 .l_write:
@@ -1234,11 +1260,16 @@ linux_syscall_dispatch:
     mov rdx, [r13 + 8]          ; iov_len
     test rdx, rdx
     jz .l_wv_next
-    push rsi
-    push rdx
-    call vfs_write_fd
-    pop rdx
-    pop rsi
+    push r12
+    push r13
+    push r14
+    push rbp
+    call .l_write
+    pop rbp
+    pop r14
+    pop r13
+    pop r12
+    test rax, rax
     js .l_wv_err
     add rbp, rax
 .l_wv_next:
@@ -1415,7 +1446,7 @@ linux_syscall_dispatch:
     push rdi
     push rsi
     mov rdi, rdx
-    mov rsi, 60
+    mov rsi, 36
     call sys_validate_user_ptr
     pop rsi
     pop rdi
@@ -1423,7 +1454,7 @@ linux_syscall_dispatch:
     push rdi
     push rcx
     mov rdi, rdx
-    mov ecx, 60 / 4
+    mov ecx, 36 / 4
     xor eax, eax
     rep stosd
     pop rcx
@@ -1671,7 +1702,32 @@ linux_syscall_dispatch:
 
 .l_open:
     ; RDI = pathname, RSI = flags, RDX = mode
+    push rdi
+    push rsi
+    push rdx
+    lea rsi, [r15 + str_l_open_dbg - kmain]
+    call puts
+    pop rdx
+    pop rsi
+    pop rdi
+    push rdi
+    push rsi
+    push rdx
+    mov rsi, rdi
+    call puts
+    pop rdx
+    pop rsi
+    pop rdi
     call vfs_open
+    push rax
+    lea rsi, [r15 + str_openat_res - kmain]
+    call puts
+    pop rax
+    push rax
+    call putdec64
+    mov al, 10
+    call putc
+    pop rax
     cmp rax, -1
     jne .l_open_ret
     mov rax, LINUX_ENOENT
@@ -1680,6 +1736,18 @@ linux_syscall_dispatch:
 
 .l_openat:
     ; RDI = dirfd, RSI = pathname, RDX = flags, R10 = mode
+    push rsi
+    push rdx
+    push r10
+    push rsi
+    lea rsi, [r15 + str_openat_log - kmain]
+    call puts
+    pop rsi
+    call puts
+    pop r10
+    pop rdx
+    pop rsi
+
     mov rdi, rsi                     ; pathname
     mov rsi, rdx                     ; flags
     mov rdx, r10                     ; mode
@@ -1688,6 +1756,15 @@ linux_syscall_dispatch:
     jne .l_openat_ret
     mov rax, LINUX_ENOENT
 .l_openat_ret:
+    push rax
+    lea rsi, [r15 + str_openat_res - kmain]
+    call puts
+    pop rax
+    push rax
+    call putdec64
+    mov al, 10
+    call putc
+    pop rax
     ret
 
 .l_close:
@@ -1701,7 +1778,39 @@ linux_syscall_dispatch:
 
 .l_lseek:
     ; RDI = fd, RSI = offset, RDX = whence
+    push rdi
+    push rsi
+    push rdx
+    push rdi
+    lea rsi, [r15 + str_lseek_dbg - kmain]
+    call puts
+    pop rax
+    call putdec64
+    mov al, ','
+    call putc
+    mov rax, [rsp + 8]                 ; offset
+    call putdec64
+    mov al, ','
+    call putc
+    mov rax, [rsp + 0]                 ; whence
+    call putdec64
+    pop rdx
+    pop rsi
+    pop rdi
+
     call vfs_lseek
+    cmp rax, -1
+    jne .l_lseek_ret
+    mov rax, -29                       ; -ESPIPE (29) standard for non-seekable streams
+.l_lseek_ret:
+    push rax
+    lea rsi, [r15 + str_lseek_res - kmain]
+    call puts
+    mov rax, [rsp]
+    call putdec64
+    mov al, 10
+    call putc
+    pop rax
     ret
 
 .l_brk:
@@ -1712,6 +1821,162 @@ linux_syscall_dispatch:
 .l_dup2:
     ; RDI = oldfd, RSI = newfd
     call vfs_dup2
+    ret
+
+; ------------------------------------------------------------------------------
+; .l_sendfile (Linux #40)
+; ssize_t sendfile(int out_fd, int in_fd, off_t *offset, size_t count)
+; In:  RDI = out_fd
+;      RSI = in_fd
+;      RDX = user pointer to offset (or 0 to use/advance in_fd file offset)
+;      R10 = count
+; Out: RAX = bytes transferred, or -errno
+; ------------------------------------------------------------------------------
+.l_sendfile:
+    push rbp
+    push r12
+    push r13
+    push r14
+    push r15
+    push rbx
+    sub rsp, 40
+
+    mov r12d, edi                       ; r12d = out_fd
+    mov r13d, esi                       ; r13d = in_fd
+    mov [rsp + 0], rdx                  ; [rsp + 0] = user offset ptr
+    mov r14, r10                        ; r14 = count remaining
+    mov qword [rsp + 8], 0              ; [rsp + 8] = total bytes sent
+
+    ; Validate fds
+    mov edi, r12d
+    call vfs_get_fd_ptr
+    test rax, rax
+    jz .l_sf_ebadf
+    mov edi, r13d
+    call vfs_get_fd_ptr
+    test rax, rax
+    jz .l_sf_ebadf
+
+    ; If offset ptr != NULL, validate and load start offset
+    mov rdx, [rsp + 0]
+    test rdx, rdx
+    jz .l_sf_loop
+    mov rdi, rdx
+    mov rsi, 8
+    call sys_validate_user_ptr
+    jc .l_sf_efault
+    mov rdx, [rsp + 0]
+    mov rax, [rdx]
+    mov [rsp + 16], rax                 ; [rsp + 16] = current offset
+
+.l_sf_loop:
+    test r14, r14
+    jz .l_sf_done
+
+    ; Chunk size = min(r14, 4096)
+    mov rcx, 4096
+    cmp r14, rcx
+    cmovb rcx, r14
+    mov [rsp + 24], rcx                 ; [rsp + 24] = chunk to transfer
+
+    ; Read chunk from in_fd
+    mov rdx, [rsp + 0]
+    test rdx, rdx
+    jz .l_sf_read_stream
+
+    ; If explicit offset ptr provided, temporarily swap offset in in_fd's fd_entry
+    mov rdx, [rsp + 0]
+    test rdx, rdx
+    jz .l_sf_read_stream
+
+    mov edi, r13d
+    call vfs_get_fd_ptr
+    test rax, rax
+    jz .l_sf_ebadf
+    mov rbx, rax                        ; rbx = fd_entry
+    mov ecx, [rbx + 4]                  ; ecx = saved original offset
+    mov edx, [rsp + 16]                 ; edx = requested offset
+    mov [rbx + 4], edx
+
+    push rcx
+    push rbx
+    mov edi, r13d
+    lea rsi, [r15 + sendfile_buf - kmain]
+    mov rdx, [rsp + 24 + 16]
+    call vfs_read_fd
+    pop rbx
+    pop rcx
+    mov [rbx + 4], ecx                  ; restore original offset
+    jmp .l_sf_read_check
+
+.l_sf_read_stream:
+    mov edi, r13d
+    lea rsi, [r15 + sendfile_buf - kmain]
+    mov rdx, [rsp + 24]
+    call vfs_read_fd
+
+.l_sf_read_check:
+    cmp rax, -1
+    je .l_sf_err
+    test rax, rax
+    jz .l_sf_done                       ; EOF reached!
+    mov rbx, rax                        ; rbx = bytes read
+
+    ; Advance explicit offset if provided
+    mov rdx, [rsp + 0]
+    test rdx, rdx
+    jz @f
+    add [rsp + 16], rbx
+@@:
+    ; Write bytes read (rbx) to out_fd
+    mov edi, r12d
+    lea rsi, [r15 + sendfile_buf - kmain]
+    mov rdx, rbx
+    call vfs_write_fd
+    cmp rax, -1
+    je .l_sf_err
+    test rax, rax
+    jz .l_sf_done
+
+    add [rsp + 8], rax                  ; total sent += written
+    sub r14, rax                        ; remaining -= written
+    cmp rax, rbx
+    jb .l_sf_done                       ; partial write (out_fd filled)
+    jmp .l_sf_loop
+
+.l_sf_done:
+    ; If explicit offset ptr provided, store back updated offset
+    mov rdx, [rsp + 0]
+    test rdx, rdx
+    jz @f
+    mov rax, [rsp + 16]
+    mov [rdx], rax
+@@:
+    mov rax, [rsp + 8]                  ; return total bytes sent
+    jmp .l_sf_ret
+
+.l_sf_err:
+    cmp qword [rsp + 8], 0
+    ja .l_sf_done                       ; return partial count if already sent bytes
+    mov eax, [r15 + vfs_last_err - kmain]
+    neg rax                             ; return -errno
+    jmp .l_sf_ret
+
+.l_sf_ebadf:
+    mov rax, LINUX_EBADF
+    jmp .l_sf_ret
+
+.l_sf_efault:
+    mov rax, LINUX_EFAULT
+
+.l_sf_ret:
+    add rsp, 40
+    pop rbx
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
     ret
 
 .l_getpid:
@@ -2356,8 +2621,10 @@ linux_syscall_dispatch:
 ; returns the slot; convert back to pid on success.
 ; ------------------------------------------------------------------------------
 .l_wait4:
+    ; Linux wait4: RDI = pid, RSI = status_ptr, RDX = options, R10 = rusage (ignored)
+    ; sys_handler_waitpid: RDI = target slot (or -1/0 for any), RSI = status_ptr, RDX = options
     cmp rdi, 1
-    jl .l_wait4_any                   ; 0 / negative -> any child
+    jl .l_wait4_any                   ; 0 / negative -> any child (-1)
     je .l_wait4_echild                ; pid 1 = kernel task, never a child
     dec rdi                           ; slot = pid - 1
     cmp rdi, MAX_TASKS
@@ -3133,7 +3400,51 @@ linux_syscall_dispatch:
     call vfs_stat_path
     ret
 .l_fstat:
+    push rsi                            ; [rsp + 8] = statbuf
+    push rdi                            ; [rsp + 0] = fd
     call vfs_stat_fd
+    pop rdi
+    pop rsi                             ; rsi = statbuf
+    push rsi                            ; save statbuf
+    push rax                            ; save return code
+    lea rsi, [r15 + str_fstat_log - kmain]
+    call puts
+    mov rax, [rsp]                      ; return code
+    call putdec64
+    ; If success (res == 0), print ino and size
+    mov rax, [rsp]
+    test rax, rax
+    jnz .l_fstat_dbg_done
+    mov rsi, [rsp + 8]                  ; restored statbuf!
+    mov al, ' '
+    call putc
+    mov al, 'i'
+    call putc
+    mov al, '='
+    call putc
+    mov rax, [rsi + 8]                  ; st_ino
+    call putdec64
+    mov al, ' '
+    call putc
+    mov al, 's'
+    call putc
+    mov al, '='
+    call putc
+    mov rax, [rsi + 48]                 ; st_size
+    call putdec64
+    mov al, ' '
+    call putc
+    mov al, 'm'
+    call putc
+    mov al, '='
+    call putc
+    movzx rax, word [rsi + 24]          ; st_mode
+    call puthex64
+.l_fstat_dbg_done:
+    mov al, 10
+    call putc
+    pop rax                             ; return code
+    pop rsi                             ; discard saved statbuf
     ret
 
 ; ------------------------------------------------------------------------------
@@ -3472,10 +3783,11 @@ linux_syscall_dispatch:
     ; RDI = path, RSI = mode
     call sys_handler_mkdir
     test eax, eax
-    jz @f
-    mov rax, LINUX_EACCES
+    jz .l_mkdir_ok
+    ; In Linux ABI, if mkdir fails (already exists, '.' or existing subfolder), return EEXIST
+    mov rax, LINUX_EEXIST
     ret
-@@:
+.l_mkdir_ok:
     xor eax, eax
     ret
 
@@ -4010,6 +4322,14 @@ linux_syscall_dispatch:
     sub rax, rbx
     add [r15 + linux_mmap_next - kmain], rax
 .l_mmap_ret:
+    push rbx
+    lea rsi, [r15 + str_mmap_ok - kmain]
+    call puts
+    pop rax
+    call puthex64
+    mov al, 10
+    call putc
+
     mov rax, rbx                ; Return original base in RAX
     pop rbx
     pop r15
@@ -4567,10 +4887,59 @@ linux_syscall_dispatch:
     mov rcx, rsi
     xor r8, r8                  ; r8 = ready count
 .poll_loop:
-    mov ax, [rdi + 4]           ; events
-    mov [rdi + 6], ax           ; revents = events
-    inc r8
-    add rdi, 8                  ; sizeof(struct pollfd) = 8
+    mov ax, [rdi + 4]           ; requested events
+    mov edx, [rdi + 0]          ; fd
+    push rdi
+    push rcx
+    push rax
+    mov edi, edx
+    call vfs_get_fd_ptr
+    pop rcx                     ; rcx = requested events
+    test rax, rax
+    jz .poll_fd_done
+    cmp word [rax + 2], 35      ; X11 socket?
+    jne .poll_fd_regular
+    ; X11 socket: check if tx buffer has data
+    mov rbx, [rax + 4]          ; client ptr
+    test rbx, rbx
+    jz .poll_fd_regular
+    xor ax, ax
+    ; If POLLOUT requested, always ready
+    test cx, 4                  ; POLLOUT
+    jz @f
+    or ax, 4
+@@:
+    ; If POLLIN requested, check if tx_head != tx_tail
+    test cx, 1                  ; POLLIN
+    jz .poll_fd_write_revents
+    mov edx, [rbx + 44]         ; tx_tail
+    cmp edx, [rbx + 40]         ; tx_head
+    je .poll_fd_write_revents
+    or ax, 1                    ; POLLIN ready!
+    jmp .poll_fd_write_revents
+
+.poll_fd_regular:
+    mov ax, cx                  ; revents = requested events
+
+.poll_fd_write_revents:
+    pop rcx
+    pop rdi
+    mov [rdi + 6], ax           ; store revents
+    test ax, ax
+    jz @f
+    inc r8                      ; count of ready fds
+@@:
+    add rdi, 8
+    dec rcx
+    jnz .poll_loop
+    mov rax, r8
+    ret
+
+.poll_fd_done:
+    pop rcx
+    pop rdi
+    mov word [rdi + 6], 0
+    add rdi, 8
     dec rcx
     jnz .poll_loop
     mov rax, r8
@@ -4643,21 +5012,54 @@ linux_syscall_dispatch:
     ; Check if connecting to X11 socket (/tmp/.X11-unix/X0 or sun_family == 1)
     test rsi, rsi
     jz .conn_ok
+    ; Validate addr pointer
+    push rdi
+    push rsi
+    push rdx
+    mov rdi, rsi
+    mov rsi, 2                          ; at least 2 bytes for sa_family
+    call sys_validate_user_ptr
+    pop rdx
+    pop rsi
+    pop rdi
+    jc .conn_ok
+    ; Print connect debug
+    push rax
+    push rsi
+    push rdx
+    push rdi
+    mov al, '<'
+    call putc
+    mov al, 'C'
+    call putc
+    mov al, ':'
+    call putc
+    movzx rax, word [rsi]
+    call putdec64
+    mov al, '>'
+    call putc
+    pop rdi
+    pop rdx
+    pop rsi
+    pop rax
+
     ; If sockaddr_un (family == 1)
     cmp word [rsi], 1
     jne .conn_ok
 
     ; Allocate X11 client slot
+    push rdi                            ; save sockfd!
     call x11_alloc_client
+    pop rdi                             ; restore sockfd!
     test rax, rax
     jz .conn_ok
 
     ; Store client pointer in fd entry
     ; RAX = client pointer
-    push rax
+    push rax                            ; save client pointer
     mov edi, edi
     call vfs_get_fd_ptr
-    pop rdx
+    pop rdx                             ; restore client pointer
     test rax, rax
     jz .conn_ok
 
@@ -4699,13 +5101,11 @@ linux_syscall_dispatch:
 
 .l_sendto:
     ; ssize_t sendto(sockfd=RDI, buf=RSI, len=RDX, flags=R10, dest_addr=R8, addrlen=R9)
-    call vfs_write_fd
-    ret
+    jmp .l_write
 
 .l_recvfrom:
     ; ssize_t recvfrom(sockfd=RDI, buf=RSI, len=RDX, flags=R10, src_addr=R8, addrlen=R9)
-    call vfs_read_fd
-    ret
+    jmp .l_read
 
 .l_sendmsg:
     ; ssize_t sendmsg(sockfd=RDI, msg=RSI, flags=RDX)
@@ -4717,14 +5117,10 @@ linux_syscall_dispatch:
     jz .sock_ok
     test r9, r9
     jz .sock_ok
-    ; Write first iov buffer
-    push rdi
-    mov rdi, rdi                            ; fd
+    ; Write first iov buffer via .l_write
     mov rsi, [r8 + 0]                       ; iov_base
     mov rdx, [r8 + 8]                       ; iov_len
-    call vfs_write_fd
-    pop rdi
-    ret
+    jmp .l_write
 
 .l_recvmsg:
     ; ssize_t recvmsg(sockfd=RDI, msg=RSI, flags=RDX)
@@ -4736,13 +5132,10 @@ linux_syscall_dispatch:
     jz .sock_ok
     test r9, r9
     jz .sock_ok
-    push rdi
-    mov rdi, rdi
+    ; Read into first iov buffer via .l_read
     mov rsi, [r8 + 0]
     mov rdx, [r8 + 8]
-    call vfs_read_fd
-    pop rdi
-    ret
+    jmp .l_read
 
 .l_shutdown:
     ; int shutdown(sockfd=RDI, how=RSI)
@@ -4755,6 +5148,9 @@ linux_syscall_dispatch:
     jz .sock_ok
     ; Return AF_UNIX family (1)
     mov word [rsi], 1
+    test rdx, rdx
+    jz .sock_ok
+    mov dword [rdx], 2                  ; sizeof(sa_family_t)
     xor eax, eax
     ret
 
@@ -4763,6 +5159,9 @@ linux_syscall_dispatch:
     test rsi, rsi
     jz .sock_ok
     mov word [rsi], 1
+    test rdx, rdx
+    jz .sock_ok
+    mov dword [rdx], 2                  ; sizeof(sa_family_t)
     xor eax, eax
     ret
 
@@ -4779,6 +5178,14 @@ linux_syscall_dispatch:
 
 .l_getsockopt:
     ; int getsockopt(sockfd=RDI, level=RSI, optname=RDX, optval=R10, optlen=R8)
+    test r10, r10
+    jz @f
+    mov dword [r10], 0                  ; clear SO_ERROR or returned option
+@@:
+    test r8, r8
+    jz @f
+    mov dword [r8], 4                   ; sizeof(int)
+@@:
     xor eax, eax
     ret
 
@@ -4863,6 +5270,12 @@ str_l_open_dbg db "[Linux ABI] open: ", 0
 str_l_read_dbg db "[Linux ABI] read: fd=", 0
 str_l_mmap_dbg db "[Linux ABI] mmap: ", 0
 str_l_munmap_dbg db "[Linux ABI] munmap: ", 0
+str_openat_log db " -> openat: ", 0
+str_openat_res db " => fd=", 0
+str_fstat_log db " -> fstat: res=", 0
+str_lseek_dbg db " -> lseek(fd,off,wh): ", 0
+str_lseek_res db " => res=", 0
+str_mmap_ok db " -> mmap ok: base=", 0
 
 align 8
 linux_mmap_next dq 0x20000000
@@ -4876,3 +5289,5 @@ INODE_LOCK_ENTRY_SIZE = 16
 ; +12: uint32 reserved
 align 16
 inode_lock_table: rb (MAX_INODE_LOCKS * INODE_LOCK_ENTRY_SIZE)
+align 16
+sendfile_buf:     rb 4096

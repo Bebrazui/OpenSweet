@@ -744,6 +744,9 @@ elf_load_exec:
     mov dword [rdi + 80], "SHEL"
     mov dword [rdi + 84], "L=/s"
     mov word  [rdi + 88], "h"
+    mov dword [rdi + 96], "DISP"
+    mov dword [rdi + 100], "LAY="
+    mov word  [rdi + 104], ":0"
 
     ; Populate envp pointers
     lea rdi, [r10 + 0x1FF600 + 8 + rcx*8 + 8]
@@ -752,8 +755,9 @@ elf_load_exec:
     mov qword [rdi + 2*8], 0x1FFFFD00 + 32
     mov qword [rdi + 3*8], 0x1FFFFD00 + 48
     mov qword [rdi + 4*8], 0x1FFFFD00 + 80
-    mov qword [rdi + 5*8], 0
-    lea rdi, [rdi + 6*8]
+    mov qword [rdi + 5*8], 0x1FFFFD00 + 96
+    mov qword [rdi + 6*8], 0
+    lea rdi, [rdi + 7*8]
     jmp .args_done
 
 .fallback_args:
@@ -805,6 +809,9 @@ elf_load_exec:
     mov dword [rdi + 80], "SHEL"
     mov dword [rdi + 84], "L=/s"
     mov word  [rdi + 88], "h"
+    mov dword [rdi + 96], "DISP"
+    mov dword [rdi + 100], "LAY="
+    mov word  [rdi + 104], ":0"
 
     lea rdi, [r10 + 0x1FF600 + 0x18]
     mov qword [rdi + 0*8], 0x1FFFFD00
@@ -812,8 +819,9 @@ elf_load_exec:
     mov qword [rdi + 2*8], 0x1FFFFD00 + 32
     mov qword [rdi + 3*8], 0x1FFFFD00 + 48
     mov qword [rdi + 4*8], 0x1FFFFD00 + 80
-    mov qword [rdi + 5*8], 0
-    lea rdi, [rdi + 6*8]              ; RDI points after NULL envp
+    mov qword [rdi + 5*8], 0x1FFFFD00 + 96
+    mov qword [rdi + 6*8], 0
+    lea rdi, [rdi + 7*8]              ; RDI points after NULL envp
 
 .args_done:
     ; Setup AMD64 System V / Linux Auxiliary Vector (auxv) at RDI:
