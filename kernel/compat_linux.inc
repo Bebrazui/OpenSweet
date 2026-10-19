@@ -2442,7 +2442,26 @@ linux_syscall_dispatch:
     mov ecx, (2 * 1024 * 1024) / 8
     rep movsq                         ; stack slot
 
-    ; 2b. Clone mmap zone pages into child
+    ; 2b. Deep-copy the private brk heap. Each slot owns its own HEAP_SIZE
+    ; physical window (see kernel/sched.inc), so the child needs its own copy of
+    ; the parent's heap contents - otherwise the two processes share allocator
+    ; metadata and musl/glibc abort on the first allocation after fork.
+    mov eax, [r15 + sched_curr_task - kmain]
+    dec eax
+    imul eax, HEAP_SIZE
+    add eax, HEAP_PHYS_BASE
+    mov r9d, eax                      ; r9  = parent heap physical base
+    mov eax, r12d
+    dec eax
+    imul eax, HEAP_SIZE
+    add eax, HEAP_PHYS_BASE
+    mov r10d, eax                     ; r10 = child heap physical base
+    mov rsi, r9
+    mov rdi, r10
+    mov ecx, HEAP_SIZE / 8
+    rep movsq
+
+    ; 2c. Clone mmap zone pages into child
     call .linux_fork_copy_mmap
 
     ; 3. File descriptor table: copy the parent's row, bump pipe refcounts

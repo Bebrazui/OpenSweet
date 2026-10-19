@@ -1431,10 +1431,11 @@ sys_handler_brk:
     test rdi, rdi
     jz .brk_query
 
-    ; Validate requested address: must be >= 0x01000000 and < 0x04000000 (heap range 16MB..64MB, 48MB)
-    cmp rdi, 0x01000000
+    ; Validate requested address: must lie inside this task's private heap window
+    ; [HEAP_VIRT_BASE, HEAP_VIRT_BASE + HEAP_SIZE) - see kernel/sched.inc.
+    cmp rdi, HEAP_VIRT_BASE
     jb .brk_fail
-    cmp rdi, 0x04000000
+    cmp rdi, HEAP_VIRT_BASE + HEAP_SIZE
     jae .brk_fail
 
     ; Update current brk

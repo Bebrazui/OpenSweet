@@ -17,6 +17,16 @@ USER_PAGE_TABLES_BASE = 0x00200000    ; 2MB: Physical base for per-process page 
 USER_PHYS_BASE        = 0x05000000    ; 80MB: Physical base for per-process code/stack (42MB for 7 slots)
 USER_MEM_STRIDE       = 0x00600000    ; 6MB physical stride per task slot (4MB code + 2MB stack)
 
+; Private brk heap. Every task needs its own physical pages: the heap used to be
+; a single identity-mapped window shared by all tasks, so a forked child and its
+; parent overwrote each other's allocator metadata (musl mallocng then failed its
+; get_meta() consistency check and executed a_crash -> hlt -> #GP).
+; Virtual base stays at 16MB so userland-visible behaviour is unchanged.
+HEAP_VIRT_BASE        = 0x01000000    ; 16MB: virtual base of the user brk heap
+HEAP_SIZE             = 0x02000000    ; 32MB per task
+HEAP_PHYS_BASE        = 0x10000000    ; 256MB: above the PMM-managed range (0..256MB) and
+                                      ; below the 512MB the machine is started with
+
 ; TCB offsets (2720 bytes per TCB, 16-byte aligned)
 TCB_RSP         = 0x00                ; uint64: Saved stack pointer
 TCB_STATE       = 0x08                ; uint32: TASK_* state
@@ -398,15 +408,20 @@ task_setup_pagetables:
     cmp ecx, 8
     jb .map_canvas_loop
 
-    ; Entries 8..31 (virtual 0x01000000..0x04000000 = 16MB..64MB, 48MB): User Heap (for Doom / Games)
-    mov eax, 0x01000087
-    mov ecx, 8
+    ; Entries 8..23 (virtual 0x01000000..0x03000000 = 16MB..48MB, HEAP_SIZE): User Heap.
+    ; Map to THIS slot's private physical window, not identity memory: a shared
+    ; heap lets concurrent processes corrupt each other's malloc metadata.
+    lea eax, [ebx - 1]
+    imul eax, HEAP_SIZE
+    add eax, HEAP_PHYS_BASE
+    or eax, 0x87                      ; Present | Writable | User | Huge
+    mov ecx, HEAP_VIRT_BASE / 0x200000 ; first PD entry of the heap (8)
 .map_ext_heap_loop:
     mov [r10 + rcx*8], eax
     mov dword [r10 + rcx*8 + 4], 0
     add eax, 0x00200000
     inc ecx
-    cmp ecx, 32
+    cmp ecx, (HEAP_VIRT_BASE + HEAP_SIZE) / 0x200000
     jb .map_ext_heap_loop
 
     ; Return PML4 physical address in RAX
