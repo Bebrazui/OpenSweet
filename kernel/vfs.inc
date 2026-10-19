@@ -174,15 +174,15 @@ vfs_open:
     push r13
     push r14
     push r15
-    sub rsp, 64
+    sub rsp, 288
 
     mov r12, rdi                        ; path
     mov r13d, esi                       ; flags
     mov r14d, edx                       ; mode
 
-    ; Validate path pointer (64 bytes max)
+    ; Validate path pointer (256 bytes max)
     mov rdi, r12
-    mov rsi, 64
+    mov rsi, 256
     call sys_validate_user_ptr
     jc .open_fail
 
@@ -202,7 +202,7 @@ vfs_open:
     jmp .find_fd
 
 .found_fd:
-    mov [rsp + 56], rcx                 ; save allocated fd number in scratch
+    mov [rsp + 256], rcx                ; save allocated fd number in scratch
     imul edx, ecx, FD_ENTRY_SIZE
     lea r14, [rbx + rdx]                ; r14 = pointer to fd_entry
 
@@ -220,16 +220,19 @@ vfs_open:
     mov dword [rdi + 32], 0
     pop rdi
 
-    ; Copy path to local buffer [rsp..rsp+48] and fd_entry structure (+12, max 35 chars)
+    ; Copy path to local buffer [rsp..rsp+255] and fd_entry structure (+12, max 35 chars)
     mov rsi, r12
     lea rdi, [rsp]
     lea rdx, [r14 + 12]
-    mov ecx, 35
+    mov ecx, 255
 .cp_p:
     lodsb
     stosb
+    cmp ecx, (255 - 35)
+    jbe @f
     mov [rdx], al
     inc rdx
+@@:
     test al, al
     jz .cp_p_done
     dec ecx
@@ -246,7 +249,29 @@ vfs_open:
     je .is_dev_null
     cmp word [rsp + 4], '/u'
     je .is_dev_null
+    cmp dword [rsp + 4], '/tty'
+    je .is_dev_tty
     jmp .not_dev
+
+.is_dev_tty:
+    mov byte [r14 + 0], FD_TYPE_CONSOLE
+    mov byte [r14 + 1], r13b            ; flags
+    mov word [r14 + 2], 0               ; inode 0
+    mov dword [r14 + 4], 0              ; offset 0
+    mov dword [r14 + 8], 0              ; size 0
+    mov rax, [rsp + 256]                ; allocated fd
+    add rsp, 288
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    popfq
+    ret
 
 .is_dev_null:
     mov byte [r14 + 0], FD_TYPE_DEV_NULL
@@ -254,8 +279,8 @@ vfs_open:
     mov word [r14 + 2], 0               ; inode 0
     mov dword [r14 + 4], 0              ; offset 0
     mov dword [r14 + 8], 0              ; size 0
-    mov rax, [rsp + 56]                 ; allocated fd
-    add rsp, 64
+    mov rax, [rsp + 256]                ; allocated fd
+    add rsp, 288
     pop r15
     pop r14
     pop r13
@@ -320,8 +345,8 @@ vfs_open:
     mov byte [r14 + 1], r13b            ; flags
 
     ; Return allocated FD
-    mov rax, [rsp + 56]
-    add rsp, 64
+    mov rax, [rsp + 256]
+    add rsp, 288
     pop r15
     pop r14
     pop r13
@@ -335,7 +360,7 @@ vfs_open:
     ret
 
 .open_fail:
-    add rsp, 64
+    add rsp, 288
     pop r15
     pop r14
     pop r13
@@ -363,6 +388,7 @@ vfs_stat_fill:
     pop rcx
     pop rax
     sub rdi, 144                      ; rep stosq advanced rdi
+    mov qword [rdi + 0], 0x0801       ; st_dev = makedev(8, 1) -> /dev/sda1
     mov [rdi + 8], rax                ; st_ino
     movzx ecx, word [r15 + ext4_inode - kmain + 26]
     mov [rdi + 16], rcx               ; st_nlink = i_links_count
@@ -373,9 +399,7 @@ vfs_stat_fill:
     movzx ecx, word [r15 + ext4_inode - kmain + 24]
     mov [rdi + 32], ecx               ; st_gid = i_gid
     mov ecx, dword [r15 + ext4_inode - kmain + 4]
-    mov [rdi + 48], ecx               ; st_size low
-    mov ecx, dword [r15 + ext4_inode - kmain + 108]
-    mov [rdi + 52], ecx               ; st_size high
+    mov [rdi + 48], rcx               ; st_size (64-bit: file size in bytes)
     mov qword [rdi + 56], 1024        ; st_blksize
     mov ecx, dword [r15 + ext4_inode - kmain + 28]
     mov [rdi + 64], rcx               ; st_blocks (512B sectors)
@@ -410,10 +434,12 @@ vfs_stat_path:
     call vfs_lookup_with_fallback
     test eax, eax
     jz .statp_enoent
+    mov ebx, eax                        ; preserve inode number
     call ext4_inode_load
     jc .statp_efault
     sub rsp, 144
     mov rdi, rsp
+    mov eax, ebx                        ; pass real inode number
     call vfs_stat_fill
     mov rsi, rsp
     mov rdi, r13
@@ -456,11 +482,13 @@ vfs_stat_fd:
     mov rbx, rax
     cmp byte [rbx + 0], FD_TYPE_FILE
     jne .statf_badfd
-    movzx eax, word [rbx + 2]         ; inode number
+    movzx r12d, word [rbx + 2]         ; preserve inode number
+    mov eax, r12d
     call ext4_inode_load
     jc .statf_efault
     sub rsp, 144
     mov rdi, rsp
+    mov eax, r12d                     ; pass real inode number
     call vfs_stat_fill
     mov rsi, rsp
     mov rdi, r13
@@ -700,15 +728,25 @@ vfs_read_fd:
     mov rdx, 65536
 @@:
 
-    ; Validate user buffer [rsi .. rsi + rdx]
+    ; Validate buffer: allow kernel buffers (e.g. sendfile/kernel internal) or validate user ptr
     push rdi
     push rsi
+    cmp rsi, 0x00400000
+    jb @f                               ; kernel low memory / identity mapped
+    mov rax, 0x800000000000
+    cmp rsi, rax
+    jae @f                              ; kernel canonical higher-half address
     mov rdi, rsi                        ; rdi = user buffer
     mov rsi, rdx                        ; rsi = count
     call sys_validate_user_ptr
     pop rsi
     pop rdi
     jc .rfd_err_fault
+    jmp .rfd_buf_ok
+@@:
+    pop rsi
+    pop rdi
+.rfd_buf_ok:
 
     call vfs_get_fd_ptr
     test rax, rax
@@ -890,15 +928,25 @@ vfs_write_fd:
     mov rdx, 65536
 @@:
 
-    ; Validate user buffer [rsi .. rsi + rdx]
+    ; Validate buffer: allow kernel buffers (e.g. sendfile/kernel internal) or validate user ptr
     push rdi
     push rsi
+    cmp rsi, 0x00400000
+    jb @f                               ; kernel low memory / identity mapped
+    mov rax, 0x800000000000
+    cmp rsi, rax
+    jae @f                              ; kernel canonical higher-half address
     mov rdi, rsi                        ; rdi = user buffer
     mov rsi, rdx                        ; rsi = count
     call sys_validate_user_ptr
     pop rsi
     pop rdi
     jc .wfd_err_fault
+    jmp .wfd_buf_ok
+@@:
+    pop rsi
+    pop rdi
+.wfd_buf_ok:
 
     call vfs_get_fd_ptr
     test rax, rax
