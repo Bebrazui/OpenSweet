@@ -268,7 +268,7 @@ if ($hasBusybox) {
     ExtentLeaf ($itable + 22 * 128) $busyboxStartBlock $busyboxBlocks $busyboxBytes.Length 0x81ED
 }
 
-$includeDoom = $true
+$includeDoom = $false
 $doomElf = Join-Path $PSScriptRoot "build\doom.elf"
 if ($includeDoom -and (-not (Test-Path $doomElf))) {
     & cmd.exe /c "build_doom.cmd"
@@ -346,16 +346,49 @@ ExtentLeaf ($itable + 33 * 128) $tmpX11StartBlock 1 1024 0x41FF
 # inode 35 = /tmp/.X11-unix/X0 socket (S_IFSOCK = 0xC000 | 0777)
 ExtentLeaf ($itable + 34 * 128) 0 0 0 0xC1FF
 
-$debPkgPath = Join-Path $PSScriptRoot "build\test.deb"
+$debBashCandidate = Join-Path $PSScriptRoot "build\bash.deb"
+$debPkgPath = if (Test-Path $debBashCandidate) { $debBashCandidate } else { Join-Path $PSScriptRoot "build\test.deb" }
+$debPkgName = if (Test-Path $debBashCandidate) { "bash.deb" } else { "test.deb" }
 $hasDebPkg = Test-Path $debPkgPath
 $debPkgBlocks = 0
 $debPkgStartBlock = $binStartBlock + 3
 if ($hasDebPkg) {
     $debPkgBytes = [IO.File]::ReadAllBytes($debPkgPath)
     $debPkgBlocks = [int][Math]::Ceiling($debPkgBytes.Length / 1024.0)
-    # inode 32 = test.deb
+    # inode 32 = bash.deb / test.deb
     ExtentLeaf ($itable + 31 * 128) $debPkgStartBlock $debPkgBlocks $debPkgBytes.Length 0x81A4
 }
+
+# ---- X11 Libraries and official Debian X11 app (ico) ----
+$x11Dir = Join-Path $PSScriptRoot "build\x11_libs"
+$curX11Block = if ($hasDebPkg) { $debPkgStartBlock + $debPkgBlocks } else { $binStartBlock + 3 }
+
+$x11FileDefs = @(
+    @{ Name = "ico"; Ino = 36; Mode = 0x81ED },
+    @{ Name = "libX11.so.6"; Ino = 37; Mode = 0x81ED },
+    @{ Name = "libxcb.so.1"; Ino = 38; Mode = 0x81ED },
+    @{ Name = "libXau.so.6"; Ino = 39; Mode = 0x81ED },
+    @{ Name = "libXdmcp.so.6"; Ino = 40; Mode = 0x81ED },
+    @{ Name = "libbsd.so.0"; Ino = 41; Mode = 0x81ED },
+    @{ Name = "libmd.so.0"; Ino = 42; Mode = 0x81ED },
+    @{ Name = "libpthread.so.0"; Ino = 43; Mode = 0x81ED },
+    @{ Name = "libdl.so.2"; Ino = 44; Mode = 0x81ED },
+    @{ Name = "libtinfo.so.6"; Ino = 46; Mode = 0x81ED }
+)
+
+$x11Extracted = @()
+foreach ($xf in $x11FileDefs) {
+    $p = Join-Path $x11Dir $xf.Name
+    if (Test-Path $p) {
+        $b = [IO.File]::ReadAllBytes($p)
+        $blks = [int][Math]::Ceiling($b.Length / 1024.0)
+        ExtentLeaf ($itable + ($xf.Ino - 1) * 128) $curX11Block $blks $b.Length $xf.Mode
+        $x11Extracted += @{ Name = $xf.Name; Ino = $xf.Ino; StartBlock = $curX11Block; Blocks = $blks; Bytes = $b; IsSymlink = $false }
+        $curX11Block += $blks
+    }
+}
+
+$lastAllocatedGrp0Block = $curX11Block
 
 
 $wadPath = Join-Path $PSScriptRoot "user\doomgeneric\doom1.wad"
@@ -420,7 +453,7 @@ if ($hasLinuxTest) {
     $curOff += 24
 }
 if ($hasBusybox) {
-    $rec = if ($hasDoom -or $hasWad) { 20 } else { $d + 1024 - $curOff }
+    $rec = if ($hasDoom -or $hasDebHello -or $hasDebThread -or $hasLd -or $hasLibc -or $hasWad) { 20 } else { $d + 1024 - $curOff }
     DirEntry $curOff 23 'busybox' 1 $rec
     $curOff += 20
 }
@@ -459,10 +492,22 @@ DirEntry $curOff 31 'lib64' 7 16
 $curOff += 16
 DirEntry $curOff 33 'tmp' 2 16
 $curOff += 16
+
+foreach ($xe in $x11Extracted) {
+    $nlen = [Text.Encoding]::ASCII.GetBytes($xe.Name).Length
+    $entrySz = 8 + $nlen
+    $alignedSz = [int][Math]::Ceiling($entrySz / 4.0) * 4
+    DirEntry $curOff $xe.Ino $xe.Name 1 $alignedSz
+    $curOff += $alignedSz
+}
+
 if ($hasDebPkg) {
-    $rec = if ($hasWad) { 16 } else { $d + 1024 - $curOff }
-    DirEntry $curOff 32 'test.deb' 1 $rec
-    $curOff += 16
+    $nlen = [Text.Encoding]::ASCII.GetBytes($debPkgName).Length
+    $entrySz = 8 + $nlen
+    $alignedSz = [int][Math]::Ceiling($entrySz / 4.0) * 4
+    $rec = if ($hasWad) { $alignedSz } else { $d + 1024 - $curOff }
+    DirEntry $curOff 32 $debPkgName 1 $rec
+    $curOff += $alignedSz
 }
 if ($hasWad) {
     DirEntry $curOff 20 'doom1.wad' 1 ($d + 1024 - $curOff)
@@ -566,7 +611,16 @@ echo "Added /tmp and /tmp/.X11-unix/X0 socket structure to disk image"
 
 if ($hasDebPkg) {
     Put ($debPkgStartBlock * $BS) $debPkgBytes
-    echo "Added test.deb ($($debPkgBytes.Length) bytes, $debPkgBlocks blocks) to disk image"
+    echo "Added $debPkgName ($($debPkgBytes.Length) bytes, $debPkgBlocks blocks) to disk image"
+}
+
+foreach ($xe in $x11Extracted) {
+    if (-not $xe.IsSymlink) {
+        Put ($xe.StartBlock * $BS) $xe.Bytes
+        echo "Added $($xe.Name) ($($xe.Bytes.Length) bytes, $($xe.Blocks) blocks) to disk image"
+    } else {
+        echo "Added symlink $($xe.Name) -> libc.so.6 to disk image"
+    }
 }
 
 if ($hasWad) {
@@ -575,7 +629,7 @@ if ($hasWad) {
 }
 
 # ---- populate block and inode bitmaps and free counts ----
-$totalAllocatedBlocksGrp0 = if ($hasDebPkg) { $debPkgStartBlock + $debPkgBlocks } else { $tmpX11StartBlock + 1 }
+$totalAllocatedBlocksGrp0 = if ($x11Extracted.Count -gt 0) { $lastAllocatedGrp0Block } elseif ($hasDebPkg) { $debPkgStartBlock + $debPkgBlocks } else { $tmpX11StartBlock + 1 }
 
 # Block bitmap at block 3:
 # In Group 0 with 1KB block size, first_data_block = 1.
@@ -610,6 +664,11 @@ $img[(4 * $BS) + 0] = 0xFF
 $img[(4 * $BS) + 1] = 0x03
 $usedInoCountGrp0 = 10
 $lastIno = 35
+if ($x11Extracted.Count -gt 0) {
+    foreach ($xe in $x11Extracted) {
+        if ($xe.Ino -gt $lastIno) { $lastIno = $xe.Ino }
+    }
+}
 for ($ino = 11; $ino -le $lastIno; $ino++) {
     $bit = $ino - 1
     $byteIdx = $bit -shr 3
