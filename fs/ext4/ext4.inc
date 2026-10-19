@@ -800,6 +800,30 @@ ext4_resolve_parent:
     jb .rp_copy
     mov byte [rdi], 0                   ; ensure null termination
 .rp_copied:
+    ; Strip trailing slashes (e.g. "./bin/" -> "./bin") unless path is "/"
+.rp_strip_slash:
+    cmp ecx, 1
+    jbe .rp_find_last_slash
+    cmp byte [rsp + rcx - 1], '/'
+    jne .rp_find_last_slash
+    dec ecx
+    mov byte [rsp + rcx], 0
+    jmp .rp_strip_slash
+
+.rp_find_last_slash:
+    ; Rescan [rsp .. rsp+rcx] for the last '/'
+    mov qword [rsp + 256], -1
+    xor edx, edx
+.rp_scan:
+    cmp edx, ecx
+    jae .rp_scanned
+    cmp byte [rsp + rdx], '/'
+    jne @f
+    mov [rsp + 256], rdx
+@@:
+    inc edx
+    jmp .rp_scan
+.rp_scanned:
 
     mov rax, [rsp + 256]                ; rax = last_slash offset
     cmp rax, -1
