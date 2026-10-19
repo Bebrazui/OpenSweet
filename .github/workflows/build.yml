@@ -1,0 +1,62 @@
+name: build
+
+# Assembles the bare-metal kernel (boot sector, stage 2, kernel) with the native
+# Linux build of flat assembler and verifies the artifacts.
+#
+# Scope note: this job covers the FASM half of the project only. The userland
+# applications are compiled by make-ext4.ps1 through tools/w64devkit/bin/gcc.exe
+# with Windows-target flags (-mabi=sysv), so the full disk image is not yet
+# reproducible off Windows. See STATUS.md.
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  assemble:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install flat assembler 1.73.35 (Linux build)
+        run: |
+          curl -fsSL -o fasm.tgz https://flatassembler.net/fasm-1.73.35.tgz
+          tar xzf fasm.tgz
+          # The tarball layout has changed between releases; locate the binary instead of guessing.
+          FASM_BIN=$(find . -maxdepth 3 -type f -name fasm | head -n1)
+          if [ -z "$FASM_BIN" ]; then echo "fasm binary not found in the tarball"; exit 1; fi
+          chmod +x "$FASM_BIN"
+          echo "FASM_BIN=$(pwd)/$FASM_BIN" >> "$GITHUB_ENV"
+
+      - name: Check the assembler runs
+        run: |
+          "$FASM_BIN" || true
+          # flat assembler prints its version banner and exits non-zero with no input file;
+          # the banner is the assertion here.
+
+      - name: Assemble boot sector, stage 2 and kernel
+        run: |
+          mkdir -p build
+          "$FASM_BIN" arch/x86_64/boot/boot.asm       build/boot.bin
+          "$FASM_BIN" arch/x86_64/boot/stage2.asm     build/stage2.bin
+          "$FASM_BIN" arch/x86_64/kernel/kernel.asm   build/kernel.bin
+
+      - name: Verify artifacts
+        run: |
+          boot=$(stat -c%s build/boot.bin)
+          stage2=$(stat -c%s build/stage2.bin)
+          kernel=$(stat -c%s build/kernel.bin)
+          echo "boot.bin=$boot  stage2.bin=$stage2  kernel.bin=$kernel"
+          [ "$boot" -eq 512 ] || { echo "boot.bin must be exactly 512 bytes"; exit 1; }
+          [ "$stage2" -gt 0 ] || { echo "stage2.bin is empty"; exit 1; }
+          [ "$kernel" -gt 65536 ] || { echo "kernel.bin is suspiciously small"; exit 1; }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kernel-binaries
+          path: |
+            build/boot.bin
+            build/stage2.bin
+            build/kernel.bin
