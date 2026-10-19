@@ -4,9 +4,9 @@
 ; Modular Window Manager integration, and Zero-Lag Drag & Drop.
 ; ==============================================================================
 
-include 'D:\Opensweet\gui\render2d.inc'
-include 'D:\Opensweet\gui\wm.inc'
-include 'D:\Opensweet\kernel\app_registry.inc'
+include 'render2d.inc'
+include 'wm.inc'
+include '../kernel/app_registry.inc'
 
 MD_TERM_ROWS = 24
 MD_TERM_COLS = 64

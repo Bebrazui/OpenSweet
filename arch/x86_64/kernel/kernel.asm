@@ -3478,22 +3478,22 @@ db "ZXCVBNM<>?",0,0,0," "         ; 0x2C - 0x39
 db 0,0,0,0,0,0,0,0,0,0,0,0,0,0    ; 0x3A - 0x47 (14 zeros)
 db 0x80,0,0,0x82,0,0x83,0,0,0x81,0,0,0 ; 0x48 - 0x53 (0x80=Up, 0x82=Left, 0x83=Right, 0x81=Down)
 
-include '..\drivers\ata.asm'
-include '..\drivers\mouse.asm'
-include '..\drivers\rtl8139.asm'
-include 'D:\Opensweet\kernel\net.inc'
-include 'D:\Opensweet\fs\ext4\ext4.inc'
-include '..\drivers\console.asm'
-include 'D:\Opensweet\gui\modern_desktop.inc'
-include 'D:\Opensweet\kernel\sched.inc'
-include 'D:\Opensweet\kernel\heap.inc'
-include 'D:\Opensweet\kernel\vfs.inc'
-include 'D:\Opensweet\kernel\compat_linux.inc'
-include 'D:\Opensweet\kernel\shm.inc'
-include 'D:\Opensweet\kernel\x11.inc'
-include 'D:\Opensweet\kernel\syscall.inc'
-include 'D:\Opensweet\kernel\test_user.inc'
-include 'D:\Opensweet\kernel\elf.inc'
+include '../drivers/ata.asm'
+include '../drivers/mouse.asm'
+include '../drivers/rtl8139.asm'
+include '../../../kernel/net.inc'
+include '../../../fs/ext4/ext4.inc'
+include '../drivers/console.asm'
+include '../../../gui/modern_desktop.inc'
+include '../../../kernel/sched.inc'
+include '../../../kernel/heap.inc'
+include '../../../kernel/vfs.inc'
+include '../../../kernel/compat_linux.inc'
+include '../../../kernel/shm.inc'
+include '../../../kernel/x11.inc'
+include '../../../kernel/syscall.inc'
+include '../../../kernel/test_user.inc'
+include '../../../kernel/elf.inc'
 
 ; ================= framebuffer test pattern (proves VBE LFB works) =================
 ; fills screen with per-pixel gradient: R=x, G=y, B=(x+y) & 255

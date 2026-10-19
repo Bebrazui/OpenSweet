@@ -4,7 +4,7 @@
 ; Dual-Output Mirroring to COM1 Serial, Active Cursor, and Modern Colors.
 ; ==============================================================================
 
-include 'D:\Opensweet\gui\font8x16.inc'
+include '../../../gui/font8x16.inc'
 
 FB_CONSOLE_COLS = 128
 FB_CONSOLE_ROWS = 48

@@ -3,7 +3,7 @@
 ; High-performance 32bpp Linear Framebuffer + Double Buffering (RAM Backbuffer)
 ; ==============================================================================
 
-include 'D:\Opensweet\gui\font8x16.inc'
+include 'font8x16.inc'
 
 GUI_BACKBUFFER    = 0x02000000   ; 4MB RAM Backbuffer (Page 0x2000..0x23FF)
 

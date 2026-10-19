@@ -10,12 +10,12 @@ R2D_SCREEN_W         = 1920
 R2D_SCREEN_H         = 1080
 R2D_PITCH            = 7680             ; 1920 dwords per scanline
 
-include 'D:\Opensweet\gui\font_mono_aa.inc'
-include 'D:\Opensweet\gui\font_ui_aa.inc'
-include 'D:\Opensweet\gui\icons_32bpp.inc'
-include 'D:\Opensweet\gui\cursor_aa.inc'
-include 'D:\Opensweet\gui\png.inc'
-include 'D:\Opensweet\gui\qoi.inc'
+include 'font_mono_aa.inc'
+include 'font_ui_aa.inc'
+include 'icons_32bpp.inc'
+include 'cursor_aa.inc'
+include 'png.inc'
+include 'qoi.inc'
 
 ; ==============================================================================
 ; r2d_init: Read VBE parameters and load wallpaper into cache (0x02800000)
