@@ -30,9 +30,13 @@ These are confirmed by the serial log of a real headless boot (`scripts/smoke.ps
 ## In flight (do not assume stable)
 
 - **Debian `bash` under the Linux ABI.** `bash.deb` is packaged into the disk image
-  and unpacked at runtime with `dpkg-deb -x`. Not confirmed working yet; the most
-  recent work (`sendfile`, default signal actions, `/dev/tty`, `DISPLAY=:0`) targets
-  this.
+  and unpacked at runtime with `dpkg-deb -x`. **Blocked, cause identified:** the
+  decompressor child spawned by `dpkg-deb` (busybox) dies with a general protection
+  fault (exception 0D) and a read of `/bash.deb` returns `-EIO`, so extraction stops
+  early and leaves a truncated 2648-byte `/bin/bash` that the ELF loader rejects with
+  `No valid PT_LOAD segments found`. Reproduce with `scripts/test_bash.ps1`.
+  Working around it by shipping a pre-extracted `bash` would hide a real bug in the
+  read/`fork` path that `apt`, `tar` and `xz` would hit too.
 - **X11 client (`ico`).** X11 wire protocol lives in `kernel/x11.inc`, SHM in
   `kernel/shm.inc`. Library set is packaged but the client is not confirmed running.
 - **Linux ABI serial tracing.** `compat_linux.inc` prints `openat`/`fstat`/`lseek`/
@@ -55,9 +59,11 @@ Ordered roughly by how much they block other work.
    `fork` is a deep copy (no COW), SMEP/SMAP are not enabled, and the user virtual
    layout is fixed. Running untrusted binaries relies entirely on range checking in
    `sys_validate_user_ptr`.
-4. **Linux ABI depth.** Missing syscalls that glibc/`bash`/`apt`/`python` need:
-   `clock_gettime(228)`, `epoll` (232/233/291), `inotify` (253–255), `pipe2(293)`,
-   `dup3(292)`, `set_robust_list(274)`. See `docs/linux-syscalls.md`.
+4. **Linux ABI depth.** `gettimeofday(96)`, `clock_gettime(228)` and
+   `nanosleep(35)` were added recently (`nanosleep` had a constant but no dispatch).
+   Still missing for glibc/`bash`/`apt`/`python`: `epoll` (232/233/291),
+   `inotify` (253–255), `pipe2(293)`, `dup3(292)`, `set_robust_list(274)`.
+   See `docs/linux-syscalls.md`.
 5. **`make-ext4.ps1` is a single point of failure.** ~30 KB of hand-rolled ext4
    construction with hard-coded inode numbers (32, 36–46). A silent accounting error
    produces a corrupt image with no diagnostic.
