@@ -30,13 +30,17 @@ These are confirmed by the serial log of a real headless boot (`scripts/smoke.ps
 ## In flight (do not assume stable)
 
 - **Debian `bash` under the Linux ABI.** `bash.deb` is packaged into the disk image
-  and unpacked at runtime with `dpkg-deb -x`. **Blocked, cause identified:** the
-  decompressor child spawned by `dpkg-deb` (busybox) dies with a general protection
-  fault (exception 0D) and a read of `/bash.deb` returns `-EIO`, so extraction stops
-  early and leaves a truncated 2648-byte `/bin/bash` that the ELF loader rejects with
-  `No valid PT_LOAD segments found`. Reproduce with `scripts/test_bash.ps1`.
-  Working around it by shipping a pre-extracted `bash` would hide a real bug in the
-  read/`fork` path that `apt`, `tar` and `xz` would hit too.
+  and unpacked at runtime with `dpkg-deb -x`. **Major blocker fixed:** the brk heap
+  used to be one identity-mapped window shared by every task, so the decompressor
+  child spawned by `dpkg-deb` and its parent overwrote each other's allocator
+  metadata; musl mallocng failed `get_meta()` and executed `a_crash()` (`hlt` ->
+  #GP, exception 0D). Each slot now owns a private 32 MB physical heap
+  (`HEAP_PHYS_BASE = 0x10000000`, above the PMM range) and `fork` deep-copies it.
+  With that, `dpkg-deb` no longer crashes and extracts a real `/usr/...` tree.
+  **Still open:** one `read()` on `/bash.deb` returns `-EIO` and `dpkg-deb` then
+  fails with `can't open './usr/share/doc/bash/CHANGES.gz'`, so `/bin/bash` is not
+  produced. Reproduce with `scripts/test_bash.ps1` (rebuild `disk.img` between runs:
+  a failed extraction leaves partial state behind).
 - **X11 client (`ico`).** X11 wire protocol lives in `kernel/x11.inc`, SHM in
   `kernel/shm.inc`. Library set is packaged but the client is not confirmed running.
 - **Linux ABI serial tracing.** `compat_linux.inc` prints `openat`/`fstat`/`lseek`/
@@ -59,6 +63,8 @@ Ordered roughly by how much they block other work.
    `fork` is a deep copy (no COW), SMEP/SMAP are not enabled, and the user virtual
    layout is fixed. Running untrusted binaries relies entirely on range checking in
    `sys_validate_user_ptr`.
+   The window-canvas range (`0x00800000..0x01000000`) is still identity-mapped and
+   therefore shared between tasks; only the brk heap was made private.
 4. **Linux ABI depth.** `gettimeofday(96)`, `clock_gettime(228)` and
    `nanosleep(35)` were added recently (`nanosleep` had a constant but no dispatch).
    Still missing for glibc/`bash`/`apt`/`python`: `epoll` (232/233/291),
