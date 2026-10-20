@@ -1179,6 +1179,91 @@ jmp .rp_success
     pop rcx
     ret
 
+; ================= attach one block to the loaded inode's extent tree =======
+; EAX = logical block, EDX = physical block.  Requires ext4_inode loaded.
+; Out: CF=0 attached, CF=1 the inline extent root is full (4 extents max and
+; this driver never writes an extent index tree).
+; Merges into the last extent when both the logical and the physical block are
+; contiguous with it; that is the normal case for an append-only writer.
+ext4_ext_attach:
+    push rbx
+    push rcx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+
+    mov r8d, eax                        ; r8d = logical block
+    mov r11d, edx                       ; r11d = physical block
+
+    cmp word [r15 + ext4_inode - kmain + IN_OFF_BLOCK], EH_MAGIC
+    jne .ea_init
+    movzx ecx, word [r15 + ext4_inode - kmain + IN_OFF_BLOCK + 2]
+    test ecx, ecx
+    jz .ea_init
+
+    dec ecx
+    imul ecx, 12
+    add ecx, IN_OFF_BLOCK + 12          ; ecx = last extent
+    mov edx, dword [r15 + ext4_inode - kmain + rcx + 0]
+    movzx esi, word [r15 + ext4_inode - kmain + rcx + 4]
+    mov edi, dword [r15 + ext4_inode - kmain + rcx + 8]
+
+    lea eax, [edx + esi]
+    cmp r8d, eax
+    jne .ea_new
+    lea eax, [edi + esi]
+    cmp r11d, eax
+    jne .ea_new
+    cmp esi, 32767
+    jae .ea_new
+
+    inc word [r15 + ext4_inode - kmain + rcx + 4]   ; ee_len++
+    clc
+    jmp .ea_pop
+
+.ea_new:
+    movzx ecx, word [r15 + ext4_inode - kmain + IN_OFF_BLOCK + 2]
+    cmp ecx, 4
+    jae .ea_full
+    imul ecx, 12
+    add ecx, IN_OFF_BLOCK + 12
+    mov dword [r15 + ext4_inode - kmain + rcx + 0], r8d
+    mov word  [r15 + ext4_inode - kmain + rcx + 4], 1
+    mov word  [r15 + ext4_inode - kmain + rcx + 6], 0
+    mov dword [r15 + ext4_inode - kmain + rcx + 8], r11d
+    inc word  [r15 + ext4_inode - kmain + IN_OFF_BLOCK + 2]
+    clc
+    jmp .ea_pop
+
+.ea_init:
+    mov word  [r15 + ext4_inode - kmain + IN_OFF_BLOCK + 0], EH_MAGIC
+    mov word  [r15 + ext4_inode - kmain + IN_OFF_BLOCK + 2], 1
+    mov word  [r15 + ext4_inode - kmain + IN_OFF_BLOCK + 4], 4
+    mov word  [r15 + ext4_inode - kmain + IN_OFF_BLOCK + 6], 0
+    mov dword [r15 + ext4_inode - kmain + IN_OFF_BLOCK + 8], 0
+    mov dword [r15 + ext4_inode - kmain + IN_OFF_BLOCK + 12], r8d
+    mov word  [r15 + ext4_inode - kmain + IN_OFF_BLOCK + 16], 1
+    mov word  [r15 + ext4_inode - kmain + IN_OFF_BLOCK + 18], 0
+    mov dword [r15 + ext4_inode - kmain + IN_OFF_BLOCK + 20], r11d
+    clc
+    jmp .ea_pop
+
+.ea_full:
+    stc
+.ea_pop:
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rcx
+    pop rbx
+    ret
+
 ; ================= add entry to directory =================
 ; Inputs:
 ;   EAX = parent directory inode
@@ -1188,7 +1273,266 @@ jmp .rp_success
 ; Outputs:
 ;   RAX = 0 on success, -1 on error
 ;   CF  = 0 on success, 1 on error
+;
+; Scans every block of the directory and appends a fresh block when all of
+; them are full.  The old version only looked at logical block 0, so as soon
+; as a directory outgrew 1 KB (e.g. /usr/share/locale, which gets one entry
+; per locale) new entries could not be created at all and dpkg-deb reported
+; "No such file or directory" for files inside it.
 ext4_add_dir_entry:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    sub rsp, 48
+    ; [rsp+0]  name_len
+    ; [rsp+8]  needed_rec_len
+    ; [rsp+16] current logical block
+    ; [rsp+24] file_type
+    ; [rsp+32] last logical block (inclusive)
+    ; [rsp+40] new physical block, kept across ext4_blk_write
+
+    mov r12d, eax                       ; r12d = parent inode
+    mov r13d, edx                       ; r13d = child inode
+    mov r14, rsi                        ; r14 = name pointer
+    mov byte [rsp + 24], cl
+
+    mov rsi, r14
+    xor ecx, ecx
+.ade_nlen:
+    cmp byte [rsi + rcx], 0
+    je .ade_nlen_done
+    inc ecx
+    cmp ecx, 255
+    jb .ade_nlen
+.ade_nlen_done:
+    test ecx, ecx
+    jz .ade_err
+    mov [rsp + 0], ecx                  ; name_len
+    lea eax, [ecx + 8 + 3]
+    and eax, not 3
+    mov [rsp + 8], eax                  ; needed_rec_len
+
+    mov eax, r12d
+    call ext4_inode_load
+    jc .ade_err
+
+    movzx edx, word [r15 + ext4_inode - kmain + IN_OFF_MODE]
+    and edx, 0xF000
+    cmp edx, 0x4000
+    jne .ade_err
+
+    ; last logical block = ceil(i_size / 1024) - 1
+    mov rax, qword [r15 + ext4_inode - kmain + IN_OFF_SIZE]
+    add rax, 1023
+    shr rax, 10
+    test rax, rax
+    jnz @f
+    mov eax, 1
+@@:
+    dec rax
+    mov [rsp + 32], rax
+    mov dword [rsp + 16], 0
+
+.ade_block_loop:
+    mov eax, [rsp + 16]
+    cmp eax, [rsp + 32]
+    ja .ade_append
+
+    call ext4_map
+    cmp rax, -1
+    je .ade_next_block
+    mov ebx, eax                        ; ebx = directory physical block
+
+    mov eax, ebx
+    lea rsi, [r15 + ext4_wbuf - kmain]
+    call ext4_blk_read
+    jc .ade_err
+
+    xor r8d, r8d                        ; r8d = byte offset in block
+    mov r10d, [rsp + 8]
+.ade_scan:
+    cmp r8d, 1024
+    jae .ade_next_block
+
+    movzx eax, word [r15 + ext4_wbuf - kmain + r8 + 4] ; rec_len
+    test ax, ax
+    jz .ade_next_block
+
+    cmp dword [r15 + ext4_wbuf - kmain + r8], 0
+    jne .ade_chk_split
+    cmp eax, r10d
+    jae .ade_use_slot
+
+.ade_chk_split:
+    movzx ecx, byte [r15 + ext4_wbuf - kmain + r8 + 6]
+    add ecx, 8 + 3
+    and ecx, not 3
+    mov edx, eax
+    sub edx, ecx
+    cmp edx, r10d
+    jae .ade_split
+
+    add r8d, eax
+    jmp .ade_scan
+
+.ade_split:
+    mov word [r15 + ext4_wbuf - kmain + r8 + 4], cx
+    add r8d, ecx
+    jmp .ade_fill
+
+.ade_use_slot:
+    mov edx, eax
+
+.ade_fill:
+    mov ecx, [rsp + 0]
+    lea eax, [r8 + rcx + 8]
+    cmp eax, 1024
+    ja .ade_err
+
+    lea rdi, [r15 + ext4_wbuf - kmain + r8]
+    mov dword [rdi + 0], r13d
+    mov word  [rdi + 4], dx
+    mov byte  [rdi + 6], cl
+    mov al, [rsp + 24]
+    mov byte  [rdi + 7], al
+
+    lea rdi, [rdi + 8]
+    mov rsi, r14
+    rep movsb
+
+    mov eax, ebx
+    lea rsi, [r15 + ext4_wbuf - kmain]
+    call ext4_blk_write
+    jc .ade_err
+
+    call disk_flush_cache
+    xor eax, eax
+    clc
+    jmp .ade_pop
+
+.ade_next_block:
+    inc dword [rsp + 16]
+    jmp .ade_block_loop
+
+; ---- every block is full: append a fresh directory block ----
+.ade_append:
+    mov r8d, [rsp + 32]
+    inc r8d                             ; logical block of the new entry
+
+    xor eax, eax                        ; hint = end of the last extent
+    cmp word [r15 + ext4_inode - kmain + IN_OFF_BLOCK], EH_MAGIC
+    jne .ade_alloc
+    movzx ecx, word [r15 + ext4_inode - kmain + IN_OFF_BLOCK + 2]
+    test ecx, ecx
+    jz .ade_alloc
+    dec ecx
+    imul ecx, 12
+    add ecx, IN_OFF_BLOCK + 12
+    movzx edx, word [r15 + ext4_inode - kmain + rcx + 4]
+    mov eax, dword [r15 + ext4_inode - kmain + rcx + 8]
+    add eax, edx
+.ade_alloc:
+    call ext4_alloc_block_hint
+    cmp rax, -1
+    je .ade_err
+    mov r11d, eax
+    mov [rsp + 40], rax
+
+    mov eax, r8d
+    mov edx, r11d
+    call ext4_ext_attach
+    jc .ade_ext_full
+
+    ; one free entry spanning the whole new block
+    lea rdi, [r15 + ext4_wbuf - kmain]
+    mov ecx, 1024 / 8
+    xor eax, eax
+    rep stosq
+
+    lea rdi, [r15 + ext4_wbuf - kmain]
+    mov dword [rdi + 0], r13d
+    mov word  [rdi + 4], 1024
+    mov ecx, [rsp + 0]
+    mov byte  [rdi + 6], cl
+    mov al, [rsp + 24]
+    mov byte  [rdi + 7], al
+    lea rdi, [rdi + 8]
+    mov rsi, r14
+    rep movsb
+
+    mov eax, [rsp + 40]
+    lea rsi, [r15 + ext4_wbuf - kmain]
+    call ext4_blk_write
+    jc .ade_free_fail
+
+    ; grow i_size / i_blocks (ext4_blk_write clobbers r8-r11, so re-derive)
+    mov ecx, [rsp + 32]
+    inc ecx
+    shl ecx, 10                         ; new size in bytes
+    mov dword [r15 + ext4_inode - kmain + IN_OFF_SIZE], ecx
+    shr ecx, 9
+    mov dword [r15 + ext4_inode - kmain + IN_OFF_BLOCKS], ecx
+
+    mov eax, r12d
+    call ext4_inode_save
+    jc .ade_err
+
+    call disk_flush_cache
+    xor eax, eax
+    clc
+    jmp .ade_pop
+
+.ade_ext_full:
+    lea rsi, [r15 + str_ext_full - kmain]
+    call puts
+    mov eax, r12d
+    call putdec64
+    mov al, 10
+    call putc
+.ade_free_fail:
+    mov edi, [rsp + 40]
+    mov esi, 1
+    call ext4_free_blocks
+.ade_err:
+    mov rax, -1
+    stc
+.ade_pop:
+    add rsp, 48
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; ================= add entry to directory (first block only, superseded) ====
+; Kept until the multi-block version above has been validated; no caller uses
+; it any more.
+; Inputs:
+;   EAX = parent directory inode
+;   EDX = child inode number
+;   RSI = child name string (ASCIIZ)
+;   CL  = child file_type (1 = file, 2 = dir)
+; Outputs:
+;   RAX = 0 on success, -1 on error
+;   CF  = 0 on success, 1 on error
+ext4_add_dir_entry_1blk:
     push rbx
     push rcx
     push rdx
@@ -1365,6 +1709,7 @@ ext4_remove_dir_entry:
     push r9
     push r12
     push r13
+    sub rsp, 16                         ; [rsp+0] cur_lb, [rsp+8] last_lb
 
     mov r12d, eax                       ; r12d = parent inode
     mov r13d, edx                       ; r13d = target child inode
@@ -1374,23 +1719,37 @@ ext4_remove_dir_entry:
     call ext4_inode_load
     jc .rde_err
 
-    xor eax, eax
+    ; Walk every block: entries can live past logical block 0.
+    mov rax, qword [r15 + ext4_inode - kmain + IN_OFF_SIZE]
+    add rax, 1023
+    shr rax, 10
+    test rax, rax
+    jnz @f
+    mov eax, 1
+@@:
+    dec rax
+    mov [rsp + 8], rax
+    mov dword [rsp + 0], 0
+
+.rde_block_loop:
+    mov eax, [rsp + 0]
+    cmp eax, [rsp + 8]
+    ja .rde_err
+
     call ext4_map
     cmp rax, -1
-    je .rde_err
+    je .rde_next
     mov ebx, eax                        ; ebx = dir phys block
 
-    ; Read directory block into ext4_wbuf
     mov eax, ebx
     lea rsi, [r15 + ext4_wbuf - kmain]
     call ext4_blk_read
     jc .rde_err
 
-    ; Scan directory entries in ext4_wbuf
     xor r8d, r8d                        ; r8d = offset in block
 .rde_scan:
     cmp r8d, 1024
-    jae .rde_err
+    jae .rde_next
 
     mov eax, dword [r15 + ext4_wbuf - kmain + r8] ; entry inode
     cmp eax, r13d
@@ -1398,7 +1757,7 @@ ext4_remove_dir_entry:
 
     movzx eax, word [r15 + ext4_wbuf - kmain + r8 + 4] ; rec_len
     test ax, ax
-    jz .rde_err
+    jz .rde_next
     add r8d, eax
     jmp .rde_scan
 
@@ -1415,7 +1774,17 @@ ext4_remove_dir_entry:
     call disk_flush_cache
     xor eax, eax
     clc
+    jmp .rde_pop
+
+.rde_next:
+    inc dword [rsp + 0]
+    jmp .rde_block_loop
+
+.rde_err:
+    mov rax, -1
+    stc
 .rde_pop:
+    add rsp, 16
     pop r13
     pop r12
     pop r9
@@ -1426,11 +1795,6 @@ ext4_remove_dir_entry:
     pop rcx
     pop rbx
     ret
-
-.rde_err:
-    mov rax, -1
-    stc
-    jmp .rde_pop
 
 ; ================= create new empty file =================
 ; RSI = filename or path (ASCIIZ). Out: RAX = inode or -1.
@@ -2658,12 +3022,27 @@ ext4_dir_find:
 .ent:
     cmp r8, r9
     jae .next_blk
+    ; Sanity-check rec_len before trusting it: 8-byte aligned header at least,
+    ; 4-byte aligned length, and the record must stay inside this block.
+    movzx eax, word [r8 + 4]                ; rec_len
+    cmp eax, 8
+    jb .next_blk
+    test eax, 3
+    jnz .next_blk
+    mov rdx, r8
+    add rdx, rax
+    cmp rdx, r9
+    ja .next_blk
     mov eax, [r8]                           ; entry inode
     test eax, eax
     jz .skip
     movzx eax, byte [r8 + 6]                ; name_len
     cmp eax, ebx
     jne .skip
+    movzx ecx, word [r8 + 4]
+    sub ecx, 8
+    cmp eax, ecx                            ; name must fit inside the record
+    ja .skip
     lea r10, [r8 + 8]                       ; entry name
     mov rcx, rbx                            ; compare length
     xor edx, edx                            ; match flag
@@ -2788,6 +3167,12 @@ ext4_read_dir:
     ; Valid entry: extract name_len and file_type
     movzx ecx, byte [r11 + 6]   ; name_len
     movzx ebp, byte [r11 + 7]   ; file_type (d_type)
+
+    ; A corrupt (or hostile) image can claim name_len > rec_len - 8; copying
+    ; that many bytes would leak the rest of the block into user space.
+    lea edx, [rbx - 8]
+    cmp ecx, edx
+    ja .rd_skip
 
     ; Calculate linux_dirent64 reclen:
     ; header = 19 bytes (d_ino 8, d_off 8, d_reclen 2, d_type 1)
