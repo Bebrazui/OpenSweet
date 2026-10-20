@@ -327,7 +327,33 @@ if ($hasLibc) {
     ExtentLeaf ($itable + 26 * 128) $libcStartBlock $libcBlocks $libcBytes.Length 0x81ED
 }
 
-$binStartBlock = if ($hasLibc) { $libcStartBlock + $libcBlocks } elseif ($hasLd) { $ldStartBlock + $ldBlocks } else { 26 }
+# /bin/bash: the genuine Debian bash binary, unpacked from bash.deb on the host.
+# The deb is an ar archive holding data.tar.xz; bsdtar (tar.exe on Windows)
+# reads both, so a fresh checkout only needs build\bash.deb in place.
+$bashPath = Join-Path $PSScriptRoot "build\bash_root\bin\bash"
+if (-not (Test-Path $bashPath)) {
+    $debSrc = Join-Path $PSScriptRoot "build\bash.deb"
+    if (Test-Path $debSrc) {
+        $bashRoot = Join-Path $PSScriptRoot "build\bash_root"
+        Remove-Item -Recurse -Force $bashRoot -ErrorAction SilentlyContinue
+        New-Item -ItemType Directory $bashRoot | Out-Null
+        Push-Location $bashRoot
+        & tar.exe -xf $debSrc 2>$null
+        if (Test-Path "data.tar.xz") { & tar.exe -xf "data.tar.xz" 2>$null }
+        Pop-Location
+    }
+}
+$hasBash = Test-Path $bashPath
+$bashBlocks = 0
+$bashStartBlock = $libcStartBlock + $libcBlocks
+if ($hasBash) {
+    $bashBytes = [IO.File]::ReadAllBytes($bashPath)
+    $bashBlocks = [int][Math]::Ceiling($bashBytes.Length / 1024.0)
+    # inode 20 = /bin/bash
+    ExtentLeaf ($itable + 19 * 128) $bashStartBlock $bashBlocks $bashBytes.Length 0x81ED
+}
+
+$binStartBlock = if ($hasBash) { $bashStartBlock + $bashBlocks } elseif ($hasLibc) { $libcStartBlock + $libcBlocks } elseif ($hasLd) { $ldStartBlock + $ldBlocks } else { 26 }
 # /bin holds a hardlink per busybox applet, so it needs more than one 1KB block.
 $binBlocks = 2
 # inode 28 = /bin directory
@@ -578,14 +604,18 @@ if ($hasLibc) {
     Put ($libcStartBlock * $BS) $libcBytes
     echo "Added libc.so.6 ($($libcBytes.Length) bytes, $libcBlocks blocks) to disk image"
 }
+if ($hasBash) {
+    Put ($bashStartBlock * $BS) $bashBytes
+    echo "Added /bin/bash ($($bashBytes.Length) bytes, $bashBlocks blocks) to disk image"
+}
 
 # ---- /bin dir data @ block $binStartBlock ----
 # Every applet is a hardlink to the busybox image (inode 23); busybox picks the
-# applet from argv[0].  dpkg-deb stays a separate Debian binary (inode 20).
+# applet from argv[0].  bash is the real Debian binary (inode 20).
 $binEntries = New-Object System.Collections.ArrayList
 [void]$binEntries.Add(@{ Ino = 28; Name = '.'; Type = 2 })
 [void]$binEntries.Add(@{ Ino = 2;  Name = '..'; Type = 2 })
-[void]$binEntries.Add(@{ Ino = 20; Name = 'dpkg-deb'; Type = 1 })
+[void]$binEntries.Add(@{ Ino = 20; Name = 'bash'; Type = 1 })
 $applets = @(
     'busybox','sh','ash','echo','cat','ls','mkdir','rmdir','rm','cp','mv','ln','touch',
     'chmod','chown','date','sleep','true','false','env','id','uname','hostname','ps','kill',
