@@ -366,10 +366,10 @@ sig_send_to_task:
     xor eax, eax
     jmp .sst_done
 .sst_einval:
-    mov eax, LINUX_EINVAL
+    mov rax, LINUX_EINVAL
     jmp .sst_done
 .sst_esrch:
-    mov eax, LINUX_ESRCH
+    mov rax, LINUX_ESRCH
 .sst_done:
     pop r14
     pop r13
@@ -2031,7 +2031,7 @@ linux_syscall_dispatch:
     xor eax, eax
     ret
 .l_gtd_fault:
-    mov eax, LINUX_EFAULT
+    mov rax, LINUX_EFAULT
     ret
 
 ; int clock_gettime(clockid_t clk_id, struct timespec *tp)
@@ -2056,7 +2056,7 @@ linux_syscall_dispatch:
     xor eax, eax
     ret
 .l_cgt_fault:
-    mov eax, LINUX_EFAULT
+    mov rax, LINUX_EFAULT
     ret
 
 ; int nanosleep(const struct timespec *req, struct timespec *rem)
@@ -2099,13 +2099,13 @@ linux_syscall_dispatch:
     xor eax, eax
     ret
 .l_ns_intr:
-    mov eax, LINUX_EINTR
+    mov rax, LINUX_EINTR
     ret
 .l_ns_einval:
-    mov eax, LINUX_EINVAL
+    mov rax, LINUX_EINVAL
     ret
 .l_ns_fault:
-    mov eax, LINUX_EFAULT
+    mov rax, LINUX_EFAULT
     ret
 
 .l_exit_group:
@@ -2848,10 +2848,10 @@ linux_syscall_dispatch:
     xor eax, eax
     ret
 .sa_einval:
-    mov eax, LINUX_EINVAL
+    mov rax, LINUX_EINVAL
     ret
 .sa_efault:
-    mov eax, LINUX_EFAULT
+    mov rax, LINUX_EFAULT
     ret
 
 ; ------------------------------------------------------------------------------
@@ -2894,7 +2894,7 @@ linux_syscall_dispatch:
     je .spm_unblock
     cmp rdi, 3
     je .spm_set
-    mov eax, LINUX_EINVAL
+    mov rax, LINUX_EINVAL
     ret
 .spm_block:
     or [rbx + TCB_SIG_BLOCKED], rax
@@ -2913,7 +2913,7 @@ linux_syscall_dispatch:
     xor eax, eax
     ret
 .spm_fault:
-    mov eax, LINUX_EFAULT
+    mov rax, LINUX_EFAULT
     ret
 
 ; ------------------------------------------------------------------------------
@@ -2996,7 +2996,7 @@ linux_syscall_dispatch:
     cli
     jmp .l_pause
 .pause_eintr:
-    mov eax, LINUX_EINTR
+    mov rax, LINUX_EINTR
     ret
 
 ; ------------------------------------------------------------------------------
@@ -3459,6 +3459,7 @@ linux_syscall_dispatch:
     inc ecx
     jmp .l_fcntl_dup_find
 .l_fcntl_dup_found:
+    mov r12d, ecx                    ; remember new fd (rep movsq clears rcx)
     imul edx, ecx, FD_ENTRY_SIZE
     lea rdi, [rax + rdx]
     mov rsi, rbx
@@ -3476,7 +3477,7 @@ linux_syscall_dispatch:
 .l_fcntl_dup_wr:
     inc word [rdx + 14]
 .l_fcntl_dup_done:
-    mov eax, ecx                     ; return new fd
+    mov eax, r12d                    ; return new fd
     pop r13
     pop r12
     pop rbx
@@ -3678,7 +3679,7 @@ linux_syscall_dispatch:
     xor eax, eax
     ret
 .kill_esrch:
-    mov eax, LINUX_ESRCH
+    mov rax, LINUX_ESRCH
     ret
 
 ; ------------------------------------------------------------------------------
@@ -3713,7 +3714,7 @@ linux_syscall_dispatch:
     inc eax
     ret
 .gps_esrch:
-    mov eax, LINUX_ESRCH
+    mov rax, LINUX_ESRCH
     ret
 
 ; ------------------------------------------------------------------------------
@@ -3823,7 +3824,9 @@ linux_syscall_dispatch:
     ; Success: point the syscall return frame at the new program
     mov rax, [r15 + sys_spawn_exec_entry - kmain]
     mov [rbx + 112], rax              ; user RIP
-    mov qword [rbx + 120], 0x1FFFFE00 ; user RSP (argc/argv/envp/auxv vector)
+    ; 0x1FFFF600 is where elf.inc lays out argc/argv/envp/auxv (see
+    ; "setup vector at phys_stack + 0x1FF600"); RSP must start exactly there.
+    mov qword [rbx + 120], 0x1FFFF600 ; user RSP (argc/argv/envp/auxv vector)
     xor eax, eax
     ret
 

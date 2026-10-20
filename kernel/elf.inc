@@ -604,10 +604,11 @@ elf_load_exec:
     pop rbx
 
     ; 9. Setup AMD64 System V ABI User Stack
-    ; Vector (argc/argv/envp/auxv) lives at phys_stack + 0x1FFE00 (virtual
-    ; 0x1FFFFE00); 512 bytes are reserved so auxv can never run past the end
-    ; of the stack slot (old base 0x1FFF00 overflowed by up to 0xA0 bytes).
-    ; Physical address = phys_stack + 0x1FFE00
+    ; Vector (argc/argv/envp/auxv) lives at phys_stack + 0x1FF600 (virtual
+    ; 0x1FFFF600, the value execve loads into RSP); 512 bytes above it are
+    ; reserved so auxv can never run past the end of the stack slot (old base
+    ; 0x1FFF00 overflowed by up to 0xA0 bytes).
+    ; Physical address = phys_stack + 0x1FF600
     mov r9, [r15 + sys_spawn_argv_ptr - kmain]
     test r9, r9
     jz .fallback_args

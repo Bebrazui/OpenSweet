@@ -658,10 +658,13 @@ sys_validate_user_ptr:
     add rax, rsi
     jc .invalid                       ; 64-bit integer overflow
 
-    ; Range A: slot code/data/heap [0x400000, 0x04000000)
+    ; Range A: slot code/data/heap [0x400000, 0x03000000)
+    ; Heap ends at HEAP_VIRT_BASE + HEAP_SIZE = 16MB + 32MB = 48MB. Anything
+    ; above that (up to the 1GB identity map) is SUPERVISOR memory, so the
+    ; old 64MB bound let user syscalls read/write kernel page tables.
     cmp rdi, 0x00400000
     jb .check_stack
-    cmp rax, 0x04000000               ; must END <= 64MB
+    cmp rax, 0x03000000               ; must END <= 48MB
     jbe .valid
 
 .check_stack:
@@ -1391,7 +1394,7 @@ sys_handler_waitpid:
     jmp .wait_ret
 
 .wait_eintr:
-    mov eax, -4                         ; -EINTR (signal interrupted the wait)
+    mov rax, -4                         ; -EINTR (signal interrupted the wait)
     jmp .wait_ret
 
 .wait_echild:

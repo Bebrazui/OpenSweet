@@ -449,12 +449,10 @@ vfs_stat_path:
     xor eax, eax
     jmp .statp_done
 .statp_enoent:
-    mov eax, LINUX_ENOENT
-    neg rax
+    mov rax, LINUX_ENOENT             ; already negative; do NOT negate
     jmp .statp_done
 .statp_efault:
-    mov eax, LINUX_EFAULT
-    neg rax
+    mov rax, LINUX_EFAULT
 .statp_done:
     pop r13
     pop r12
@@ -498,12 +496,10 @@ vfs_stat_fd:
     xor eax, eax
     jmp .statf_done
 .statf_badfd:
-    mov eax, LINUX_EBADF
-    neg rax
+    mov rax, LINUX_EBADF              ; already negative; do NOT negate
     jmp .statf_done
 .statf_efault:
-    mov eax, LINUX_EFAULT
-    neg rax
+    mov rax, LINUX_EFAULT
 .statf_done:
     pop r13
     pop r12
@@ -542,6 +538,7 @@ vfs_dup:
     jmp .dup_find
 .dup_found:
     ; copy old fd_entry to new slot
+    mov r12d, ecx                     ; r12d = new fd (rep movsq clears rcx)
     imul eax, ecx, FD_ENTRY_SIZE
     lea rdi, [rdx + rax]
     mov rsi, rbx
@@ -560,7 +557,7 @@ vfs_dup:
 .dup_wr:
     inc word [rdx + 14]               ; writers++
 .dup_done:
-    mov eax, ecx                      ; return new fd
+    mov eax, r12d                     ; return new fd
     pop r12
     pop rdi
     pop rsi
@@ -577,8 +574,7 @@ vfs_dup:
     pop rcx
     pop rbx
     popfq
-    mov eax, LINUX_EBADF
-    neg rax
+    mov rax, LINUX_EBADF              ; already negative; do NOT negate
     ret
 
 ; ==============================================================================
@@ -901,6 +897,14 @@ vfs_read_fd:
     lea rsi, [r15 + str_io_blk - kmain]
     call puts
     mov eax, [r15 + ext4_dbg_blk - kmain]
+    call putdec64
+    lea rsi, [r15 + str_io_ino - kmain]
+    call puts
+    movzx eax, word [rbx + 2]           ; inode number of the failing fd
+    call putdec64
+    lea rsi, [r15 + str_io_rino - kmain]
+    call puts
+    mov eax, [r15 + ext4_dbg_ino - kmain]
     call putdec64
     mov al, 10
     call putc
