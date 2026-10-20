@@ -83,6 +83,10 @@ ext4_mount:                       ; CF=0 ok
     ja .fail
     mov dword [r15 + ext4_groups_count - kmain], eax
 
+    ; Pick the append point once, so new blocks land after the data the image
+    ; already contains instead of in the first small hole.
+    call ext4_scan_alloc_watermark
+
     mov byte [r15 + ext4_ok - kmain], 1
     clc
 .pop:
@@ -106,21 +110,25 @@ ext4_blk_read:
     jz .ebr_rng_ok
     cmp rax, rcx
     jb .ebr_rng_ok
-    mov rcx, [rsp]                  ; caller return address
-    push rcx
-    push rax
+    ; Keep both values in callee-saved registers: puts/putdec64 are free to
+    ; clobber rax/rcx, which used to garble this very diagnostic.
+    push rbx
+    push rbp
+    mov rbx, rax                    ; block number as passed
+    mov rbp, [rsp + 16]             ; caller return address
     lea rsi, [r15 + str_blk_wild - kmain]
     call puts
-    mov rax, [rsp + 8]              ; return address
+    mov rax, rbp
     call puthex64
     lea rsi, [r15 + str_blk_b1 - kmain]
     call puts
-    mov rax, [rsp]                  ; block number as passed
+    mov rax, rbx
     call putdec64
     mov al, 10
     call putc
-    pop rax
-    pop rcx
+    mov rax, rbx                    ; restore the block for the read below
+    pop rbp
+    pop rbx
     ; Fall through on purpose: report the bad mapping, then let the read (and its
     ; retry) proceed. Rejecting it outright makes callers that do not expect a
     ; failed inode load dereference NULL, which is a worse failure mode until the
@@ -141,6 +149,7 @@ ext4_blk_read:
     inc ecx                       ; shift count = lbs + 1
     shl rax, cl                   ; LBA = block << (lbs+1)
     mov r8, rax                   ; r8 = LBA
+    mov [r15 + ext4_dbg_lba - kmain], rax   ; retry/report source of truth
     mov edx, 1
     shl edx, cl                   ; sectors per block = 1 << (lbs+1)
     mov r9d, edx                  ; r9 = sector count
@@ -153,7 +162,7 @@ ext4_blk_read:
     ; (bad LBA / past end of medium) stays visible instead of being masked.
     lea rsi, [r15 + str_ata_retry - kmain]
     call puts
-    mov rax, [rsp + 24]           ; saved r8 = LBA
+    mov rax, [r15 + ext4_dbg_lba - kmain]
     call putdec64
     lea rsi, [r15 + str_ata_st - kmain]
     call puts
@@ -164,7 +173,7 @@ ext4_blk_read:
     call putc
 
     mov rdi, [rsp + 48]           ; saved destination buffer
-    mov rax, [rsp + 24]           ; LBA
+    mov rax, [r15 + ext4_dbg_lba - kmain]   ; LBA (r8 is clobbered by the driver)
     mov ecx, [rsp + 16]           ; sector count
     call disk_read_blocks
     jnc .ebr_out
@@ -587,8 +596,202 @@ ext4_free_blocks:
 ; ================= allocate a single free block =================
 ; Out: RAX = physical block number, or -1 on error.
 ext4_alloc_block:
-    mov edi, 1
-    jmp ext4_alloc_blocks
+    xor eax, eax                              ; no hint: use the append point
+    jmp ext4_alloc_block_hint
+
+; ================= allocate one block, starting at a hint =================
+; EAX = physical block to try first (0 = ext4_alloc_next, then group 0 bit 0)
+; Out: RAX = physical block number, or -1 on error. CF=1 on error.
+;
+; Starting the bitmap scan at the hint keeps a sequentially written file in one
+; contiguous extent instead of dropping it into the first small hole, which is
+; what used to exhaust the four inline extent slots of a large file.
+ext4_alloc_block_hint:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+
+    xor r12d, r12d                  ; group to scan
+    xor r11d, r11d                  ; bit to start at
+    test eax, eax
+    jnz .abh_have_hint
+    mov eax, dword [r15 + ext4_alloc_next - kmain]
+    test eax, eax
+    jz .abh_group_loop
+.abh_have_hint:
+    ; Convert the hint into (group, bit)
+    sub eax, dword [r15 + ext4_sb - kmain + SB_FDB]
+    js .abh_group_loop              ; hint below the first data block
+    xor edx, edx
+    div dword [r15 + ext4_bpg - kmain]
+    cmp eax, dword [r15 + ext4_groups_count - kmain]
+    jae .abh_group_loop             ; hint past the last group: rescan from 0
+    mov r12d, eax
+    mov r11d, edx
+
+.abh_group_loop:
+    cmp r12d, dword [r15 + ext4_groups_count - kmain]
+    jae .abh_err
+
+    mov eax, dword [r15 + ext4_gdtb - kmain]
+    lea rsi, [r15 + ext4_nbuf - kmain]
+    call ext4_blk_read
+    jc .abh_err
+
+    mov ecx, r12d
+    shl ecx, 5
+    cmp word [r15 + ext4_nbuf - kmain + rcx + 0x0C], 0
+    je .abh_next_group              ; nothing free in this group
+
+    mov eax, dword [r15 + ext4_nbuf - kmain + rcx + 0x00]
+    mov dword [r15 + e4w_bmp_blk - kmain], eax
+    lea rsi, [r15 + ext4_bbuf - kmain]
+    call ext4_blk_read
+    jc .abh_err
+
+.abh_scan:
+    cmp r11d, dword [r15 + ext4_bpg - kmain]
+    jae .abh_next_group
+    mov eax, r11d
+    bt dword [r15 + ext4_bbuf - kmain], eax
+    jc .abh_scan_next
+    jmp .abh_found
+.abh_scan_next:
+    inc r11d
+    jmp .abh_scan
+
+.abh_found:
+    bts dword [r15 + ext4_bbuf - kmain], eax
+    mov eax, dword [r15 + e4w_bmp_blk - kmain]
+    lea rsi, [r15 + ext4_bbuf - kmain]
+    call ext4_blk_write
+    jc .abh_err
+
+    ; Re-read the GDT: the bitmap write above may have used ext4_nbuf.
+    mov eax, dword [r15 + ext4_gdtb - kmain]
+    lea rsi, [r15 + ext4_nbuf - kmain]
+    call ext4_blk_read
+    jc .abh_err
+    mov ecx, r12d
+    shl ecx, 5
+    dec word [r15 + ext4_nbuf - kmain + rcx + 0x0C]
+    call ext4_gdt_save
+
+    dec dword [r15 + ext4_sb - kmain + 0x0C]
+    call ext4_sb_save
+
+    mov eax, r12d
+    mul dword [r15 + ext4_bpg - kmain]
+    add eax, r11d
+    add eax, dword [r15 + ext4_sb - kmain + SB_FDB]
+
+    ; Remember where the next block should go.
+    lea edx, [eax + 1]
+    mov dword [r15 + ext4_alloc_next - kmain], edx
+    mov dword [r15 + ext4_alloc_next - kmain + 4], 0
+
+    clc
+.abh_pop:
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+.abh_next_group:
+    inc r12d
+    xor r11d, r11d
+    jmp .abh_group_loop
+
+.abh_err:
+    mov rax, -1
+    stc
+    jmp .abh_pop
+
+; ================= find the append point for new blocks =================
+; Stores, in ext4_alloc_next, the first block past every block the image
+; already uses.  Padding bits (blocks beyond s_blocks_count) are ignored so a
+; padded bitmap cannot push the watermark out of the volume.
+ext4_scan_alloc_watermark:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+
+    xor r8d, r8d                            ; r8d = highest used block + 1
+    xor r12d, r12d
+.saw_group:
+    cmp r12d, dword [r15 + ext4_groups_count - kmain]
+    jae .saw_done
+
+    mov eax, dword [r15 + ext4_gdtb - kmain]
+    lea rsi, [r15 + ext4_nbuf - kmain]
+    call ext4_blk_read
+    jc .saw_done
+    mov ecx, r12d
+    shl ecx, 5
+    mov eax, dword [r15 + ext4_nbuf - kmain + rcx + 0x00]
+    lea rsi, [r15 + ext4_bbuf - kmain]
+    call ext4_blk_read
+    jc .saw_done
+
+    mov r9d, dword [r15 + ext4_bpg - kmain]
+.saw_bit:
+    test r9d, r9d
+    jz .saw_next_group
+    dec r9d
+    mov eax, r9d
+    bt dword [r15 + ext4_bbuf - kmain], eax
+    jnc .saw_bit
+    mov eax, r12d
+    mul dword [r15 + ext4_bpg - kmain]
+    add eax, r9d
+    add eax, dword [r15 + ext4_sb - kmain + SB_FDB]
+    cmp eax, dword [r15 + ext4_sb - kmain + 0x04]
+    jae .saw_bit                            ; padding bit, keep looking down
+    inc eax
+    cmp eax, r8d
+    jbe .saw_next_group
+    mov r8d, eax
+.saw_next_group:
+    inc r12d
+    jmp .saw_group
+.saw_done:
+    mov dword [r15 + ext4_alloc_next - kmain], r8d
+    mov dword [r15 + ext4_alloc_next - kmain + 4], 0
+
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
 
 ; ================= allocate a free inode =================
 ; Out: RAX = inode number (1-based), or -1 on error.
@@ -1984,6 +2187,7 @@ ext4_write_file_chunk:
     mov r12d, eax                       ; r12d = inode
     mov r13, rsi                        ; r13 = source data pointer
     mov r14, rcx                        ; r14 = bytes remaining
+    mov [r15 + ext4_dbg_ino - kmain], eax
 
     ; Load inode
     mov eax, r12d
@@ -2025,8 +2229,22 @@ ext4_write_file_chunk:
     cmp rax, -1
     jne .wfc_got_phys                   ; already mapped!
 
-    ; Not mapped: allocate physical block
-    call ext4_alloc_block
+    ; Not mapped: allocate a physical block, preferring the one right after the
+    ; last extent so a sequential write stays contiguous.
+    xor eax, eax
+    cmp word [r15 + ext4_inode - kmain + IN_OFF_BLOCK], EH_MAGIC
+    jne .wfc_alloc
+    movzx ecx, word [r15 + ext4_inode - kmain + IN_OFF_BLOCK + 2]  ; eh_entries
+    test ecx, ecx
+    jz .wfc_alloc
+    dec ecx
+    imul ecx, 12
+    add ecx, IN_OFF_BLOCK + 12
+    movzx edx, word [r15 + ext4_inode - kmain + rcx + 4]   ; last ee_len
+    mov eax, dword [r15 + ext4_inode - kmain + rcx + 8]    ; last ee_start_lo
+    add eax, edx                                           ; hint = start + len
+.wfc_alloc:
+    call ext4_alloc_block_hint
     cmp rax, -1
     je .wfc_err
     mov r11d, eax                       ; r11d = new physical block P
@@ -2062,8 +2280,22 @@ ext4_write_file_chunk:
 .wfc_new_ext:
     movzx ecx, word [r15 + ext4_inode - kmain + IN_OFF_BLOCK + 2] ; eh_entries
     cmp ecx, 4
-    jae .wfc_free_and_fail              ; 4 extents limit reached
-
+    jb @f
+    ; The inline extent root holds at most 4 extents and we never build an
+    ; extent index tree, so a fragmented file hits a hard wall here.
+    lea rsi, [r15 + str_ext_full - kmain]
+    call puts
+    mov eax, [r15 + ext4_dbg_ino - kmain]
+    call putdec64
+    lea rsi, [r15 + str_io_off - kmain]
+    call puts
+    mov rax, [rsp + 8]
+    call putdec64
+    mov al, 10
+    call putc
+    jmp .wfc_free_and_fail
+@@:
+    movzx ecx, word [r15 + ext4_inode - kmain + IN_OFF_BLOCK + 2] ; eh_entries
     imul ecx, 12
     add ecx, IN_OFF_BLOCK + 12
     mov dword [r15 + ext4_inode - kmain + rcx + 0], r8d  ; ee_block = L
@@ -3053,6 +3285,7 @@ ext4_read_file_chunk_inode:
 
     mov r12, rcx                    ; r12 = max bytes
     mov r14, rdx                    ; r14 = file offset
+    mov [r15 + ext4_dbg_ino - kmain], eax   ; keep for the EIO diagnostic
 
     ; Load inode directly
     call ext4_inode_load
@@ -3122,16 +3355,23 @@ ext4_read_file_chunk_inode:
     push rbx
     push rdx
     push rdi
+    push rax                        ; keep the block for the EIO diagnostic
     lea rsi, [r15 + ext4_bbuf - kmain]
     call ext4_blk_read
+    jnc .rfc_blk_read_ok
+    mov eax, [rsp]
+    mov [r15 + ext4_dbg_blk - kmain], eax   ; block that actually failed
+    mov [r15 + ext4_dbg_off - kmain], r14d
+    add rsp, 8
     pop rdi
     pop rdx
     pop rbx
-    jnc .rfc_blk_ok
-    mov [r15 + ext4_dbg_off - kmain], r14d
-    mov [r15 + ext4_dbg_blk - kmain], eax
     jmp .rfc_err
-.rfc_blk_ok:
+.rfc_blk_read_ok:
+    add rsp, 8
+    pop rdi
+    pop rdx
+    pop rbx
 
     ; Copy rbx bytes from ext4_bbuf + edx to [rdi + r13]
     push rsi
@@ -3522,6 +3762,9 @@ ext4_lbs    dd 0
 ; read trace prints these when it converts a failure into -EIO.
 ext4_dbg_off dd 0
 ext4_dbg_blk dd 0
+ext4_dbg_lba dq 0
+ext4_dbg_ino dd 0
+ext4_alloc_next dq 0
 ext4_bpg    dd 0
 ext4_ipg    dd 0
 ext4_isize  dd 0
@@ -3572,6 +3815,9 @@ str_ata_retry   db "!ata retry lba=", 0
 str_ata_st      db " st=", 0
 str_io_off      db "[io] ext4 off=", 0
 str_io_blk      db " blk=", 0
+str_io_ino      db " ino=", 0
+str_io_rino     db " rino=", 0
+str_ext_full    db "!ext4 extents full ino=", 0
 str_blk_wild    db "!blk wild ra=", 0
 str_blk_b1      db " blk=", 0
 
