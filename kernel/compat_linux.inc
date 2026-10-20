@@ -1789,13 +1789,13 @@ linux_syscall_dispatch:
     ; TCGETS = 0x5401: struct termios (60 bytes)
     cmp rsi, 0x5401
     je .l_ioctl_tcgets
-    ; TCSETS/TCSETSW/TCSETSF (0x5402..0x5404): accept as no-op
+    ; TCSETS/TCSETSW/TCSETSF (0x5402..0x5404): store the new termios
     cmp rsi, 0x5402
-    je .l_ioctl_ok
+    je .l_ioctl_tcsets
     cmp rsi, 0x5403
-    je .l_ioctl_ok
+    je .l_ioctl_tcsets
     cmp rsi, 0x5404
-    je .l_ioctl_ok
+    je .l_ioctl_tcsets
     ; TIOCGPGRP / TIOCSPGRP
     cmp rsi, 0x540F
     je .l_ioctl_getpgrp
@@ -1863,6 +1863,77 @@ linux_syscall_dispatch:
     mov byte  [rdx + 23], 1            ; VMIN
     mov dword [rdx + 52], 15           ; c_ispeed (B38400)
     mov dword [rdx + 56], 15           ; c_ospeed (B38400)
+
+    ; If a tty backs this fd, report the flags that were actually set.
+    push rdi
+    push rsi
+    push rdx
+    mov edi, edi
+    call vfs_get_fd_ptr
+    test rax, rax
+    jz .l_tcgets_done
+    mov rdi, rax
+    call tty_from_fd
+    cmp eax, -1
+    je .l_tcgets_done
+    imul eax, eax, TTY_SIZE
+    lea r9, [r15 + tty_table - kmain + rax]
+    mov rdx, [rsp]
+    mov eax, [r9 + TTY_IFLAG]
+    mov [rdx + 0], eax
+    mov eax, [r9 + TTY_OFLAG]
+    mov [rdx + 4], eax
+    mov eax, [r9 + TTY_CFLAG]
+    mov [rdx + 8], eax
+    mov eax, [r9 + TTY_LFLAG]
+    mov [rdx + 12], eax
+.l_tcgets_done:
+    pop rdx
+    pop rsi
+    pop rdi
+    xor eax, eax
+    ret
+
+.l_ioctl_tcsets:
+    test rdx, rdx
+    jz .l_ioctl_efault
+    push rdi
+    push rsi
+    push rdx
+    mov rdi, rdx
+    mov rsi, 60
+    call sys_validate_user_ptr
+    pop rdx
+    pop rsi
+    pop rdi
+    jc .l_ioctl_efault
+
+    push rdi
+    push rsi
+    push rdx
+    mov edi, edi
+    call vfs_get_fd_ptr
+    test rax, rax
+    jz .l_tcsets_done
+    mov rdi, rax
+    call tty_from_fd
+    cmp eax, -1
+    je .l_tcsets_done
+    imul eax, eax, TTY_SIZE
+    lea r9, [r15 + tty_table - kmain + rax]
+    mov rdx, [rsp]
+    mov eax, [rdx + 0]
+    mov [r9 + TTY_IFLAG], eax
+    mov eax, [rdx + 4]
+    mov [r9 + TTY_OFLAG], eax
+    mov eax, [rdx + 8]
+    mov [r9 + TTY_CFLAG], eax
+    mov eax, [rdx + 12]
+    mov [r9 + TTY_LFLAG], eax
+.l_tcsets_done:
+    pop rdx
+    pop rsi
+    pop rdi
     xor eax, eax
     ret
 .l_ioctl_getpgrp:
