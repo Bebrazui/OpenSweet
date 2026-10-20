@@ -241,7 +241,7 @@ sys_linux_shmat:
     push rax
     push rdi
     push r11
-    mov r11b, 7                        ; Present | Writable | User
+    mov r11d, 7                        ; Present | Writable | User
     call vmm_map
     pop r11
     pop rdi

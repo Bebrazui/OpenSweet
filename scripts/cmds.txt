@@ -1,0 +1,5 @@
+/bin/bash -c "echo hi | cat"
+#wait 5
+/bin/sh -c "x=$(echo sub); echo got=$x"
+#wait 5
+#shot build\s1.ppm

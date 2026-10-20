@@ -2942,27 +2942,29 @@ common_ex:
     mov rax, [rsp + 3*8]      ; R12
     call puthex64
 
+    ; Current task (helps tell a parent fault from a child fault)
+    lea rsi, [r15 + str_dump_tid - kmain]
+    call puts
+    mov eax, [r15 + sched_curr_task - kmain]
+    call putdec64
+
     ; Stack contents at fault RSP
     lea rsi, [r15 + str_dump_stk - kmain]
     call puts
     mov rbx, [rsp + 20*8]     ; fault RSP
     test rbx, rbx
-    jz @f
-    mov rax, [rbx + 0]
+    jz .dump_done
+    mov r13d, 10
+    xor r14d, r14d
+.dump_loop:
+    mov rax, [rbx + r14*8]
     call puthex64
     mov al, ' '
     call putc
-    mov rax, [rbx + 8]
-    call puthex64
-    mov al, ' '
-    call putc
-    mov rax, [rbx + 16]
-    call puthex64
-    mov al, ' '
-    call putc
-    mov rax, [rbx + 24]
-    call puthex64
-@@:
+    inc r14d
+    cmp r14d, r13d
+    jb .dump_loop
+.dump_done:
     mov al, 10
     call putc
 
@@ -3239,6 +3241,7 @@ str_dump_rb1 db " R11=", 0
 str_dump_rc1 db " R12=", 0
 str_dump_rd1 db " R13=", 0
 str_dump_stk db 10, "  STK@RSP: ", 0
+str_dump_tid db 10, "  TID=", 0
 cmd_exc  db "exc", 0
 cmd_div  db "div", 0
 cmd_map  db "map", 0

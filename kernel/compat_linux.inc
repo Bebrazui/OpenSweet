@@ -179,6 +179,7 @@ SA_NODEFER     = 0x40000000           ; do not block the signal during its handl
 
 LINUX_SYS_GETTIMEOFDAY = 96
 LINUX_SYS_CLOCK_GETTIME = 228
+LINUX_SYS_TIME        = 201
 LINUX_SYS_RENAME      = 82
 LINUX_SYS_LINK        = 86
 LINUX_SYS_SYMLINK     = 88
@@ -921,6 +922,8 @@ linux_syscall_dispatch:
     je .l_gettimeofday
     cmp eax, LINUX_SYS_CLOCK_GETTIME
     je .l_clock_gettime
+    cmp eax, LINUX_SYS_TIME
+    je .l_time
     cmp eax, LINUX_SYS_NANOSLEEP
     je .l_nanosleep
     cmp eax, LINUX_SYS_SENDFILE
@@ -1741,6 +1744,14 @@ linux_syscall_dispatch:
     pop rbx
     ret
 
+; Size of the kernel's struct termios carried by TCGETS/TCSETS:
+; c_iflag..c_lflag (16) + c_line (1) + c_cc[19] = 36 bytes.  glibc's
+; tcgetattr() sizes its stack buffer for exactly this much, so writing the
+; full 60-byte *user* termios smashes the caller's canary and return address
+; (c_ospeed = 15 landed on the low half of the return address, which is why
+; interactive bash jumped to RIP 0xF).
+KTERMIOS_SIZE = 36
+
 .l_ioctl:
     ; RDI = fd, RSI = request, RDX = arg
     push rbx
@@ -1834,7 +1845,7 @@ linux_syscall_dispatch:
     push rdi
     push rsi
     mov rdi, rdx
-    mov rsi, 60
+    mov rsi, KTERMIOS_SIZE
     call sys_validate_user_ptr
     pop rsi
     pop rdi
@@ -1842,7 +1853,7 @@ linux_syscall_dispatch:
     push rdi
     push rcx
     mov rdi, rdx
-    mov ecx, 60 / 4
+    mov ecx, KTERMIOS_SIZE / 4
     xor eax, eax
     rep stosd
     pop rcx
@@ -1861,8 +1872,6 @@ linux_syscall_dispatch:
     mov byte  [rdx + 21], 4            ; VEOF   = ^D
     mov byte  [rdx + 22], 0            ; VTIME
     mov byte  [rdx + 23], 1            ; VMIN
-    mov dword [rdx + 52], 15           ; c_ispeed (B38400)
-    mov dword [rdx + 56], 15           ; c_ospeed (B38400)
 
     ; If a tty backs this fd, report the flags that were actually set.
     push rdi
@@ -1901,7 +1910,7 @@ linux_syscall_dispatch:
     push rsi
     push rdx
     mov rdi, rdx
-    mov rsi, 60
+    mov rsi, KTERMIOS_SIZE
     call sys_validate_user_ptr
     pop rdx
     pop rsi
@@ -2535,6 +2544,27 @@ linux_syscall_dispatch:
     ret
 .l_cgt_fault:
     mov rax, LINUX_EFAULT
+    ret
+
+; time_t time(time_t *tloc)
+;   RDI = tloc (may be NULL).  Same clock as gettimeofday/clock_gettime so the
+;   three stay consistent with each other.
+.l_time:
+    mov eax, [r15 + timer_ticks - kmain]
+    xor edx, edx
+    mov ecx, 1000
+    div ecx                     ; eax = seconds
+    test rdi, rdi
+    jz .l_time_ok
+    push rdi
+    push rax
+    mov rsi, 8
+    call sys_validate_user_ptr
+    pop rax
+    pop rdi
+    jc .l_gtd_fault
+    mov [rdi], rax
+.l_time_ok:
     ret
 
 ; int nanosleep(const struct timespec *req, struct timespec *rem)
@@ -3197,7 +3227,7 @@ linux_syscall_dispatch:
 
     mov rdi, r12                        ; virt
     mov rax, rbx                        ; phys
-    mov r11b, 7                         ; Present | Writable | User
+    mov r11d, 7                         ; Present | Writable | User
     call vmm_map
 
     pop rax
@@ -4861,7 +4891,7 @@ linux_syscall_dispatch:
     ; Map virtual page r12 to physical page rax
     ; Flags: Present (1) | Writable (2) | User (4) = 7
     mov rdi, r12
-    mov r11b, 7
+    mov r11d, 7
     call vmm_map
 
     add r12, 4096
