@@ -1834,11 +1834,28 @@ linux_syscall_dispatch:
     mov qword [rbx + 32], 9000         ; f_bavail
     mov qword [rbx + 40], 128          ; f_files
     mov qword [rbx + 48], 64           ; f_ffree
+    ; Report the real superblock counters so df matches the filesystem.
+    push rbx
+    mov eax, 1                         ; superblock lives in block 1
+    lea rsi, [r15 + ext4_nbuf - kmain]
+    call ext4_blk_read
+    pop rbx
+    jc .l_statfs_defaults
+    mov eax, dword [r15 + ext4_nbuf - kmain + 0x04]
+    mov [rbx + 16], rax                ; f_blocks = s_blocks_count_lo
+    mov eax, dword [r15 + ext4_nbuf - kmain + 0x0C]
+    mov [rbx + 24], rax                ; f_bfree = s_free_blocks_count_lo
+    mov [rbx + 32], rax                ; f_bavail
+    mov eax, dword [r15 + ext4_nbuf - kmain + 0x00]
+    mov [rbx + 40], rax                ; f_files = s_inodes_count
+    mov eax, dword [r15 + ext4_nbuf - kmain + 0x10]
+    mov [rbx + 48], rax                ; f_ffree = s_free_inodes_count
+.l_statfs_defaults:
     mov qword [rbx + 56], 0            ; f_fsid[0]
-    mov qword [rbx + 64], 0            ; f_fsid[1]
-    mov qword [rbx + 72], 255          ; f_namelen
-    mov qword [rbx + 80], 1024         ; f_frsize
-    mov qword [rbx + 88], 0            ; f_flags
+    mov qword [rbx + 64], 255          ; f_namelen
+    mov qword [rbx + 72], 1024         ; f_frsize
+    mov qword [rbx + 80], 0            ; f_flags
+    mov qword [rbx + 88], 0
     mov qword [rbx + 96], 0
     mov qword [rbx + 104], 0
     mov qword [rbx + 112], 0
@@ -2430,8 +2447,10 @@ KTERMIOS_SIZE = 36
     ; totalram = 256MB, freeram = ~128MB
     mov qword [rdi + 32], 256 * 1024 * 1024  ; totalram
     mov qword [rdi + 40], 128 * 1024 * 1024  ; freeram
-    mov word  [rdi + 80], 4096               ; mem_unit = 4KB
-    mov word  [rdi + 78], 1                  ; procs = 1
+    mov qword [rdi + 64], 0                  ; totalswap
+    mov qword [rdi + 72], 0                  ; freeswap
+    mov word  [rdi + 80], 1                  ; procs
+    mov qword [rdi + 104], 1                 ; mem_unit = 1: values are in bytes
     xor eax, eax
     ret
 .l_sysinfo_efault:
@@ -4542,6 +4561,8 @@ KTERMIOS_SIZE = 36
     test rax, rax
     jz .l_gd_badfd
     mov rbx, rax
+    cmp byte [rbx + 0], FD_TYPE_PROCDIR
+    je .l_gd_proc
     cmp byte [rbx + 0], FD_TYPE_FILE
     jne .l_gd_badfd
     movzx eax, word [rbx + 2]
@@ -4565,6 +4586,14 @@ KTERMIOS_SIZE = 36
     jmp .l_gd_done
 .l_gd_einval:
     mov rax, LINUX_EINVAL
+    jmp .l_gd_done
+.l_gd_proc:
+    ; Synthetic /proc listing; the fd offset doubles as the entry index.
+    mov rdi, r13
+    mov rsi, [rsp]
+    mov edx, [rbx + 4]
+    call proc_dir_read
+    mov [rbx + 4], edx
     jmp .l_gd_done
 .l_gd_badfd:
     mov rax, LINUX_EBADF

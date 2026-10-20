@@ -242,7 +242,7 @@ vfs_open:
 .cp_p_done:
     ; Check for virtual devices: /dev/null, /dev/zero, /dev/urandom
     cmp dword [rsp], '/dev'
-    jne .not_dev
+    jne .check_proc
     cmp word [rsp + 4], '/n'
     je .is_dev_null
     cmp word [rsp + 4], '/z'
@@ -251,7 +251,35 @@ vfs_open:
     je .is_dev_null
     cmp dword [rsp + 4], '/tty'
     je .is_dev_tty
-    jmp .not_dev
+    jmp .check_proc
+
+; Synthetic /proc: proc_find returns 0 (not procfs), -1 (/proc dir) or an id.
+.check_proc:
+    lea rsi, [rsp]
+    call proc_find
+    test eax, eax
+    jz .not_dev
+    js .is_proc_dir
+
+.is_proc_file:
+    mov byte [r14 + 0], FD_TYPE_PROCFS
+    mov byte [r14 + 1], r13b
+    mov [r14 + 2], ax
+    mov dword [r14 + 4], 0
+    push rax
+    mov edi, eax
+    call proc_gen
+    pop rcx
+    mov [r14 + 8], eax
+    jmp .open_finish
+
+.is_proc_dir:
+    mov byte [r14 + 0], FD_TYPE_PROCDIR
+    mov byte [r14 + 1], r13b
+    mov word [r14 + 2], 0
+    mov dword [r14 + 4], 0
+    mov dword [r14 + 8], 0
+    jmp .open_finish
 
 .is_dev_tty:
     mov byte [r14 + 0], FD_TYPE_CONSOLE
@@ -279,6 +307,9 @@ vfs_open:
     mov word [r14 + 2], 0               ; inode 0
     mov dword [r14 + 4], 0              ; offset 0
     mov dword [r14 + 8], 0              ; size 0
+    jmp .open_finish
+
+.open_finish:
     mov rax, [rsp + 256]                ; allocated fd
     add rsp, 288
     pop r15
@@ -431,6 +462,26 @@ vfs_stat_path:
     call sys_validate_user_ptr
     jc .statp_efault
     mov rsi, r12
+    call proc_find
+    test eax, eax
+    jz .statp_ext4
+    js .statp_proc_dir
+    jmp .statp_proc
+.statp_proc_dir:
+    xor eax, eax
+.statp_proc:
+    sub rsp, 144
+    mov rdi, rsp
+    call proc_stat_fill
+    mov rsi, rsp
+    mov rdi, r13
+    mov ecx, 144 / 8
+    rep movsq
+    add rsp, 144
+    xor eax, eax
+    jmp .statp_done
+.statp_ext4:
+    mov rsi, r12
     call vfs_lookup_with_fallback
     test eax, eax
     jz .statp_enoent
@@ -479,7 +530,53 @@ vfs_stat_fd:
     jz .statf_badfd
     mov rbx, rax
     cmp byte [rbx + 0], FD_TYPE_FILE
-    jne .statf_badfd
+    je .statf_file
+    cmp byte [rbx + 0], FD_TYPE_PROCFS
+    je .statf_proc
+    cmp byte [rbx + 0], FD_TYPE_PROCDIR
+    je .statf_proc_dir
+    cmp byte [rbx + 0], FD_TYPE_CONSOLE
+    je .statf_char
+    jmp .statf_badfd
+
+.statf_proc:
+    movzx eax, word [rbx + 2]
+    jmp .statf_proc_fill
+.statf_proc_dir:
+    xor eax, eax
+.statf_proc_fill:
+    sub rsp, 144
+    mov rdi, rsp
+    call proc_stat_fill
+    mov rsi, rsp
+    mov rdi, r13
+    mov ecx, 144 / 8
+    rep movsq
+    add rsp, 144
+    xor eax, eax
+    jmp .statf_done
+
+.statf_char:
+    sub rsp, 144
+    mov rdi, rsp
+    mov ecx, 18
+    xor eax, eax
+    rep stosq
+    mov qword [rsp + 0], 0x0501         ; st_dev
+    mov qword [rsp + 8], 1              ; st_ino
+    mov qword [rsp + 16], 1             ; st_nlink
+    mov qword [rsp + 24], 0x21B6        ; S_IFCHR | 0666
+    mov qword [rsp + 40], 0x0500        ; st_rdev = makedev(5, 0) = /dev/tty
+    mov qword [rsp + 56], 1024
+    mov rsi, rsp
+    mov rdi, r13
+    mov ecx, 144 / 8
+    rep movsq
+    add rsp, 144
+    xor eax, eax
+    jmp .statf_done
+
+.statf_file:
     movzx r12d, word [rbx + 2]         ; preserve inode number
     mov eax, r12d
     call ext4_inode_load
@@ -650,7 +747,10 @@ vfs_lseek:
     test rax, rax
     jz .lseek_err
     cmp byte [rax + 0], FD_TYPE_FILE
+    je @f
+    cmp byte [rax + 0], FD_TYPE_PROCFS
     jne .lseek_err
+@@:
 
     mov rbx, rax                        ; rbx = fd_entry
 
@@ -765,6 +865,9 @@ vfs_read_fd:
     cmp byte [rbx + 0], FD_TYPE_DEV_NULL
     je .rfd_dev_null
 
+    cmp byte [rbx + 0], FD_TYPE_PROCFS
+    je .rfd_proc
+
     cmp byte [rbx + 0], FD_TYPE_FILE
     jne .rfd_err_badfd
 
@@ -852,6 +955,37 @@ vfs_read_fd:
 
 .rfd_pipe_eof:
     xor eax, eax
+    jmp .rfd_done
+
+; Synthetic /proc file: regenerate the content, then serve the requested slice.
+.rfd_proc:
+    mov eax, [rbx + 4]                  ; offset
+    cmp eax, [rbx + 8]                  ; size
+    jae .rfd_eof
+    push rsi
+    push rdx
+    movzx edi, word [rbx + 2]           ; proc file id
+    call proc_gen                       ; EAX = length, content in proc_buf
+    pop rdx
+    pop rsi
+    mov r8d, eax
+    mov eax, [rbx + 4]
+    cmp eax, r8d
+    jae .rfd_eof
+    mov ecx, r8d
+    sub ecx, eax                        ; bytes available
+    cmp rdx, rcx
+    jbe @f
+    mov rdx, rcx
+@@:
+    mov r9, rsi                         ; destination
+    lea rsi, [r15 + proc_buf - kmain]
+    add rsi, rax
+    mov rdi, r9
+    mov rcx, rdx
+    rep movsb
+    add [rbx + 4], edx
+    mov rax, rdx
     jmp .rfd_done
 
 .rfd_zero:
