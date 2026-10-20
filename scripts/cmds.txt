@@ -1,25 +1,7 @@
-/bin/sh -c "echo k1 | cat"
-#wait 3
-/bin/sh -c "echo k2 | cat"
-#wait 3
-/bin/sh -c "echo k3 | cat"
-#wait 3
-/bin/sh -c "echo k4 | cat"
-#wait 3
-/bin/sh -c "echo k5 | cat"
-#wait 3
-/bin/sh -c "echo k6 | cat"
-#wait 3
-/bin/sh -c "echo k7 | cat"
-#wait 3
-/bin/sh -c "echo k8 | cat"
-#wait 3
-/bin/sh -c "echo k9 | cat"
-#wait 3
-/bin/sh -c "echo k10 | cat"
-#wait 3
-/bin/sh -c "echo k11 | cat"
-#wait 3
-/bin/sh -c "echo k12 | cat"
-#wait 3
-#shot build\st.ppm
+/bin/bash -c "/busybox date"
+#wait 5
+/bin/bash -c "/busybox date +%s"
+#wait 4
+/bin/bash -c "/busybox touch /tmp/t1 && /busybox ls -l /tmp/t1"
+#wait 5
+#shot build\d3.ppm

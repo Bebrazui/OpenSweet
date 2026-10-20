@@ -442,6 +442,233 @@ sig_kill_current:
 ; ------------------------------------------------------------------------------
 
 ; ==============================================================================
+; rtc_reg: read CMOS register AL, return its value in AL.
+; ==============================================================================
+rtc_reg:
+    out 0x70, al
+    in al, 0x71
+    ret
+
+; ==============================================================================
+; rtc_get_epoch: EAX = seconds since 1970-01-01 from the CMOS RTC.
+;   The RTC carries the wall clock; the PIT tick counter only counts uptime, so
+;   CLOCK_REALTIME/gettimeofday/time cannot simply report it (every program
+;   would think it is 1970).  The RTC is read once here and cached as
+;   (epoch, ticks); later calls add the elapsed ticks to the base.
+; Preserves all registers except RAX.
+; ==============================================================================
+rtc_get_epoch:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+
+    cmp dword [r15 + rtc_epoch_base - kmain], 0
+    jne .rge_cached
+
+    sub rsp, 48
+    ; [rsp+0] sec, +4 min, +8 hour, +12 day, +16 month, +20 year,
+    ; +24 century, +28 status B, +32 hour PM flag, +36 full year
+
+    ; Wait for the update-in-progress flag to clear.
+    mov ebx, 100000
+.rge_wait:
+    mov al, 0x0A
+    call rtc_reg
+    test al, 0x80
+    jz .rge_read
+    dec ebx
+    jnz .rge_wait
+.rge_read:
+    mov al, 0x0B
+    call rtc_reg
+    mov [rsp + 28], al
+    xor al, al
+    call rtc_reg
+    mov [rsp + 0], al
+    mov al, 0x02
+    call rtc_reg
+    mov [rsp + 4], al
+    mov al, 0x04
+    call rtc_reg
+    mov [rsp + 8], al
+    mov al, 0x07
+    call rtc_reg
+    mov [rsp + 12], al
+    mov al, 0x08
+    call rtc_reg
+    mov [rsp + 16], al
+    mov al, 0x09
+    call rtc_reg
+    mov [rsp + 20], al
+    mov al, 0x32
+    call rtc_reg
+    mov [rsp + 24], al
+
+    ; Split off the 12-hour-mode PM bit so it does not disturb the BCD digits.
+    mov al, [rsp + 8]
+    and al, 0x80
+    mov [rsp + 32], al
+    and byte [rsp + 8], 0x7F
+
+    ; BCD -> binary unless status register B says the clock is binary already.
+    test byte [rsp + 28], 0x04
+    jnz .rge_binary
+    xor edx, edx
+    mov ecx, 7                          ; sec..year and the century byte
+.rge_bcd:
+    movzx eax, byte [rsp + rdx]
+    mov esi, eax
+    and esi, 0x0F
+    shr eax, 4
+    imul eax, eax, 10
+    add esi, eax
+    mov [rsp + rdx], sil
+    add edx, 4
+    dec ecx
+    jnz .rge_bcd
+.rge_binary:
+    ; Hour: convert 12-hour notation to 24-hour when the RTC uses it.
+    test byte [rsp + 28], 0x02
+    jz .rge_h24
+    movzx eax, byte [rsp + 8]
+    cmp eax, 12
+    jb @f
+    sub eax, 12
+@@:
+    cmp byte [rsp + 32], 0
+    je .rge_h24
+    add eax, 12
+    mov [rsp + 8], al
+.rge_h24:
+
+    ; Full year: century register when it looks valid, else assume 20xx.
+    movzx eax, byte [rsp + 20]
+    movzx ecx, byte [rsp + 24]
+    test ecx, ecx
+    jz .rge_no_cent
+    imul ecx, ecx, 100
+    add eax, ecx
+    jmp .rge_year
+.rge_no_cent:
+    add eax, 2000
+.rge_year:
+    cmp eax, 1970
+    jae @f
+    mov eax, 2000
+@@:
+    cmp eax, 2100
+    jbe @f
+    mov eax, 2000
+@@:
+    mov [rsp + 36], eax
+
+    ; days = 365*(year-1970) + leap days
+    mov esi, eax                       ; esi = year
+    xor ebx, ebx                       ; ebx = days
+    mov ecx, 1970
+.rge_yloop:
+    cmp ecx, esi
+    jae .rge_ydone
+    mov eax, ecx
+    xor edx, edx
+    mov edi, 4
+    div edi
+    test edx, edx
+    jnz .rge_365
+    mov eax, ecx
+    xor edx, edx
+    mov edi, 100
+    div edi
+    test edx, edx
+    jnz .rge_366
+    mov eax, ecx
+    xor edx, edx
+    mov edi, 400
+    div edi
+    test edx, edx
+    jnz .rge_365
+.rge_366:
+    add ebx, 366
+    jmp .rge_ynext
+.rge_365:
+    add ebx, 365
+.rge_ynext:
+    inc ecx
+    jmp .rge_yloop
+.rge_ydone:
+
+    ; days += days of the months before this one
+    lea r9, [r15 + rtc_mon_days - kmain]
+    movzx ecx, byte [rsp + 16]         ; month (1..12)
+    dec ecx                            ; months before it
+    xor edx, edx                       ; edx = month index
+.rge_mloop:
+    test ecx, ecx
+    jz .rge_mdone
+    movzx eax, byte [r9 + rdx]
+    cmp edx, 1                         ; February in a leap year?
+    jne @f
+    mov edi, esi
+    and edi, 3
+    jnz @f
+    mov eax, 29
+@@:
+    add ebx, eax
+    inc edx
+    dec ecx
+    jmp .rge_mloop
+.rge_mdone:
+    movzx eax, byte [rsp + 12]         ; day of month
+    add ebx, eax
+    dec ebx                            ; days since 1970-01-01
+
+    ; epoch = days*86400 + hour*3600 + min*60 + sec
+    imul eax, ebx, 86400
+    movzx ecx, byte [rsp + 8]
+    imul ecx, ecx, 3600
+    add eax, ecx
+    movzx ecx, byte [rsp + 4]
+    imul ecx, ecx, 60
+    add eax, ecx
+    movzx ecx, byte [rsp + 0]
+    add eax, ecx
+
+    test eax, eax
+    jz .rge_unset                      ; RTC gave nothing useful: retry later
+    mov [r15 + rtc_epoch_base - kmain], eax
+    mov ecx, [r15 + timer_ticks - kmain]
+    mov [r15 + rtc_epoch_ticks - kmain], ecx
+    add rsp, 48
+    jmp .rge_done
+
+.rge_unset:
+    add rsp, 48
+    xor eax, eax
+    jmp .rge_done
+
+.rge_cached:
+    mov eax, [r15 + timer_ticks - kmain]
+    sub eax, [r15 + rtc_epoch_ticks - kmain]
+    xor edx, edx
+    mov ecx, 1000
+    div ecx
+    add eax, [r15 + rtc_epoch_base - kmain]
+
+.rge_done:
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; ==============================================================================
 ; task_mmap_next_get: EAX = this process's mmap bump pointer.
 ;   Each process has its own address space, so they can all reuse the same
 ;   [0x20000000, 0x40000000) virtual zone; a single global pointer leaked the
@@ -2680,12 +2907,15 @@ KTERMIOS_SIZE = 36
     call sys_validate_user_ptr
     pop rdi
     jc .l_gtd_fault
+    push rdi
+    call rtc_get_epoch             ; wall clock, not uptime
+    pop rdi
+    mov [rdi + 0], rax
     mov eax, [r15 + timer_ticks - kmain]
     xor edx, edx
     mov ecx, 1000
-    div ecx                     ; eax = seconds, edx = ms remainder
-    mov [rdi + 0], rax
-    imul rdx, rdx, 1000         ; -> microseconds
+    div ecx                        ; edx = ms remainder
+    imul rdx, rdx, 1000            ; -> microseconds
     mov [rdi + 8], rdx
 .l_gtd_ok:
     xor eax, eax
@@ -2695,16 +2925,24 @@ KTERMIOS_SIZE = 36
     ret
 
 ; int clock_gettime(clockid_t clk_id, struct timespec *tp)
-;   RDI = clockid (ignored), RSI = tp = { int64 tv_sec; int64 tv_nsec; }
+;   RDI = clockid, RSI = tp = { int64 tv_sec; int64 tv_nsec; }
+;   CLOCK_REALTIME (0) and CLOCK_REALTIME_COARSE (5) report the wall clock;
+;   CLOCK_MONOTONIC and friends report uptime.
 .l_clock_gettime:
+    push rdi
     test rsi, rsi
-    jz .l_cgt_ok
+    jz .l_cgt_ok_nul
     push rsi
     mov rdi, rsi
     mov rsi, 16
     call sys_validate_user_ptr
     pop rsi
+    pop rdi
     jc .l_cgt_fault
+    cmp edi, 0
+    je .l_cgt_real
+    cmp edi, 5
+    je .l_cgt_real
     mov eax, [r15 + timer_ticks - kmain]
     xor edx, edx
     mov ecx, 1000
@@ -2712,6 +2950,23 @@ KTERMIOS_SIZE = 36
     mov [rsi + 0], rax
     imul rdx, rdx, 1000000      ; -> nanoseconds
     mov [rsi + 8], rdx
+    xor eax, eax
+    ret
+.l_cgt_real:
+    push rsi
+    call rtc_get_epoch
+    pop rsi
+    mov [rsi + 0], rax
+    mov eax, [r15 + timer_ticks - kmain]
+    xor edx, edx
+    mov ecx, 1000
+    div ecx
+    imul rdx, rdx, 1000000
+    mov [rsi + 8], rdx
+    xor eax, eax
+    ret
+.l_cgt_ok_nul:
+    pop rdi
 .l_cgt_ok:
     xor eax, eax
     ret
@@ -2723,10 +2978,9 @@ KTERMIOS_SIZE = 36
 ;   RDI = tloc (may be NULL).  Same clock as gettimeofday/clock_gettime so the
 ;   three stay consistent with each other.
 .l_time:
-    mov eax, [r15 + timer_ticks - kmain]
-    xor edx, edx
-    mov ecx, 1000
-    div ecx                     ; eax = seconds
+    push rdi
+    call rtc_get_epoch             ; wall clock seconds
+    pop rdi
     test rdi, rdi
     jz .l_time_ok
     push rdi
@@ -6217,6 +6471,11 @@ align 8
 ; Staged by the image loader: the mmap bump pointer the freshly loaded process
 ; starts with (0 = none, 0x20100000 = reserve the interpreter's first MB).
 sys_spawn_mmap_next dq 0
+
+; Wall clock: (epoch seconds at boot, tick count then) filled by rtc_get_epoch.
+rtc_epoch_base  dd 0
+rtc_epoch_ticks dd 0
+rtc_mon_days    db 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31
 
 MAX_INODE_LOCKS = 16
 INODE_LOCK_ENTRY_SIZE = 16
