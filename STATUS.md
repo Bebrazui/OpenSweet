@@ -30,25 +30,30 @@ These are confirmed by the serial log of a real headless boot (`scripts/smoke.ps
 ## In flight (do not assume stable)
 
 - **Debian `bash` under the Linux ABI.** `bash.deb` is packaged into the disk image
-  and unpacked at runtime with `dpkg-deb -x`. **Major blocker fixed:** the brk heap
-  used to be one identity-mapped window shared by every task, so the decompressor
-  child spawned by `dpkg-deb` and its parent overwrote each other's allocator
-  metadata; musl mallocng failed `get_meta()` and executed `a_crash()` (`hlt` ->
-  #GP, exception 0D). Each slot now owns a private 32 MB physical heap
-  (`HEAP_PHYS_BASE = 0x10000000`, above the PMM range) and `fork` deep-copies it.
-  With that, `dpkg-deb` no longer crashes and extracts a real `/usr/...` tree.
-  **Still open — group descriptor corruption.** When the extractor creates enough
-  files that inode allocation reaches a second block group, `ext4_inode_load`
-  reads `bg_inode_table_lo` from that group's descriptor as `0xFFFFFFFF` (the
-  descriptor on disk is not valid), computes a wild block number and hands it to
-  `ext4_blk_read`. The 28-bit ATA LBA then truncates it and reads an unrelated
-  sector. Diagnostics now print `!blk wild ra=<caller> blk=<block>` for this, and
-  the ATA layer retries once (`!ata retry lba=<lba> st=<status>`) so a single
-  failure no longer aborts an extraction. The real fix is to make the writer keep
-  `bg_inode_table` valid for every group it allocates inodes from (or to stop
-  allocating inode numbers outside the group whose table exists).
-  Reproduce with `scripts/test_bash.ps1` (use `-RebuildDisk` for a clean tree; a
-  failed extraction leaves partial state behind).
+  and unpacked at runtime with `dpkg-deb -x`. Two major blockers have been fixed:
+  - *Shared brk heap.* The heap used to be one identity-mapped window shared by
+    every task, so the decompressor child spawned by `dpkg-deb` and its parent
+    overwrote each other's allocator metadata; musl mallocng failed `get_meta()`
+    and executed `a_crash()` (`hlt` -> #GP, exception 0D). Each slot now owns a
+    private 32 MB physical heap (`HEAP_PHYS_BASE = 0x10000000`, above the PMM
+    range) and `fork` deep-copies it.
+  - *Truncated extraction.* Large sequential writes were placed into the first
+    free holes in group 0, so one file needed more than the four entries of the
+    ext4 inline extent root; `ext4_write_file` then failed `-EIO` or truncated
+    the file, and the loader silently loaded fewer PT_LOAD segments. The
+    allocator now starts each bitmap scan at an append-point hint
+    (`ext4_alloc_block_hint` / `ext4_scan_alloc_watermark`), keeping a
+    sequentially written file in a single extent. The earlier "group descriptor
+    corruption" diagnosis was wrong: the wild block numbers came from reading a
+    register clobbered by the ATA retry path.
+  - *Result:* `dpkg-deb -x /bash.deb /` now extracts `/bin/bash` at its full
+    `1 234 376` bytes, the loader reports `loaded segments: 4`, and
+    `bash --version` prints the real GNU banner (5.1.4) and exits 0.
+  - *Still open:* an interactive `bash` session (prompt / readline), command
+    execution (`bash -c`), pipelines, job control, and the `fstat`-on-`/dev/tty`
+    path that currently returns `EBADF`. Reproduce with
+    `scripts/test_bash.ps1` (use `-RebuildDisk` for a clean tree; a failed
+    extraction leaves partial state behind).
 - **X11 client (`ico`).** X11 wire protocol lives in `kernel/x11.inc`, SHM in
   `kernel/shm.inc`. Library set is packaged but the client is not confirmed running.
 - **Linux ABI serial tracing.** `compat_linux.inc` prints `openat`/`fstat`/`lseek`/
@@ -73,11 +78,22 @@ Ordered roughly by how much they block other work.
    `sys_validate_user_ptr`.
    The window-canvas range (`0x00800000..0x01000000`) is still identity-mapped and
    therefore shared between tasks; only the brk heap was made private.
-4. **Linux ABI depth.** `gettimeofday(96)`, `clock_gettime(228)` and
-   `nanosleep(35)` were added recently (`nanosleep` had a constant but no dispatch).
-   Still missing for glibc/`bash`/`apt`/`python`: `epoll` (232/233/291),
-   `inotify` (253–255), `pipe2(293)`, `dup3(292)`, `set_robust_list(274)`.
-   See `docs/linux-syscalls.md`.
+   Syscalls also run with interrupts disabled (`syscall_entry`): the ext4/ATA state
+   is a single shared set of globals, so preempting a syscall in the middle of a
+   filesystem operation corrupts it. Blocking syscalls still schedule through an
+   explicit `int 0x31`. A per-subsystem lock (with preemption left on) is the
+   correct long-term replacement.
+4. **Linux ABI depth.** `epoll` (213/232/233/291), `select`/`pselect6`/`ppoll`,
+   `gettimeofday`, `clock_gettime`, `nanosleep`, `futex`, `shm*`, `sendfile`,
+   `statx`, `renameat2` and the usual network calls are implemented. Recently added:
+   `pipe2(293)`, `dup3(292)`, `set_robust_list(273)`, `get_robust_list(274)`,
+   `prlimit64(302)`, `getrlimit(97)`, `setrlimit(160)`, `getrandom(318)`,
+   `getcpu(309)`, `fadvise64(221)`, `readahead(187)`, `membarrier(324)`,
+   `sched_getaffinity/setaffinity(203/204)`, `statfs/fstatfs(137/138)`.
+   Missing and known to matter: `inotify` (253–255), `rseq(334)` (returns ENOSYS
+   on purpose), real `futex` time64 robustness, `signalfd`, `timerfd`.  See
+   `docs/linux-syscalls.md`.
+   The per-task fd table was also raised from 16 to 64 entries.
 5. **`make-ext4.ps1` is a single point of failure.** ~30 KB of hand-rolled ext4
    construction with hard-coded inode numbers (32, 36–46). A silent accounting error
    produces a corrupt image with no diagnostic.
