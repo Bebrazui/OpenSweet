@@ -1,7 +1,0 @@
-/bin/bash -c "/busybox date"
-#wait 5
-/bin/bash -c "/busybox date +%s"
-#wait 4
-/bin/bash -c "/busybox touch /tmp/t1 && /busybox ls -l /tmp/t1"
-#wait 5
-#shot build\d3.ppm

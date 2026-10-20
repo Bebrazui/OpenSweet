@@ -16,3 +16,6 @@ scratch/
 *.jsonl
 *.ppm
 
+
+# Terminal driver scratch input
+scripts/cmds.txt

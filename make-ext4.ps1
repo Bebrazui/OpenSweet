@@ -328,8 +328,10 @@ if ($hasLibc) {
 }
 
 $binStartBlock = if ($hasLibc) { $libcStartBlock + $libcBlocks } elseif ($hasLd) { $ldStartBlock + $ldBlocks } else { 26 }
+# /bin holds a hardlink per busybox applet, so it needs more than one 1KB block.
+$binBlocks = 2
 # inode 28 = /bin directory
-ExtentLeaf ($itable + 27 * 128) $binStartBlock 1 1024 0x41ED
+ExtentLeaf ($itable + 27 * 128) $binStartBlock $binBlocks ($binBlocks * $BS) 0x41ED
 # inode 29 = usr symlink -> .
 FastSymlink ($itable + 28 * 128) '.'
 # inode 30 = lib symlink -> .
@@ -337,8 +339,8 @@ FastSymlink ($itable + 29 * 128) '.'
 # inode 31 = lib64 symlink -> .
 FastSymlink ($itable + 30 * 128) '.'
 
-$tmpStartBlock = $binStartBlock + 1
-$tmpX11StartBlock = $binStartBlock + 2
+$tmpStartBlock = $binStartBlock + $binBlocks
+$tmpX11StartBlock = $binStartBlock + $binBlocks + 1
 # inode 33 = /tmp directory
 ExtentLeaf ($itable + 32 * 128) $tmpStartBlock 1 1024 0x41FF
 # inode 34 = /tmp/.X11-unix directory
@@ -351,7 +353,7 @@ $debPkgPath = if (Test-Path $debBashCandidate) { $debBashCandidate } else { Join
 $debPkgName = if (Test-Path $debBashCandidate) { "bash.deb" } else { "test.deb" }
 $hasDebPkg = Test-Path $debPkgPath
 $debPkgBlocks = 0
-$debPkgStartBlock = $binStartBlock + 3
+$debPkgStartBlock = $binStartBlock + $binBlocks + 2
 if ($hasDebPkg) {
     $debPkgBytes = [IO.File]::ReadAllBytes($debPkgPath)
     $debPkgBlocks = [int][Math]::Ceiling($debPkgBytes.Length / 1024.0)
@@ -361,7 +363,7 @@ if ($hasDebPkg) {
 
 # ---- X11 Libraries and official Debian X11 app (ico) ----
 $x11Dir = Join-Path $PSScriptRoot "build\x11_libs"
-$curX11Block = if ($hasDebPkg) { $debPkgStartBlock + $debPkgBlocks } else { $binStartBlock + 3 }
+$curX11Block = if ($hasDebPkg) { $debPkgStartBlock + $debPkgBlocks } else { $binStartBlock + $binBlocks + 2 }
 
 $x11FileDefs = @(
     @{ Name = "ico"; Ino = 36; Mode = 0x81ED },
@@ -578,20 +580,49 @@ if ($hasLibc) {
 }
 
 # ---- /bin dir data @ block $binStartBlock ----
+# Every applet is a hardlink to the busybox image (inode 23); busybox picks the
+# applet from argv[0].  dpkg-deb stays a separate Debian binary (inode 20).
+$binEntries = New-Object System.Collections.ArrayList
+[void]$binEntries.Add(@{ Ino = 28; Name = '.'; Type = 2 })
+[void]$binEntries.Add(@{ Ino = 2;  Name = '..'; Type = 2 })
+[void]$binEntries.Add(@{ Ino = 20; Name = 'dpkg-deb'; Type = 1 })
+$applets = @(
+    'busybox','sh','ash','echo','cat','ls','mkdir','rmdir','rm','cp','mv','ln','touch',
+    'chmod','chown','date','sleep','true','false','env','id','uname','hostname','ps','kill',
+    'grep','sed','awk','head','tail','sort','uniq','wc','cut','tr','find','xargs','du','df',
+    'stat','free','mount','umount','ping','ifconfig','netstat','more','less','vi','which',
+    'dirname','basename','seq','printf','test','expr','tee','sync','dmesg','tar','gzip',
+    'gunzip','bzip2','xz','top','uptime','whoami','clear','pwd','dd','hexdump','od','strings',
+    'diff','wget','nc','yes','nohup','watch','ar','tty','printenv','groups','who','stty','reset'
+)
+foreach ($a in $applets) { [void]$binEntries.Add(@{ Ino = 23; Name = $a; Type = 1 }) }
+
 $bOff = $binStartBlock * $BS
-[Array]::Clear($img, $bOff, $BS)
-DirEntry $bOff        28 '.'       2 12
-DirEntry ($bOff + 12) 2  '..'      2 12
-DirEntry ($bOff + 24) 23 'echo'     1 16
-DirEntry ($bOff + 40) 23 'sh'       1 16
-DirEntry ($bOff + 56) 23 'ls'       1 16
-DirEntry ($bOff + 72) 23 'cat'      1 16
-DirEntry ($bOff + 88) 23 'ar'       1 16
-DirEntry ($bOff + 104) 23 'tar'     1 16
-DirEntry ($bOff + 120) 23 'dpkg'    1 16
-DirEntry ($bOff + 136) 23 'dpkg-deb' 1 20
-DirEntry ($bOff + 156) 23 'busybox' 1 ($BS - 156)
-echo "Added /bin directory (echo, sh, ls, cat, ar, tar, dpkg, dpkg-deb, busybox) and /usr, /lib, /lib64 symlinks to disk image"
+[Array]::Clear($img, $bOff, $binBlocks * $BS)
+$blk = 0
+$off = 0
+$prevOff = -1
+for ($i = 0; $i -lt $binEntries.Count; $i++) {
+    $e = $binEntries[$i]
+    $nb = [Text.Encoding]::ASCII.GetByteCount($e.Name)
+    $rec = [int]([Math]::Ceiling((8 + $nb) / 4.0) * 4)
+    if ($rec -lt 12) { $rec = 12 }
+    if ($off + $rec -gt $BS) {
+        # Directory records may not straddle a block: stretch the last record
+        # of this block up to its end, then continue in the next block.
+        if ($prevOff -lt 0) { throw "make-ext4: /bin entry '$($e.Name)' does not fit a block" }
+        PutU16 ($bOff + $blk * $BS + $prevOff + 4) ($BS - $prevOff)
+        $blk++
+        $off = 0
+        $prevOff = -1
+        if ($blk -ge $binBlocks) { throw "make-ext4: /bin needs more than $binBlocks blocks" }
+    }
+    DirEntry ($bOff + $blk * $BS + $off) $e.Ino $e.Name $e.Type $rec
+    $prevOff = $off
+    $off += $rec
+}
+if ($prevOff -ge 0) { PutU16 ($bOff + $blk * $BS + $prevOff + 4) ($BS - $prevOff) }
+echo "Added /bin ($($applets.Count) busybox applets + dpkg-deb) and /usr, /lib, /lib64 symlinks to disk image"
 
 # ---- /tmp dir data @ block $tmpStartBlock ----
 $tOff = $tmpStartBlock * $BS
