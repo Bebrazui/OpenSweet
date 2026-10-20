@@ -64,7 +64,7 @@ Start-Sleep -Seconds 1
 Remove-Item build\serial.log -ErrorAction SilentlyContinue
 
 Write-Host 'Booting...' -ForegroundColor Cyan
-$q = Start-Process -FilePath $QemuPath -ArgumentList `
+$q = Start-Process -WindowStyle Hidden -FilePath $QemuPath -ArgumentList `
     '-accel', 'whpx', '-accel', 'tcg', `
     '-cpu', 'max', '-m', '512M', `
     '-drive', 'format=raw,file=build\os.img', `

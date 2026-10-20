@@ -16,7 +16,7 @@ Start-Sleep 1
 Remove-Item build\serial.log -ErrorAction SilentlyContinue
 
 $qemu = if ($env:OPENSWEET_QEMU) { $env:OPENSWEET_QEMU } else { "C:\Program Files\qemu\qemu-system-x86_64.exe" }
-$q = Start-Process -FilePath $qemu -ArgumentList `
+$q = Start-Process -WindowStyle Hidden -FilePath $qemu -ArgumentList `
     "-m","512M", `
     "-drive","format=raw,file=build\os.img", "-drive","format=raw,file=build\disk.img,if=ide,index=1", `
     "-display","none", `

@@ -5,7 +5,7 @@ Get-Process qemu-system-* -ErrorAction SilentlyContinue | Stop-Process -Force
 Start-Sleep 1
 
 $qemu = if ($env:OPENSWEET_QEMU) { $env:OPENSWEET_QEMU } else { "C:\Program Files\qemu\qemu-system-x86_64.exe" }
-$q = Start-Process -FilePath $qemu -ArgumentList `
+$q = Start-Process -WindowStyle Hidden -FilePath $qemu -ArgumentList `
     "-accel","whpx","-accel","tcg", `
     "-cpu","max", `
     "-m","512M", `
