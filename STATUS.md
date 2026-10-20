@@ -49,11 +49,27 @@ These are confirmed by the serial log of a real headless boot (`scripts/smoke.ps
   - *Result:* `dpkg-deb -x /bash.deb /` now extracts `/bin/bash` at its full
     `1 234 376` bytes, the loader reports `loaded segments: 4`, and
     `bash --version` prints the real GNU banner (5.1.4) and exits 0.
-  - *Still open:* an interactive `bash` session (prompt / readline), command
-    execution (`bash -c`), pipelines, job control, and the `fstat`-on-`/dev/tty`
-    path that currently returns `EBADF`. Reproduce with
-    `scripts/test_bash.ps1` (use `-RebuildDisk` for a clean tree; a failed
-    extraction leaves partial state behind).
+  - *Still open:* an interactive `bash` session (prompt / readline), pipelines,
+    job control, and the `fstat`-on-`/dev/tty` path that currently returns
+    `EBADF`. Reproduce with `scripts/test_bash.ps1` (use `-RebuildDisk` for a
+    clean tree; a failed extraction leaves partial state behind).
+- **Interactive children in the native terminal.** A foreground child now gets
+  a stdin pipe as fd 0, and the terminal multiplexes the child's output with
+  GUI events, so a Linux program can be typed at and it keeps repainting.
+  - Kernel: `SYS_POLL` (38) / `vfs_poll` report real pipe readiness
+    (`POLLIN`/`POLLOUT`/`POLLHUP`) and sleep in 1 ms slices until the timeout.
+    The Linux ABI `poll` uses the same readiness instead of "everything is
+    ready", which used to make poll loops burn CPU.
+  - Terminal: a small ANSI subset (CSI cursor moves, EL, ED, OSC) is decoded,
+    quotes are honoured when splitting argv, and bytes a child echoes back
+    that match just-typed input are dropped so nothing prints twice.
+  - *Limit:* a pipe is not a tty. `bash` therefore runs non-interactively (no
+    `PS1`, no readline, no job control) and programs calling `isatty` take
+    their pipe path. A real `/dev/ptmx` + `/dev/pts/N` with termios and a line
+    discipline is the next step.
+  - *Verified:* `scripts/test_term_input.ps1` types `echo GOT:sh` while
+    `/bin/sh` runs and busybox prints `GOT:sh`; with `-Bash` it unpacks
+    `bash.deb` and runs `/bin/bash -c 'echo from-bash-c'`.
 - **X11 client (`ico`).** X11 wire protocol lives in `kernel/x11.inc`, SHM in
   `kernel/shm.inc`. Library set is packaged but the client is not confirmed running.
 - **Linux ABI serial tracing.** `compat_linux.inc` prints `openat`/`fstat`/`lseek`/

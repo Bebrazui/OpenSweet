@@ -38,6 +38,7 @@ SYS_SYMLINK        = 35
 SYS_NET_INFO       = 36
 SYS_GUI_TOGGLE_PIP = 37
 SYS_POLL           = 38
+SYS_TTY_BIND       = 39
 
 align 16
 sys_user_rsp       dq 0
@@ -248,6 +249,8 @@ end if
     je .do_gui_toggle_pip
     cmp eax, SYS_POLL
     je .do_poll
+    cmp eax, SYS_TTY_BIND
+    je .do_tty_bind
 
 if defined CONFIG_LINUX_COMPAT
     ; Fallback to Linux ABI for undeclared syscall numbers (marked distinctly
@@ -282,6 +285,33 @@ end if
 .do_write:
     ; RDI = fd, RSI = buffer, RDX = count
     call vfs_write_fd
+    jmp .syscall_ret
+
+; ------------------------------------------------------------------------------
+; .do_tty_bind: mark a pipe pair as a terminal
+; RDI = fd the terminal writes to, RSI = fd the child writes to
+; ------------------------------------------------------------------------------
+.do_tty_bind:
+    mov r12d, edi
+    mov r13d, esi
+    call vfs_get_fd_ptr
+    test rax, rax
+    jz .do_tty_bind_err
+    cmp byte [rax + 0], FD_TYPE_PIPE
+    jne .do_tty_bind_err
+    movzx r14d, word [rax + 2]
+    mov edi, r13d
+    call vfs_get_fd_ptr
+    test rax, rax
+    jz .do_tty_bind_err
+    cmp byte [rax + 0], FD_TYPE_PIPE
+    jne .do_tty_bind_err
+    movzx edx, word [rax + 2]
+    mov eax, r14d
+    call tty_bind
+    jmp .syscall_ret
+.do_tty_bind_err:
+    mov rax, -1
     jmp .syscall_ret
 
 .do_read:

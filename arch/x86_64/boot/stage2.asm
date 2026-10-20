@@ -3,7 +3,12 @@
 
 KERNEL_LBA     = 33                  ; LBA0=MBR, LBA1..32=stage2(16KB)
 KERNEL_ADDR    = 0x10000
-KERNEL_SECTORS = 920                 ; 460KB kernel window (fits before stack 0x90000 / EBDA)
+; Number of 512-byte sectors to load for the kernel.  build.cmd passes the
+; real value on the command line (-d KERNEL_SECTORS=<n>) so the kernel can
+; never be silently truncated; the default is only a fallback.
+if ~ defined KERNEL_SECTORS
+    KERNEL_SECTORS = 920
+end if
 
 org 0x0600
 use16

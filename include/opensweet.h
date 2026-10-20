@@ -72,6 +72,7 @@ typedef _Bool bool;
 #define SYS_NET_INFO       36
 #define SYS_GUI_TOGGLE_PIP 37
 #define SYS_POLL           38
+#define SYS_TTY_BIND       39
 
 typedef struct {
     uint8_t  present;
@@ -469,6 +470,14 @@ typedef struct os_pollfd {
 static inline int os_poll(os_pollfd_t *fds, int nfds, int timeout_ms) {
     if (!fds || nfds < 0) return -1;
     return (int)os_syscall3(SYS_POLL, (int64_t)fds, nfds, timeout_ms);
+}
+
+/* Attach a terminal to a pipe pair: in_fd is the write end the terminal types
+ * into, out_fd is the read end it reads the child's output from.  Afterwards
+ * isatty() succeeds on both, the kernel echoes + line-buffers input, and tty
+ * ioctls (TCGETS/TCSETS/TIOCGWINSZ) work.  Returns 0 on success. */
+static inline int os_tty_bind(int in_fd, int out_fd) {
+    return (int)os_syscall2(SYS_TTY_BIND, in_fd, out_fd);
 }
 
 static inline int os_dup2(int oldfd, int newfd) {

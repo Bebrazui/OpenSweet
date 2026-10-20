@@ -1531,6 +1531,23 @@ linux_syscall_dispatch:
     call putc
     mov rax, [rsp]                     ; return value
     call putdec64
+    test rax, rax
+    jle .lr_nodump
+    mov rbx, [rsp + 16]                ; buffer
+    mov r12d, 8
+.lr_dl:
+    push rax
+    mov al, ' '
+    call putc
+    movzx eax, byte [rbx]
+    call puthex64
+    pop rax
+    inc rbx
+    dec r12d
+    jz .lr_nodump
+    dec rax
+    jnz .lr_dl
+.lr_nodump:
     mov al, 10
     call putc
     pop rax
@@ -1738,9 +1755,34 @@ linux_syscall_dispatch:
     pop rbx
     test rax, rax
     jz .l_ioctl_badfd
+
+    ; Terminal pipes share the console ioctl handlers so that isatty()
+    ; succeeds and TCGETS/TIOCGWINSZ return sane values.
+    push rdi
+    push rsi
+    push rdx
+    mov rdi, rax
+    call tty_from_fd
+    pop rdx
+    pop rsi
+    pop rdi
+    cmp eax, -1
+    jne .l_ioctl_handlers
+
+    push rdi
+    push rsi
+    push rdx
+    mov edi, edi
+    call vfs_get_fd_ptr
+    pop rdx
+    pop rsi
+    pop rdi
+    test rax, rax
+    jz .l_ioctl_badfd
     cmp byte [rax + 0], FD_TYPE_CONSOLE
     jne .l_ioctl_notty
 
+.l_ioctl_handlers:
     ; TIOCGWINSZ = 0x5413: struct winsize { unsigned short ws_row, ws_col, ws_xpixel, ws_ypixel; }
     cmp rsi, 0x5413
     je .l_ioctl_winsz
@@ -1754,8 +1796,12 @@ linux_syscall_dispatch:
     je .l_ioctl_ok
     cmp rsi, 0x5404
     je .l_ioctl_ok
+    ; TIOCGPGRP / TIOCSPGRP
+    cmp rsi, 0x540F
+    je .l_ioctl_getpgrp
+    cmp rsi, 0x5410
+    je .l_ioctl_ok
     jmp .l_ioctl_notty
-
 .l_ioctl_badfd:
     mov rax, -9                 ; -EBADF
     ret
@@ -1788,7 +1834,7 @@ linux_syscall_dispatch:
     push rdi
     push rsi
     mov rdi, rdx
-    mov rsi, 36
+    mov rsi, 60
     call sys_validate_user_ptr
     pop rsi
     pop rdi
@@ -1796,16 +1842,43 @@ linux_syscall_dispatch:
     push rdi
     push rcx
     mov rdi, rdx
-    mov ecx, 36 / 4
+    mov ecx, 60 / 4
     xor eax, eax
     rep stosd
     pop rcx
     pop rdi
-    ; c_iflag = ICRNL (0x0100), c_oflag = OPOST|ONLCR (0x0005), c_cflag = CS8|CREAD (0x00bf), c_lflag = ISIG|ICANON|ECHO (0x000b)
+    ; c_iflag = ICRNL (0x0100), c_oflag = OPOST|ONLCR (0x0005),
+    ; c_cflag = B38400|CS8|CREAD (0x00bf), c_lflag = ISIG|ICANON|ECHO (0x000b)
     mov dword [rdx + 0],  0x00000100   ; c_iflag
     mov dword [rdx + 4],  0x00000005   ; c_oflag
     mov dword [rdx + 8],  0x000000bf   ; c_cflag
     mov dword [rdx + 12], 0x0000000b   ; c_lflag
+    mov byte  [rdx + 16], 0            ; c_line
+    mov byte  [rdx + 17], 3            ; VINTR  = ^C
+    mov byte  [rdx + 18], 28           ; VQUIT  = ^\
+    mov byte  [rdx + 19], 127          ; VERASE = DEL
+    mov byte  [rdx + 20], 21           ; VKILL  = ^U
+    mov byte  [rdx + 21], 4            ; VEOF   = ^D
+    mov byte  [rdx + 22], 0            ; VTIME
+    mov byte  [rdx + 23], 1            ; VMIN
+    mov dword [rdx + 52], 15           ; c_ispeed (B38400)
+    mov dword [rdx + 56], 15           ; c_ospeed (B38400)
+    xor eax, eax
+    ret
+.l_ioctl_getpgrp:
+    test rdx, rdx
+    jz .l_ioctl_efault
+    push rdi
+    push rsi
+    mov rdi, rdx
+    mov rsi, 4
+    call sys_validate_user_ptr
+    pop rsi
+    pop rdi
+    jc .l_ioctl_efault
+    mov eax, [r15 + sched_curr_task - kmain]
+    inc eax
+    mov [rdx], eax
     xor eax, eax
     ret
 .l_ioctl_efault:
@@ -5338,132 +5411,193 @@ linux_syscall_dispatch:
     ret
 
 .l_poll:
-    ; struct pollfd *fds = RDI, nfds_t nfds = RSI, int timeout = RDX
-    ; Mock: each fd is ready for POLLIN | POLLOUT (revents = events)
+    ; int poll(struct pollfd *fds = RDI, nfds_t nfds = RSI, int timeout = RDX)
+    ; Real blocking wait: pending pipes report their true state, everything
+    ; else stays "ready", and the caller is put to sleep until something
+    ; happens or the deadline expires.
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    sub rsp, 32                 ; [0]=fds [8]=nfds [16]=deadline [24]=timeout
+
     test rdi, rdi
     jz .poll_ret_zero
     test rsi, rsi
     jz .poll_ret_zero
-    ; C-L5: clamp nfds and validate the whole pollfd array (nfds * 8 bytes)
     cmp rsi, 4096
     ja .poll_einval
+
+    mov [rsp + 0], rdi
+    mov [rsp + 8], rsi
+    mov [rsp + 24], rdx
+
     push rsi
-    shl rsi, 3                   ; nfds * sizeof(struct pollfd)
+    shl rsi, 3
     call sys_validate_user_ptr
     pop rsi
     jc .poll_efault
-    mov rcx, rsi
-    xor r8, r8                  ; r8 = ready count
+
+    mov eax, [r15 + timer_ticks - kmain]
+    cmp dword [rsp + 24], -1
+    je .poll_infinite
+    add eax, dword [rsp + 24]
+    jmp .poll_have_deadline
+.poll_infinite:
+    mov eax, -1
+.poll_have_deadline:
+    mov [rsp + 16], eax
+
+.poll_retry:
+    xor r12d, r12d              ; ready count
+    xor r13d, r13d              ; index
 .poll_loop:
-    mov ax, [rdi + 4]           ; requested events
-    mov edx, [rdi + 0]          ; fd
-    push rdi
-    push rcx
-    push rax
-    mov edi, edx
+    cmp r13, [rsp + 8]
+    jae .poll_scan_done
+
+    mov r10, [rsp + 0]
+    lea r10, [r10 + r13 * 8]    ; r10 = &pollfd[i]
+    mov eax, [r10 + 0]
+    test eax, eax
+    js .poll_next               ; negative fd: ignored, revents stays 0
+    mov word [r10 + 6], 0
+
+    mov edi, eax
     call vfs_get_fd_ptr
-    pop rcx                     ; rcx = requested events
+    mov r10, [rsp + 0]
+    lea r10, [r10 + r13 * 8]
     test rax, rax
     jz .poll_fd_done
+
     cmp word [rax + 2], 35      ; X11 socket?
-    jne .poll_fd_regular
-    ; X11 socket: check if tx buffer has data
-    mov rbx, [rax + 4]          ; client ptr
-    test rbx, rbx
-    jz .poll_fd_regular
-    xor ax, ax
-    ; If POLLOUT requested, always ready
-    test cx, 4                  ; POLLOUT
+    jne .poll_not_x11
+    mov r11, [rax + 4]
+    test r11, r11
+    jz .poll_not_x11
+    xor eax, eax
+    movzx ecx, word [r10 + 4]
+    test cx, 4                  ; POLLOUT requested
     jz @f
     or ax, 4
 @@:
-    ; If POLLIN requested, check if tx_head != tx_tail
-    test cx, 1                  ; POLLIN
-    jz .poll_fd_write_revents
-    mov edx, [rbx + 44]         ; tx_tail
-    cmp edx, [rbx + 40]         ; tx_head
-    je .poll_fd_write_revents
-    or ax, 1                    ; POLLIN ready!
-    jmp .poll_fd_write_revents
+    test cx, 1                  ; POLLIN requested
+    jz .poll_store
+    mov edx, [r11 + 44]         ; tx_tail
+    cmp edx, [r11 + 40]         ; tx_head
+    je .poll_store
+    or ax, 1
+    jmp .poll_store
 
-.poll_fd_regular:
-    ; Pipes report their real state; everything else stays "ready", which is
-    ; what the console, regular files and the desktop clients expect.
+.poll_not_x11:
     cmp byte [rax + 0], FD_TYPE_PIPE
     jne .poll_fd_plain
-    movzx edx, word [rax + 2]       ; pipe id
+    movzx edx, word [rax + 2]   ; pipe id
     cmp edx, MAX_PIPES
     jae .poll_fd_plain
     imul edx, edx, PIPE_STRUCT_SIZE
     lea rdx, [r15 + pipe_table - kmain + rdx]
     cmp byte [rax + 1], O_WRONLY
     je .poll_fd_pwrite
-    mov eax, [rdx + 8]              ; bytes buffered
+    mov eax, [rdx + 8]          ; bytes buffered
     test eax, eax
     jnz .poll_fd_pread
-    cmp word [rdx + 14], 0          ; writers gone -> EOF is readable
+    cmp word [rdx + 14], 0      ; writers gone -> EOF is readable
     jne .poll_fd_pnone
 .poll_fd_pread:
-    mov eax, 1                      ; POLLIN
+    mov eax, 1                  ; POLLIN
     cmp word [rdx + 14], 0
-    jne .poll_fd_mask
-    or eax, 16                      ; POLLHUP
-    jmp .poll_fd_mask
+    jne .poll_store
+    or eax, 16                  ; POLLHUP
+    jmp .poll_store
 .poll_fd_pwrite:
-    cmp word [rdx + 12], 0          ; readers gone
+    cmp word [rdx + 12], 0      ; readers gone
     je .poll_fd_perr
     mov eax, PIPE_BUF_SIZE
     sub eax, [rdx + 8]
     test eax, eax
     jle .poll_fd_pnone
-    mov eax, 4                      ; POLLOUT
-    jmp .poll_fd_mask
+    mov eax, 4                  ; POLLOUT
+    jmp .poll_store
 .poll_fd_perr:
-    mov eax, 24                     ; POLLERR|POLLHUP
-    jmp .poll_fd_mask
+    mov eax, 24                 ; POLLERR|POLLHUP
+    jmp .poll_store
 .poll_fd_pnone:
     xor eax, eax
-.poll_fd_mask:
-    mov r9d, eax
-    and r9d, ecx                    ; only what was requested
-    and eax, 24                     ; condition bits are always reported
-    or eax, r9d
-    jmp .poll_fd_write_revents
-.poll_fd_plain:
-    mov ax, cx                  ; revents = requested events
+    jmp .poll_store
 
-.poll_fd_write_revents:
-    pop rcx
-    pop rdi
-    mov [rdi + 6], ax           ; store revents
+.poll_fd_plain:
+    movzx eax, word [r10 + 4]   ; revents = requested events
+
+.poll_store:
+    movzx ecx, word [r10 + 4]
+    mov edx, eax
+    and edx, ecx                ; only what was requested
+    and eax, 24                 ; condition bits are always reported
+    or eax, edx
+    mov [r10 + 6], ax
     test ax, ax
-    jz @f
-    inc r8                      ; count of ready fds
-@@:
-    add rdi, 8
-    dec rcx
-    jnz .poll_loop
-    mov rax, r8
-    ret
+    jz .poll_next
+    inc r12d
+.poll_next:
+    inc r13
+    jmp .poll_loop
 
 .poll_fd_done:
-    pop rcx
+    mov word [r10 + 6], 0
+    jmp .poll_next
+
+.poll_scan_done:
+    test r12d, r12d
+    jnz .poll_done
+    mov eax, [rsp + 24]
+    test eax, eax
+    jz .poll_timed_out
+    cmp eax, -1
+    je .poll_sleep
+    mov ecx, [r15 + timer_ticks - kmain]
+    cmp ecx, [rsp + 16]
+    jae .poll_timed_out
+.poll_sleep:
+    ; No sti here: syscalls run with IF=0 by design (see syscall_entry). task_sleep
+    ; yields through int 0x31, which works regardless of IF.
+    mov ecx, 1
+    call task_sleep
+    jmp .poll_retry
+.poll_timed_out:
+    xor r12d, r12d
+.poll_done:
+    mov rax, r12
+    jmp .poll_pop
+
+.poll_einval:
+    mov rax, LINUX_EINVAL
+    jmp .poll_pop
+.poll_efault:
+    mov rax, LINUX_EFAULT
+.poll_pop:
+    add rsp, 32
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
     pop rdi
-    mov word [rdi + 6], 0
-    add rdi, 8
-    dec rcx
-    jnz .poll_loop
-    mov rax, r8
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
     ret
 .poll_ret_zero:
     xor eax, eax
-    ret
-.poll_einval:
-    mov rax, LINUX_EINVAL
-    ret
-.poll_efault:
-    mov rax, LINUX_EFAULT
-    ret
+    jmp .poll_pop
 
 ; ==============================================================================
 ; Socket & Network Syscalls (Linux ABI)

@@ -8,6 +8,8 @@ param(
     [int]$MonitorPort = 4445,
     [int]$BootWaitSec = 25,
     [int]$StepWaitSec = 4,
+    [int]$UnpackWaitSec = 180,
+    [switch]$Bash,
     [switch]$RebuildDisk,
     [switch]$KeepRunning
 )
@@ -64,6 +66,20 @@ $c = New-Object System.Net.Sockets.TcpClient('127.0.0.1', $MonitorPort)
 $s = $c.GetStream()
 
 try {
+    if ($Bash) {
+        Write-Host 'Step 0: dpkg-deb -x /bash.deb / (extract Debian bash)' -ForegroundColor Cyan
+        SendText $s 'dpkg-deb -x /bash.deb /'
+        Start-Sleep -Seconds $UnpackWaitSec
+        Send $s 'screendump build\term_unpack.ppm'
+        Start-Sleep -Seconds 2
+
+        Write-Host "Step 0b: /bin/bash -c 'echo from-bash-c'" -ForegroundColor Cyan
+        SendText $s "/bin/bash -c 'echo from-bash-c'"
+        Start-Sleep -Seconds ($StepWaitSec + 4)
+        Send $s 'screendump build\term_bash_c.ppm'
+        Start-Sleep -Seconds 2
+    }
+
     # /bin/sh is busybox, present on the image without unpacking anything.
     # 'echo GOT:sh' has output different from the input line, so seeing GOT:sh
     # proves the keystrokes really reached the child's stdin and its stdout

@@ -17,11 +17,22 @@ rem close any running QEMU - it locks build\os.img
 taskkill /IM qemu-system-x86_64.exe /F >nul 2>&1
 timeout /t 1 /nobreak >nul
 
-"%FASM%" arch\x86_64\boot\boot.asm build\boot.bin
-if errorlevel 1 exit /b 1
-"%FASM%" arch\x86_64\boot\stage2.asm build\stage2.bin
-if errorlevel 1 exit /b 1
+rem Build the kernel first: stage2 must know its exact size so that no tail
+rem of the image is ever left unloaded.
 "%FASM%" arch\x86_64\kernel\kernel.asm build\kernel.bin
+if errorlevel 1 exit /b 1
+
+rem The kernel is loaded at 0x10000 and must stay below the EBDA (~0x9F000).
+for %%A in (build\kernel.bin) do set KSIZE=%%~zA
+if %KSIZE% GTR 585728 (
+    echo BUILD ERROR: kernel.bin is %KSIZE% bytes, limit is 585728 ^(0x8F000^)
+    exit /b 1
+)
+set /a KSEC=(KSIZE + 511) / 512
+
+"%FASM%" -d KERNEL_SECTORS=%KSEC% arch\x86_64\boot\stage2.asm build\stage2.bin
+if errorlevel 1 exit /b 1
+"%FASM%" arch\x86_64\boot\boot.asm build\boot.bin
 if errorlevel 1 exit /b 1
 
 del build\os.img 2>nul

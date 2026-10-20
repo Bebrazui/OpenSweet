@@ -375,7 +375,7 @@ static void term_child_output(const char *buf, int n) {
 /* Run a child to completion while staying responsive: multiplex its output
  * with GUI events and forward keystrokes to its stdin.  Returns 1 if the user
  * closed the window (the caller should shut down). */
-static int run_child_interactive(os_window_t *win, int pid, int out_fd, int in_fd) {
+static int run_child_interactive(os_window_t *win, int pid, int out_fd, int in_fd, int tty_mode) {
     char buf[256];
     int out_eof = (out_fd < 0);
     int alive = (pid > 0);
@@ -397,7 +397,7 @@ static int run_child_interactive(os_window_t *win, int pid, int out_fd, int in_f
                 ssize_t n = os_read_fd(out_fd, buf, (int)sizeof(buf));
                 if (n > 0) {
                     for (ssize_t i = 0; i < n; i++) {
-                        if (echo_is_reflection(buf[i])) continue;
+                        if (!tty_mode && echo_is_reflection(buf[i])) continue;
                         term_child_output(&buf[i], 1);
                     }
                     dirty = 1;
@@ -424,18 +424,25 @@ static int run_child_interactive(os_window_t *win, int pid, int out_fd, int in_f
                 uint32_t k = ev.param;
                 if (k == 10 || k == 13) {
                     seq[sn++] = '\n';
-                    /* The child cannot echo on a pipe, so show the newline. */
-                    term_live_newline();
-                    echo_remember('\n');
+                    /* On a real tty the kernel echoes; on a plain pipe the
+                     * terminal has to draw the input itself. */
+                    if (!tty_mode) {
+                        term_live_newline();
+                        echo_remember('\n');
+                    }
                 } else if (k == 8) {
                     seq[sn++] = 127;
-                    if (live_len > 0) live_len--;
-                    live_buf[live_len] = '\0';
-                    term_live_flush();
+                    if (!tty_mode) {
+                        if (live_len > 0) live_len--;
+                        live_buf[live_len] = '\0';
+                        term_live_flush();
+                    }
                 } else if (k == 9) {
                     seq[sn++] = '\t';
-                    term_live_putc('\t');
-                    echo_remember('\t');
+                    if (!tty_mode) {
+                        term_live_putc('\t');
+                        echo_remember('\t');
+                    }
                 } else if (k == OS_KEY_LEFT) {
                     seq[0] = 27; seq[1] = '['; seq[2] = 'D'; sn = 3;
                 } else if (k == OS_KEY_RIGHT) {
@@ -446,8 +453,10 @@ static int run_child_interactive(os_window_t *win, int pid, int out_fd, int in_f
                     seq[0] = 27; seq[1] = '['; seq[2] = 'B'; sn = 3;
                 } else if (k >= 32 && k <= 126) {
                     seq[sn++] = (char)k;
-                    term_live_putc((char)k);
-                    echo_remember((char)k);
+                    if (!tty_mode) {
+                        term_live_putc((char)k);
+                        echo_remember((char)k);
+                    }
                 }
                 if (sn > 0 && in_fd >= 0) {
                     os_write_fd(in_fd, seq, sn);
@@ -1017,21 +1026,42 @@ static void execute_command(os_window_t *win, const char *cmd) {
     } else if (os_strcmp(cmd, "exit") == 0) {
         os_exit(0);
     } else {
-        /* Tokenize command into argv array */
+        /* Tokenize command into argv, honouring 'single' and "double" quotes
+         * (and backslash escapes) so `bash -c 'echo hi'` reaches the child as
+         * two arguments instead of four.  Compaction happens in place: dst
+         * never overtakes src. */
         char cmd_buf[128];
         os_strcpy(cmd_buf, cmd);
         char *argv[16];
         int argc = 0;
-        char *p = cmd_buf;
-        while (*p && argc < 15) {
-            while (*p == ' ') p++;
-            if (*p == '\0') break;
-            argv[argc++] = p;
-            while (*p && *p != ' ') p++;
-            if (*p) {
-                *p = '\0';
-                p++;
+        char *src = cmd_buf;
+        char *dst = cmd_buf;
+        while (*src && argc < 15) {
+            while (*src == ' ' || *src == '\t') src++;
+            if (*src == '\0') break;
+            argv[argc++] = dst;
+            char quote = 0;
+            while (*src) {
+                char c = *src;
+                if (quote) {
+                    if (c == quote) { quote = 0; src++; continue; }
+                    if (c == '\\' && quote == '"' && src[1]) c = *++src;
+                    *dst++ = c;
+                    src++;
+                    continue;
+                }
+                if (c == '\'' || c == '"') { quote = c; src++; continue; }
+                if (c == ' ' || c == '\t') break;
+                if (c == '\\' && src[1]) c = *++src;
+                *dst++ = c;
+                src++;
             }
+            int more = (*src != '\0');
+            *dst++ = '\0';
+            /* The terminator just written may land on the separator itself
+             * (dst == src when nothing was unquoted), so decide before it is
+             * overwritten. */
+            if (more) src++;
         }
         argv[argc] = NULL;
         if (argc == 0) return;
@@ -1048,10 +1078,16 @@ static void execute_command(os_window_t *win, const char *cmd) {
         int pfd[2] = { -1, -1 };
         int infd[2] = { -1, -1 };
         int spawned = -1;
+        int tty_mode = 0;
 
         if (!run_bg) {
             os_pipe(pfd);
             os_pipe(infd);
+            /* Give the child a real terminal so interactive tools (bash,
+             * readline, less, vim) take their tty code paths. */
+            if (pfd[0] >= 0 && infd[1] >= 0) {
+                tty_mode = (os_tty_bind(infd[1], pfd[0]) == 0);
+            }
         }
 
         if (exe_name[0] == '/') {
@@ -1119,7 +1155,7 @@ static void execute_command(os_window_t *win, const char *cmd) {
                 if (infd[0] >= 0) os_close(infd[0]);
                 live_len = 0;
                 live_buf[0] = '\0';
-                if (run_child_interactive(win, spawned, pfd[0], infd[1])) {
+                if (run_child_interactive(win, spawned, pfd[0], infd[1], tty_mode)) {
                     term_quit_request = 1;
                 }
                 if (pfd[0] >= 0) os_close(pfd[0]);

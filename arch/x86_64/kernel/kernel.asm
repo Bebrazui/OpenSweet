@@ -2993,6 +2993,35 @@ common_ex:
     ; tasks); native tasks terminate as before. Returns only when an
     ; installed handler must run — by then the iretq frame is patched.
     mov esi, r12d                     ; vector
+    cmp r12d, 14
+    je .r3_err
+    cmp r12d, 13
+    je .r3_err
+    cmp r12d, 11
+    je .r3_err
+    cmp r12d, 10
+    je .r3_err
+    cmp r12d, 8
+    je .r3_err
+    cmp r12d, 17
+    je .r3_err
+    mov r10, [rsp + 16*8]
+    jmp .r3_show
+.r3_err:
+    mov r10, [rsp + 17*8]
+.r3_show:
+    push rsi
+    mov rsi, at_msg
+    call puts
+    mov rax, r10
+    call puthex64
+    mov al, ' '
+    call putc
+    mov rax, cr2
+    call puthex64
+    mov al, 10
+    call putc
+    pop rsi
     lea rdi, [rsp]                    ; exception frame base
     call sig_on_exception
     jmp .ex_resume
@@ -3494,6 +3523,7 @@ include '../../../kernel/x11.inc'
 include '../../../kernel/syscall.inc'
 include '../../../kernel/test_user.inc'
 include '../../../kernel/elf.inc'
+include '../../../kernel/tty.inc'
 
 ; ================= framebuffer test pattern (proves VBE LFB works) =================
 ; fills screen with per-pixel gradient: R=x, G=y, B=(x+y) & 255

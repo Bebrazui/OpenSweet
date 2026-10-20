@@ -1020,6 +1020,16 @@ vfs_write_fd:
 .wfd_p_wait:
     cmp word [r8 + 12], 0              ; any readers left?
     je .wfd_err_epipe
+
+    ; A pipe that backs a terminal input runs through the line discipline:
+    ; the kernel stages/echoes the line instead of dumping raw bytes.
+    movzx edi, word [rbx + 2]
+    call tty_try_input
+    jnc @f
+    mov rax, rdx
+    jmp .wfd_done
+@@:
+
     mov ecx, PIPE_BUF_SIZE
     sub ecx, [r8 + 8]
     test ecx, ecx
@@ -1142,6 +1152,10 @@ vfs_pipe:
 .found_pipe:
     mov r13d, ecx                       ; r13d = pipe_id
     lea r14, [rdx]                      ; r14 = pipe struct
+
+    ; A recycled pipe slot must not inherit an old terminal binding.
+    mov edi, r13d
+    call tty_forget_pipe
 
     ; Find two free FDs in current task
     mov eax, [r15 + sched_curr_task - kmain]
