@@ -15,8 +15,8 @@ param(
     [string]$QemuPath = $(if ($env:OPENSWEET_QEMU) { $env:OPENSWEET_QEMU } else { 'C:\Program Files\qemu\qemu-system-x86_64.exe' }),
     [string]$MonitorPort = '4445',
     [int]$BootWaitSec = 15,
-    [int]$UnpackWaitSec = 60,
-    [int]$StepWaitSec = 8,
+    [int]$UnpackWaitSec = 180,
+    [int]$StepWaitSec = 12,
     [switch]$SkipUnpack,
     [switch]$RebuildDisk,
     [int]$SerialTail = 60
