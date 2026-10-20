@@ -1,5 +1,25 @@
-/bin/bash -c "echo hi | cat"
-#wait 5
-/bin/sh -c "x=$(echo sub); echo got=$x"
-#wait 5
-#shot build\s1.ppm
+/bin/sh -c "echo k1 | cat"
+#wait 3
+/bin/sh -c "echo k2 | cat"
+#wait 3
+/bin/sh -c "echo k3 | cat"
+#wait 3
+/bin/sh -c "echo k4 | cat"
+#wait 3
+/bin/sh -c "echo k5 | cat"
+#wait 3
+/bin/sh -c "echo k6 | cat"
+#wait 3
+/bin/sh -c "echo k7 | cat"
+#wait 3
+/bin/sh -c "echo k8 | cat"
+#wait 3
+/bin/sh -c "echo k9 | cat"
+#wait 3
+/bin/sh -c "echo k10 | cat"
+#wait 3
+/bin/sh -c "echo k11 | cat"
+#wait 3
+/bin/sh -c "echo k12 | cat"
+#wait 3
+#shot build\st.ppm

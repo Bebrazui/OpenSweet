@@ -69,7 +69,7 @@ TCB_EGID             = 0xAAC          ; uint32: effective GID (0 = root)
 TCB_SUID             = 0xAB0          ; uint32: saved set-UID (0 = root)
 TCB_SGID             = 0xAB4          ; uint32: saved set-GID (0 = root)
 TCB_UMASK            = 0xAB8          ; uint32: file creation mask (default 022 = 0x12)
-TCB_PAD_CRED         = 0xABC          ; uint32: alignment padding
+TCB_MMAP_NEXT        = 0xABC          ; uint32: per-process mmap bump pointer (0 = none yet)
 TCB_SIZE             = 2752           ; 0xAC0 (16-byte aligned)
 
 TASK_STACK_SIZE = 8192                ; 8 KB stack per task
@@ -568,6 +568,10 @@ task_finalize_user:
     mov dword [rdi + TCB_SGID], 0
     mov dword [rdi + TCB_UMASK], 0x12  ; 022 octal (default umask)
     mov [rdi + TCB_USER_RSP], r11
+    ; Per-process mmap zone bump pointer staged by the image loader.
+    mov eax, dword [r15 + sys_spawn_mmap_next - kmain]
+    mov [rdi + TCB_MMAP_NEXT], eax
+    mov qword [r15 + sys_spawn_mmap_next - kmain], 0
 
     ; Signal state: every (re-)loaded image starts with SIG_DFL handlers and
     ; no pending signals — execve resets handlers per POSIX. The blocked mask
@@ -857,6 +861,10 @@ task_exit:
     mov edi, [rbx + TCB_TGID]
     call vfs_release_tgid_locks
     call vfs_cleanup_task_fds
+    ; Give the process's mmap pages back to the PMM: the zone is per-address-
+    ; space, and without this every spawned process leaked its libraries.
+    mov rdi, rbx
+    call task_free_mmap_zone
 .te_skip_fds:
 
     int 0x31

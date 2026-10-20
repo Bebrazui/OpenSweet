@@ -202,8 +202,9 @@ sys_linux_shmat:
     test r13, r13
     jnz .shmat_custom_addr
 
-    ; Bump from linux_mmap_next
-    mov r13, [r15 + linux_mmap_next - kmain]
+    ; Bump from this process's mmap pointer (per-address-space zone)
+    call task_mmap_next_get
+    mov r13d, eax
     add r13, 0xFFF
     and r13, -4096                     ; 4KB align
 
@@ -216,8 +217,8 @@ sys_linux_shmat:
     cmp rax, 0x40000000
     ja .shmat_enomem
 
-    ; Advance linux_mmap_next
-    mov [r15 + linux_mmap_next - kmain], rax
+    ; Advance this process's mmap pointer
+    call task_mmap_next_set
     jmp .shmat_do_map
 
 .shmat_custom_addr:

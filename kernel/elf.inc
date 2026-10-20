@@ -110,6 +110,7 @@ elf_load_from_ext4:
     cli
 
     mov r14, rsi                      ; r14 = original path string
+    mov qword [r15 + sys_spawn_mmap_next - kmain], 0   ; fresh address space
 
     ; 1. Check if filesystem is mounted
     cmp byte [r15 + ext4_ok - kmain], 0
@@ -1199,8 +1200,9 @@ elf_load_interp:
 
 
 .li_load_done:
-    ; Advance linux_mmap_next to 0x20100000 (beyond interpreter)
-    mov qword [r15 + linux_mmap_next - kmain], 0x20100000
+    ; Reserve the first MB of the mmap zone for the interpreter, so libraries
+    ; the freshly exec'd image maps cannot collide with it.
+    mov qword [r15 + sys_spawn_mmap_next - kmain], 0x20100000
 
     lea rsi, [r15 + str_elf_interp_ok - kmain]
     call puts

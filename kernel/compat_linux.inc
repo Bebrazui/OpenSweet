@@ -440,6 +440,179 @@ sig_kill_current:
     call task_exit                    ; never returns
 
 ; ------------------------------------------------------------------------------
+
+; ==============================================================================
+; task_mmap_next_get: EAX = this process's mmap bump pointer.
+;   Each process has its own address space, so they can all reuse the same
+;   [0x20000000, 0x40000000) virtual zone; a single global pointer leaked the
+;   zone (and, since nothing freed the pages, physical memory too) once the
+;   shell had spawned enough children.
+;   A zero TCB field means "nothing mapped yet" -> the zone base.
+; Preserves everything except RAX.
+; ==============================================================================
+task_mmap_next_get:
+    push rbx
+    mov ebx, [r15 + sched_curr_task - kmain]
+    imul ebx, ebx, TCB_SIZE
+    mov eax, [r15 + task_table - kmain + rbx + TCB_MMAP_NEXT]
+    pop rbx
+    test eax, eax
+    jnz @f
+    mov eax, 0x20000000
+@@:
+    ret
+
+; ==============================================================================
+; task_mmap_next_set: EAX = new bump pointer for this process
+; Preserves everything except RAX.
+; ==============================================================================
+task_mmap_next_set:
+    push rbx
+    mov ebx, [r15 + sched_curr_task - kmain]
+    imul ebx, ebx, TCB_SIZE
+    mov [r15 + task_table - kmain + rbx + TCB_MMAP_NEXT], eax
+    pop rbx
+    ret
+
+; ==============================================================================
+; task_free_user_page: RDI = physical page to return to the PMM, unless it is
+;   owned by a live SysV SHM segment (those pages are shared between address
+;   spaces and must survive this process).  Layouts mirror shm.inc, which is
+;   included after this file.
+; Preserves everything.
+; ==============================================================================
+task_free_user_page:
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    xor ecx, ecx
+.tfp_loop:
+    cmp ecx, 8                          ; MAX_SHM_SEGMENTS
+    jae .tfp_free
+    imul edx, ecx, 64                   ; SHM_ENTRY_SIZE
+    lea rdx, [r15 + shm_table - kmain + rdx]
+    cmp dword [rdx + 16], 0             ; SHM_FREE
+    je .tfp_next
+    mov rsi, [rdx + 24]                 ; phys_base
+    cmp rdi, rsi
+    jb .tfp_next
+    mov rax, [rdx + 12]                 ; pages
+    shl rax, 12
+    add rax, rsi
+    cmp rdi, rax
+    jb .tfp_done                        ; inside a live segment: leave it
+.tfp_next:
+    inc ecx
+    jmp .tfp_loop
+.tfp_free:
+    call pmm_free
+.tfp_done:
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    ret
+
+; ==============================================================================
+; task_free_mmap_zone: unmap and free every page of the Linux mmap zone.
+;   All other user regions (code/stack/canvas/heap) are single 2MB huge pages
+;   pointing at the slot's fixed physical window, so they are skipped; only the
+;   zone uses 4KB page tables.  Frees both the data pages and the PT pages and
+;   clears the PD entries, then reloads CR3 to drop stale TLB entries.
+; RDI = TCB pointer of the (dead/exiting) process.
+; Preserves all registers.
+; ==============================================================================
+task_free_mmap_zone:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+
+    mov rsi, [rdi + TCB_CR3]
+    and rsi, 0xFFFFFFFFFFFFF000
+    test rsi, rsi
+    jz .fmz_done
+    mov rsi, [rsi]                      ; PML4[0] -> PDPT
+    and rsi, 0xFFFFFFFFFFFFF000
+    test rsi, rsi
+    jz .fmz_done
+    mov rsi, [rsi]                      ; PDPT[0] -> PD
+    and rsi, 0xFFFFFFFFFFFFF000
+    test rsi, rsi
+    jz .fmz_done
+
+    mov r8d, 256                        ; first PD index of the mmap zone
+.fmz_pd_loop:
+    cmp r8d, 512
+    jae .fmz_done
+    mov rax, [rsi + r8*8]
+    test al, 1
+    jz .fmz_next
+    test al, 0x80                       ; huge page: fixed slot window, not ours
+    jnz .fmz_next
+
+    mov r9, rax
+    and r9, 0xFFFFFFFFFFFFF000          ; r9 = PT physical
+    xor ecx, ecx
+.fmz_pt_loop:
+    mov rax, [r9 + rcx*8]
+    test al, 1
+    jz .fmz_pt_next
+    mov r10, rax
+    and r10, 0xFFFFFFFFFFFFF000
+    push rcx
+    push rsi
+    push r8
+    push r9
+    mov rdi, r10
+    call task_free_user_page
+    pop r9
+    pop r8
+    pop rsi
+    pop rcx
+    mov qword [r9 + rcx*8], 0
+.fmz_pt_next:
+    inc ecx
+    cmp ecx, 512
+    jb .fmz_pt_loop
+
+    ; Drop the now-empty page table as well.
+    push rsi
+    push r8
+    push r9
+    mov rdi, r9
+    call pmm_free
+    pop r9
+    pop r8
+    pop rsi
+    mov qword [rsi + r8*8], 0
+
+.fmz_next:
+    inc r8d
+    jmp .fmz_pd_loop
+
+.fmz_done:
+    mov rax, cr3
+    mov cr3, rax                        ; flush stale translations
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
 ; sig_on_syscall_ret: deliver pending signals just before returning to ring 3.
 ; Called from .syscall_ret with RSP = frame base F and RAX = syscall result,
 ; interrupts off. May patch the frame (enter a signal handler) or never return
@@ -3125,7 +3298,7 @@ KTERMIOS_SIZE = 36
     ret
 
 ; ==============================================================================
-; linux_fork_copy_mmap: Clone parent's mmap zone [0x20000000, linux_mmap_next)
+; linux_fork_copy_mmap: Clone parent's mmap zone [0x20000000, mmap_next)
 ; R13 = child TCB pointer (contains [r13 + TCB_CR3])
 ; Preserves all registers
 ; ==============================================================================
@@ -3145,7 +3318,14 @@ KTERMIOS_SIZE = 36
     push r15
 
     mov r12, 0x20000000                 ; r12 = current VA
-    mov r14, [r15 + linux_mmap_next - kmain]
+    mov eax, [r15 + sched_curr_task - kmain]
+    imul eax, eax, TCB_SIZE
+    mov r14d, [r15 + task_table - kmain + rax + TCB_MMAP_NEXT]
+    test r14d, r14d
+    jnz @f
+    mov r14d, 0x20000000
+@@:
+    mov [r13 + TCB_MMAP_NEXT], r14d     ; child inherits the parent's bump pointer
     cmp r12, r14
     jae .lf_done
 
@@ -4321,6 +4501,12 @@ KTERMIOS_SIZE = 36
 .l_execve_argv_done:
 
     ; Load the new image into the RUNNING slot
+    ; execve replaces the address space: drop the old mmap zone first so the
+    ; new image starts from a clean zone and the pages return to the PMM.
+    mov eax, [r15 + sched_curr_task - kmain]
+    imul eax, eax, TCB_SIZE
+    lea rdi, [r15 + task_table - kmain + rax]
+    call task_free_mmap_zone
     mov qword [r15 + sys_spawn_exec_mode - kmain], 1
     lea rsi, [r15 + exec_path_buf - kmain]
     call elf_load_from_ext4           ; EAX = slot (ok) or ELF_ERR_* (negative)
@@ -4847,7 +5033,8 @@ KTERMIOS_SIZE = 36
     xor r14d, r14d                      ; r14 = bump-mode flag (addr == 0)
     test rdi, rdi
     jnz .l_mmap_base_ok
-    mov rdi, [r15 + linux_mmap_next - kmain]
+    call task_mmap_next_get
+    mov rdi, rax
     inc r14d
 .l_mmap_base_ok:
     ; Align addr to 4KB
@@ -4959,10 +5146,13 @@ KTERMIOS_SIZE = 36
     test r14d, r14d
     jz .l_mmap_ret
     ; Bump mode only: commit [base, r12) now that every page is mapped, so a
-    ; failed mapping can never leave linux_mmap_next past half-mapped VA.
+    ; failed mapping can never leave the bump pointer past half-mapped VA.
     mov rax, r12
-    sub rax, rbx
-    add [r15 + linux_mmap_next - kmain], rax
+    sub rax, rbx                        ; bytes actually mapped
+    mov edx, eax
+    call task_mmap_next_get
+    add eax, edx
+    call task_mmap_next_set
 .l_mmap_ret:
     push rbx
     lea rsi, [r15 + str_mmap_ok - kmain]
@@ -6024,7 +6214,9 @@ str_lseek_res db " => res=", 0
 str_mmap_ok db " -> mmap ok: base=", 0
 
 align 8
-linux_mmap_next dq 0x20000000
+; Staged by the image loader: the mmap bump pointer the freshly loaded process
+; starts with (0 = none, 0x20100000 = reserve the interpreter's first MB).
+sys_spawn_mmap_next dq 0
 
 MAX_INODE_LOCKS = 16
 INODE_LOCK_ENTRY_SIZE = 16
