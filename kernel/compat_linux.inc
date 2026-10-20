@@ -132,6 +132,26 @@ LINUX_SYS_SHMAT        = 30
 LINUX_SYS_SHMCTL       = 31
 LINUX_SYS_SHMDT        = 67
 
+; --- startup / toolchain syscalls (simple shims; see handlers below) ---
+LINUX_SYS_GETRLIMIT    = 97
+LINUX_SYS_STATFS       = 137
+LINUX_SYS_FSTATFS      = 138
+LINUX_SYS_SETRLIMIT    = 160
+LINUX_SYS_READAHEAD    = 187
+LINUX_SYS_SCHED_SETAFFINITY = 203
+LINUX_SYS_SCHED_GETAFFINITY = 204
+LINUX_SYS_FADVISE64    = 221
+LINUX_SYS_SET_ROBUST_LIST = 273
+LINUX_SYS_GET_ROBUST_LIST = 274
+LINUX_SYS_DUP3         = 292
+LINUX_SYS_PIPE2        = 293
+LINUX_SYS_PRLIMIT64    = 302
+LINUX_SYS_GETCPU       = 309
+LINUX_SYS_GETRANDOM    = 318
+LINUX_SYS_MEMBARRIER   = 324
+LINUX_SYS_RSEQ         = 334
+LINUX_SYS_PERSONALITY  = 135
+
 ; Signal numbers (Linux x86_64 numbering)
 LINUX_SIGINT   = 2
 LINUX_SIGILL   = 4
@@ -1135,6 +1155,42 @@ linux_syscall_dispatch:
     je sys_linux_shmctl
     cmp eax, LINUX_SYS_SHMDT
     je sys_linux_shmdt
+    cmp eax, LINUX_SYS_DUP3
+    je .l_dup3
+    cmp eax, LINUX_SYS_PIPE2
+    je .l_pipe2
+    cmp eax, LINUX_SYS_SET_ROBUST_LIST
+    je .l_set_robust_list
+    cmp eax, LINUX_SYS_GET_ROBUST_LIST
+    je .l_get_robust_list
+    cmp eax, LINUX_SYS_PRLIMIT64
+    je .l_prlimit64
+    cmp eax, LINUX_SYS_GETRLIMIT
+    je .l_getrlimit
+    cmp eax, LINUX_SYS_SETRLIMIT
+    je .l_setrlimit
+    cmp eax, LINUX_SYS_GETRANDOM
+    je .l_getrandom
+    cmp eax, LINUX_SYS_MEMBARRIER
+    je .l_ret_zero
+    cmp eax, LINUX_SYS_RSEQ
+    je .l_ret_enosys
+    cmp eax, LINUX_SYS_GETCPU
+    je .l_getcpu
+    cmp eax, LINUX_SYS_FADVISE64
+    je .l_ret_zero
+    cmp eax, LINUX_SYS_READAHEAD
+    je .l_ret_zero
+    cmp eax, LINUX_SYS_PERSONALITY
+    je .l_ret_zero
+    cmp eax, LINUX_SYS_SCHED_SETAFFINITY
+    je .l_ret_zero
+    cmp eax, LINUX_SYS_SCHED_GETAFFINITY
+    je .l_sched_getaffinity
+    cmp eax, LINUX_SYS_STATFS
+    je .l_statfs
+    cmp eax, LINUX_SYS_FSTATFS
+    je .l_fstatfs
 
     ; Unhandled Linux syscall: log to serial and return -ENOSYS
     push rax
@@ -1148,6 +1204,284 @@ linux_syscall_dispatch:
     pop rsi
     pop rax
     mov rax, LINUX_ENOSYS
+    ret
+
+    ; ---- simple startup shims (glibc / coreutils / toolchain) ----
+.l_ret_zero:
+    xor eax, eax
+    ret
+.l_ret_enosys:
+    mov rax, LINUX_ENOSYS              ; glibc disables rseq when unsupported
+    ret
+
+; dup3(292): RDI=oldfd, RSI=newfd, EDX=flags. Like dup2 but EINVAL on equal fds.
+.l_dup3:
+    cmp edi, esi
+    je .l_dup3_einval
+    call vfs_dup2
+    ret
+.l_dup3_einval:
+    mov rax, LINUX_EINVAL
+    ret
+
+; pipe2(293): RDI=buf, RSI=flags. Accepts O_CLOEXEC|O_NONBLOCK|O_DIRECT only.
+.l_pipe2:
+    mov eax, esi
+    test eax, 0xFFF7B3FF               ; ~(O_CLOEXEC|O_NONBLOCK|O_DIRECT)
+    jnz .l_pipe2_einval
+    call vfs_pipe
+    cmp rax, -1
+    jne .l_pipe2_ok
+    mov rax, LINUX_EMFILE
+    ret
+.l_pipe2_ok:
+    xor eax, eax
+    ret
+.l_pipe2_einval:
+    mov rax, LINUX_EINVAL
+    ret
+
+; set_robust_list(273): RDI=head, RSI=len. Accepted and ignored.
+.l_set_robust_list:
+    xor eax, eax
+    ret
+
+; get_robust_list(274): RDI=pid, RSI=&head, RDX=&len. We never register one.
+.l_get_robust_list:
+    push rbx
+    push r12
+    mov rbx, rsi
+    mov r12, rdx
+    test rbx, rbx
+    jz .l_grl_chk2
+    mov rdi, rbx
+    mov esi, 8
+    call sys_validate_user_ptr
+    jc .l_grl_efault
+    mov qword [rbx], 0
+.l_grl_chk2:
+    test r12, r12
+    jz .l_grl_ok
+    mov rdi, r12
+    mov esi, 8
+    call sys_validate_user_ptr
+    jc .l_grl_efault
+    mov qword [r12], 0
+.l_grl_ok:
+    xor eax, eax
+    pop r12
+    pop rbx
+    ret
+.l_grl_efault:
+    mov rax, LINUX_EFAULT
+    pop r12
+    pop rbx
+    ret
+
+; prlimit64(302)/getrlimit(97): RDI=resource, RSI=old_limit (may be NULL).
+; setrlimit(160) is accepted and ignored.
+.l_prlimit64:
+    mov rdi, rsi                       ; resource
+    mov rsi, r10                       ; old_limit (arg5)
+    call .l_fill_rlimit
+    ret
+.l_getrlimit:
+    call .l_fill_rlimit
+    ret
+.l_setrlimit:
+    xor eax, eax
+    ret
+
+; getrandom(318): RDI=buf, RSI=count, EDX=flags.
+.l_getrandom:
+    test rsi, rsi
+    jz .l_gr_zero
+    cmp rsi, 4096
+    jbe @f
+    mov rsi, 4096
+@@:
+    mov eax, edx
+    test eax, 0xFFFFFFF8               ; only GRND_NONBLOCK|GRND_RANDOM|GRND_INSECURE
+    jnz .l_gr_einval
+    push rbx
+    push r12
+    push r13
+    mov r12, rdi                       ; user buffer
+    mov r13, rsi                       ; count
+    call sys_validate_user_ptr
+    jc .l_gr_efault
+    ; Cheap xorshift64* seeded from the TSC; this is a compatibility shim,
+    ; not a cryptographic source.
+    rdtsc
+    shl rdx, 32
+    or rax, rdx
+    mov rbx, rax
+    test rbx, rbx
+    jnz @f
+    mov rbx, 0x9E3779B97F4A7C15
+@@:
+    mov rcx, r13
+.l_gr_loop:
+    mov rax, rbx
+    shl rax, 13
+    xor rbx, rax
+    mov rax, rbx
+    shr rax, 7
+    xor rbx, rax
+    mov rax, rbx
+    shl rax, 17
+    xor rbx, rax
+    mov [r12], bl
+    inc r12
+    dec rcx
+    jnz .l_gr_loop
+    mov rax, r13
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.l_gr_zero:
+    xor eax, eax
+    ret
+.l_gr_einval:
+    mov rax, LINUX_EINVAL
+    ret
+.l_gr_efault:
+    mov rax, LINUX_EFAULT
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; getcpu(309): RDI=&cpu (opt), RSI=&node (opt), RDX=unused.
+.l_getcpu:
+    push rbx
+    push r12
+    mov rbx, rdi
+    mov r12, rsi
+    test rbx, rbx
+    jz .l_gc_chk2
+    mov rdi, rbx
+    mov esi, 4
+    call sys_validate_user_ptr
+    jc .l_gc_efault
+    mov dword [rbx], 0
+.l_gc_chk2:
+    test r12, r12
+    jz .l_gc_ok
+    mov rdi, r12
+    mov esi, 4
+    call sys_validate_user_ptr
+    jc .l_gc_efault
+    mov dword [r12], 0
+.l_gc_ok:
+    xor eax, eax
+    pop r12
+    pop rbx
+    ret
+.l_gc_efault:
+    mov rax, LINUX_EFAULT
+    pop r12
+    pop rbx
+    ret
+
+; sched_getaffinity(204): RDI=pid, RSI=len, RDX=&mask. One CPU.
+.l_sched_getaffinity:
+    push rbx
+    mov rbx, rsi
+    test rsi, rsi
+    jz .l_sga_ok
+    mov rdi, rdx
+    call sys_validate_user_ptr
+    jc .l_sga_efault
+    mov byte [rdx], 1
+    mov rax, 1                         ; bytes written
+    pop rbx
+    ret
+.l_sga_ok:
+    mov rax, 8
+    pop rbx
+    ret
+.l_sga_efault:
+    mov rax, LINUX_EFAULT
+    pop rbx
+    ret
+
+; statfs(137)/fstatfs(138): RDI=path/fd, RSI=statfs buf. Synthetic ext4 values.
+; The path/fd is not resolved: callers use this only for free-space reporting,
+; and reporting a valid ext4 filesystem is strictly better than ENOSYS.
+.l_statfs:
+.l_fstatfs:
+    mov rdi, rsi
+.l_statfs_fill:
+    push rbx
+    mov rbx, rdi                       ; statfs buffer
+    test rbx, rbx
+    jz .l_statfs_einval
+    mov rdi, rbx
+    mov esi, 120
+    call sys_validate_user_ptr
+    jc .l_statfs_efault
+    ; struct statfs (x86_64): f_type, f_bsize, f_blocks, f_bfree, f_bavail,
+    ; f_files, f_ffree, f_fsid[2], f_namelen, f_frsize, f_flags, f_spare[4]
+    mov qword [rbx + 0],  0xEF53       ; f_type = EXT4_SUPER_MAGIC
+    mov qword [rbx + 8],  1024         ; f_bsize
+    mov qword [rbx + 16], 16384        ; f_blocks
+    mov qword [rbx + 24], 9000         ; f_bfree
+    mov qword [rbx + 32], 9000         ; f_bavail
+    mov qword [rbx + 40], 128          ; f_files
+    mov qword [rbx + 48], 64           ; f_ffree
+    mov qword [rbx + 56], 0            ; f_fsid[0]
+    mov qword [rbx + 64], 0            ; f_fsid[1]
+    mov qword [rbx + 72], 255          ; f_namelen
+    mov qword [rbx + 80], 1024         ; f_frsize
+    mov qword [rbx + 88], 0            ; f_flags
+    mov qword [rbx + 96], 0
+    mov qword [rbx + 104], 0
+    mov qword [rbx + 112], 0
+    xor eax, eax
+    pop rbx
+    ret
+.l_statfs_einval:
+    mov rax, LINUX_EINVAL
+    pop rbx
+    ret
+.l_statfs_efault:
+    mov rax, LINUX_EFAULT
+    pop rbx
+    ret
+
+; .l_fill_rlimit: RDI = resource, RSI = out ptr (may be 0). Writes struct
+; rlimit { rlim_cur; rlim_max }. Memory and file-size limits are reported as
+; RLIM_INFINITY; RLIMIT_NOFILE is reported as 1024 (the ABI-visible default).
+.l_fill_rlimit:
+    push rbx
+    mov rbx, rsi
+    test rbx, rbx
+    jz .lfr_ok
+    mov rdi, rbx
+    mov esi, 16
+    call sys_validate_user_ptr
+    jc .lfr_efault
+    mov rax, -1                        ; RLIM_INFINITY for both by default
+    mov [rbx + 0], rax
+    mov [rbx + 8], rax
+    cmp edi, 7                         ; RLIMIT_NOFILE
+    jne @f
+    mov qword [rbx + 0], 256           ; soft limit within MAX_FDS_PER_TASK
+    mov qword [rbx + 8], 1024          ; hard limit
+    jmp .lfr_ok
+@@:
+    cmp edi, 3                         ; RLIMIT_STACK
+    jne .lfr_ok
+    mov qword [rbx + 0], 0x00800000    ; 8 MB soft
+.lfr_ok:
+    xor eax, eax
+    pop rbx
+    ret
+.lfr_efault:
+    mov rax, LINUX_EFAULT
+    pop rbx
     ret
 
 .l_read:

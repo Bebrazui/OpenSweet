@@ -6,7 +6,7 @@
 ;   - System calls: open, close, read, write, lseek, fstat, stat
 ; ==============================================================================
 
-MAX_FDS_PER_TASK = 16
+MAX_FDS_PER_TASK = 64
 FD_ENTRY_SIZE    = 48
 
 ; FD Types
@@ -46,7 +46,7 @@ task_fd_tables rb (MAX_TASKS * MAX_FDS_PER_TASK * FD_ENTRY_SIZE)
 pipe_table     rb (MAX_PIPES * PIPE_STRUCT_SIZE)
 
 ; ==============================================================================
-; vfs_init_task_fds: Initialize standard streams 0, 1, 2 and clear 3..15
+; vfs_init_task_fds: Initialize standard streams 0, 1, 2 and clear the rest
 ; EBX = task slot ID (0..MAX_TASKS-1)
 ; ==============================================================================
 vfs_init_task_fds:
