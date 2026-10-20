@@ -5387,6 +5387,49 @@ linux_syscall_dispatch:
     jmp .poll_fd_write_revents
 
 .poll_fd_regular:
+    ; Pipes report their real state; everything else stays "ready", which is
+    ; what the console, regular files and the desktop clients expect.
+    cmp byte [rax + 0], FD_TYPE_PIPE
+    jne .poll_fd_plain
+    movzx edx, word [rax + 2]       ; pipe id
+    cmp edx, MAX_PIPES
+    jae .poll_fd_plain
+    imul edx, edx, PIPE_STRUCT_SIZE
+    lea rdx, [r15 + pipe_table - kmain + rdx]
+    cmp byte [rax + 1], O_WRONLY
+    je .poll_fd_pwrite
+    mov eax, [rdx + 8]              ; bytes buffered
+    test eax, eax
+    jnz .poll_fd_pread
+    cmp word [rdx + 14], 0          ; writers gone -> EOF is readable
+    jne .poll_fd_pnone
+.poll_fd_pread:
+    mov eax, 1                      ; POLLIN
+    cmp word [rdx + 14], 0
+    jne .poll_fd_mask
+    or eax, 16                      ; POLLHUP
+    jmp .poll_fd_mask
+.poll_fd_pwrite:
+    cmp word [rdx + 12], 0          ; readers gone
+    je .poll_fd_perr
+    mov eax, PIPE_BUF_SIZE
+    sub eax, [rdx + 8]
+    test eax, eax
+    jle .poll_fd_pnone
+    mov eax, 4                      ; POLLOUT
+    jmp .poll_fd_mask
+.poll_fd_perr:
+    mov eax, 24                     ; POLLERR|POLLHUP
+    jmp .poll_fd_mask
+.poll_fd_pnone:
+    xor eax, eax
+.poll_fd_mask:
+    mov r9d, eax
+    and r9d, ecx                    ; only what was requested
+    and eax, 24                     ; condition bits are always reported
+    or eax, r9d
+    jmp .poll_fd_write_revents
+.poll_fd_plain:
     mov ax, cx                  ; revents = requested events
 
 .poll_fd_write_revents:

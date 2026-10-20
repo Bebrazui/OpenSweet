@@ -811,7 +811,7 @@ vfs_read_fd:
     jnz .rfd_p_data
     ; Buffer empty: writers == 0 -> EOF
     cmp word [r8 + 14], 0
-    je .rfd_eof
+    je .rfd_pipe_eof
     ; Empty pipe with live writers: POSIX read blocks until data or EOF
     call sig_probe_actionable        ; signal pending? -> EINTR instead of block
     test eax, eax
@@ -848,6 +848,10 @@ vfs_read_fd:
     pop rsi
     mov [r8 + 4], r10d
     mov rax, rdx
+    jmp .rfd_done
+
+.rfd_pipe_eof:
+    xor eax, eax
     jmp .rfd_done
 
 .rfd_zero:
@@ -1209,6 +1213,202 @@ vfs_pipe:
     pop r14
     pop r13
     pop r12
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    popfq
+    ret
+
+; ==============================================================================
+; poll() event bits, matching Linux so the same numbers reach user space
+; ==============================================================================
+POLLIN           = 0x001
+POLLPRI          = 0x002
+POLLOUT          = 0x004
+POLLERR          = 0x008
+POLLHUP          = 0x010
+POLLNVAL         = 0x020
+
+; ==============================================================================
+; vfs_poll: Wait until at least one descriptor is ready
+; RDI = struct os_pollfd[] (int fd; int16 events; int16 revents; = 8 bytes)
+; ESI = number of entries, EDX = timeout in milliseconds (-1 = forever)
+; Returns: RAX = number of descriptors with a non-zero revents, 0 on timeout,
+;          -1 on a bad argument
+;
+; This exists so the native terminal can multiplex a child's output pipe with
+; keyboard input.  Without it a single-threaded user program has to pick one
+; and blocks on it, which is why interactive Linux binaries (bash itself,
+; less, vim, python) could not be driven from the GUI.
+; ==============================================================================
+vfs_poll:
+    pushfq
+    cli
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    sub rsp, 32                 ; [rsp+0]=deadline, [rsp+8]=array, [rsp+16]=nfds
+
+    test esi, esi
+    js .vp_err
+    cmp esi, 64
+    ja .vp_err
+    mov [rsp + 16], rsi
+
+    ; Make sure the descriptor array itself is inside the user window.
+    ; poll(fds, 0, timeout) is a portable sleep, so an empty set is legal.
+    mov [rsp + 8], rdi
+    test rsi, rsi
+    jz .vp_no_validate
+    shl rsi, 3
+    call sys_validate_user_ptr
+    jc .vp_err
+.vp_no_validate:
+
+    ; deadline = timer_ticks + timeout  (timer runs at 1 kHz)
+    mov eax, [r15 + timer_ticks - kmain]
+    cmp edx, -1
+    je .vp_infinite
+    add eax, edx
+    jmp .vp_have_deadline
+.vp_infinite:
+    mov eax, -1
+.vp_have_deadline:
+    mov [rsp + 0], rax
+
+.vp_retry:
+    xor r12d, r12d                      ; r12d = ready count
+    xor r13d, r13d                      ; r13d = index
+.vp_loop:
+    cmp r13, [rsp + 16]
+    jae .vp_scan_done
+
+    mov rbx, [rsp + 8]
+    lea rbx, [rbx + r13 * 8]
+    mov eax, [rbx + 0]                  ; fd
+    test eax, eax
+    js .vp_next                         ; negative fd: ignore, revents stays 0
+    mov word [rbx + 6], 0               ; revents
+
+    mov edi, eax
+    call vfs_get_fd_ptr
+    test rax, rax
+    jz .vp_nval
+
+    movzx ecx, byte [rax + 0]           ; type
+    movzx edx, byte [rax + 1]           ; open flags
+
+    cmp ecx, FD_TYPE_PIPE
+    je .vp_pipe
+
+    ; console, regular file, /dev/null: always ready both ways
+    mov eax, POLLIN or POLLOUT
+    jmp .vp_set
+
+.vp_pipe:
+    movzx ecx, word [rax + 2]           ; pipe id
+    cmp ecx, MAX_PIPES
+    jae .vp_nval
+    imul ecx, ecx, PIPE_STRUCT_SIZE
+    lea rcx, [r15 + pipe_table - kmain + rcx]
+
+    test edx, O_WRONLY
+    jnz .vp_pipe_write
+
+    ; read end: data available, or EOF (writers gone) is readable too
+    mov eax, [rcx + 8]
+    test eax, eax
+    jnz .vp_pipe_readable
+    cmp word [rcx + 14], 0
+    jne .vp_not_ready
+.vp_pipe_readable:
+    mov eax, POLLIN
+    cmp word [rcx + 14], 0
+    jne .vp_set
+    or eax, POLLHUP
+    jmp .vp_set
+
+.vp_pipe_write:
+    cmp word [rcx + 12], 0
+    je .vp_pipe_broken
+    mov eax, PIPE_BUF_SIZE
+    sub eax, [rcx + 8]
+    test eax, eax
+    jle .vp_not_ready
+    mov eax, POLLOUT
+    jmp .vp_set
+
+.vp_pipe_broken:
+    mov eax, POLLERR or POLLHUP
+    jmp .vp_set
+
+.vp_not_ready:
+    xor eax, eax
+    jmp .vp_set
+
+.vp_nval:
+    mov eax, POLLNVAL
+
+.vp_set:
+    ; Report only what the caller asked for, except for the condition bits,
+    ; which POSIX always delivers.
+    movzx ecx, word [rbx + 4]           ; events
+    mov edx, eax
+    and edx, ecx
+    and eax, (POLLERR or POLLHUP or POLLNVAL)
+    or edx, eax
+    mov [rbx + 6], dx                   ; revents
+    test dx, dx
+    jz .vp_next
+    inc r12d
+
+.vp_next:
+    inc r13
+    jmp .vp_loop
+
+.vp_scan_done:
+    test r12d, r12d
+    jnz .vp_done
+
+    mov rax, [rsp + 0]
+    cmp rax, -1
+    je .vp_sleep
+    mov ecx, [r15 + timer_ticks - kmain]
+    cmp ecx, eax
+    jae .vp_timeout
+
+.vp_sleep:
+    sti
+    mov ecx, 1
+    call task_sleep
+    cli
+    jmp .vp_retry
+
+.vp_timeout:
+    xor r12d, r12d
+.vp_done:
+    mov rax, r12
+    jmp .vp_pop
+.vp_err:
+    mov rax, -1
+.vp_pop:
+    add rsp, 32
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
     pop rdi
     pop rsi
     pop rdx

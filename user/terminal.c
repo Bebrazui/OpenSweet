@@ -45,6 +45,8 @@ typedef struct {
 
 static term_line_t lines[TERM_ROWS];
 static int         cur_row = 0;
+
+static void render_terminal(os_window_t *win);
 static char        input_buf[128];
 static int         input_len = 0;
 static int         blink_cnt = 0;
@@ -52,6 +54,7 @@ static int         curr_blink_state = 1;
 
 /* Smooth Animation State (VS Code / Neovide style smooth caret and scrolling) */
 static int         anim_active = 0;
+static int         term_quit_request = 0;
 static int         anim_cur_x_fp = 0;    /* 8.8 fixed-point */
 static int         anim_cur_y_fp = 0;    /* 8.8 fixed-point */
 static int         anim_inited = 0;
@@ -225,8 +228,254 @@ static void print_fetch(void) {
     term_print_line("\x1b[36m     :::                               \x1b[36mPalette : \x1b[35m● \x1b[31m● \x1b[33m● \x1b[32m● \x1b[36m● \x1b[34m● \x1b[37m● \x1b[90m●\x1b[0m", OS_COLOR_SLATE_200);
 }
 
+/* ---------------------------------------------------------------------------
+ * Interactive child support
+ *
+ * Programs that talk to the user emit control sequences: readline redraws its
+ * edit line with "\r", "\033[K" and cursor moves, coreutils colourise output.
+ * Until there is a real pseudo-terminal the terminal has to decode the small
+ * subset those programs actually use, and echo typed characters itself,
+ * because a pipe is not a tty and the child will not echo.
+ * ------------------------------------------------------------------------- */
+
+static char live_buf[TERM_COLS + 1];
+static int  live_len = 0;
+static int  ansi_esc = 0;    /* 0 = text, 1 = after ESC, 2 = CSI, 3 = OSC */
+static int  ansi_par = 0;    /* numeric CSI parameter */
+static int  ansi_seen = 0;   /* a digit was seen */
+
+/* A pipe is not a tty, so some programs (cat, dd, ...) echo their input while
+ * others (bash reading a script) do not.  The terminal echoes locally so the
+ * user can always see what they type; bytes the child sends back that match
+ * the tail of what we just typed are dropped instead of printed twice. */
+static char echo_pend[TERM_COLS + 8];
+static int  echo_len = 0;
+
+static void echo_remember(char c) {
+    if (echo_len < (int)sizeof(echo_pend)) echo_pend[echo_len++] = c;
+}
+
+static int echo_is_reflection(char c) {
+    if (echo_len > 0 && echo_pend[0] == c) {
+        for (int i = 1; i < echo_len; i++) echo_pend[i - 1] = echo_pend[i];
+        echo_len--;
+        return 1;
+    }
+    if (echo_len > 0) echo_len = 0;   /* genuine output: stop expecting an echo */
+    return 0;
+}
+
+/* Draw the in-progress line at the current row without advancing. */
+static void term_live_flush(void) {
+    if (cur_row >= TERM_ROWS) {
+        term_scroll_up();
+        cur_row = TERM_ROWS - 1;
+    }
+    int len = 0;
+    while (live_buf[len] && len < TERM_COLS) {
+        lines[cur_row].text[len] = live_buf[len];
+        len++;
+    }
+    lines[cur_row].text[len] = '\0';
+    lines[cur_row].color = OS_COLOR_SLATE_200;
+    lines[cur_row].is_prompt = 0;
+}
+
+static void term_live_newline(void) {
+    term_live_flush();
+    cur_row++;
+    live_len = 0;
+    live_buf[0] = '\0';
+}
+
+/* Append one output character, honouring the carriage-return/backspace/tab
+ * conventions that everything from bash to `ls` relies on. */
+static void term_live_putc(char c) {
+    if (c == '\r') {
+        live_len = 0;
+    } else if (c == '\b' || c == 127) {
+        if (live_len > 0) live_len--;
+    } else if (c == '\t') {
+        int n = 8 - (live_len & 7);
+        while (n-- > 0 && live_len < TERM_COLS) live_buf[live_len++] = ' ';
+    } else if (live_len < TERM_COLS) {
+        live_buf[live_len++] = c;
+    }
+    live_buf[live_len] = '\0';
+    term_live_flush();
+}
+
+/* Decode a chunk of child output.  Escape parsing state is kept in statics so
+ * a sequence may be split across two read() calls. */
+static void term_child_output(const char *buf, int n) {
+    for (int i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)buf[i];
+
+        if (ansi_esc == 2) {                 /* CSI: ESC [ params final */
+            if (c >= '0' && c <= '9') {
+                ansi_par = ansi_par * 10 + (c - '0');
+                ansi_seen = 1;
+            } else if (c == ';') {
+                ansi_par = 0;
+                ansi_seen = 0;
+            } else if (c >= 0x40 && c <= 0x7e) {
+                int v = ansi_seen ? ansi_par : 1;
+                if (c == 'K') {              /* erase to end of line */
+                    live_buf[live_len] = '\0';
+                } else if (c == 'J' && ansi_par == 2) {
+                    term_clear();
+                    cur_row = 0;
+                } else if (c == 'D') {
+                    live_len -= v;
+                    if (live_len < 0) live_len = 0;
+                    live_buf[live_len] = '\0';
+                } else if (c == 'C') {
+                    live_len += v;
+                    if (live_len > TERM_COLS) live_len = TERM_COLS;
+                    for (int k = 0; k < live_len; k++) {
+                        if (live_buf[k] == '\0') live_buf[k] = ' ';
+                    }
+                    live_buf[live_len] = '\0';
+                } else if (c == 'G') {
+                    live_len = v - 1;
+                    if (live_len < 0) live_len = 0;
+                }
+                ansi_esc = 0;
+                ansi_par = 0;
+                ansi_seen = 0;
+            }
+            continue;
+        }
+        if (ansi_esc == 3) {                 /* OSC: skip to BEL or ST */
+            if (c == 7) ansi_esc = 0;
+            else if (c == 27) ansi_esc = 4;
+            continue;
+        }
+        if (ansi_esc == 4) {                 /* seen ESC inside OSC */
+            ansi_esc = (c == '\\') ? 0 : 3;
+            continue;
+        }
+        if (ansi_esc == 1) {
+            if (c == '[') { ansi_esc = 2; ansi_par = 0; ansi_seen = 0; }
+            else if (c == ']') ansi_esc = 3;
+            else if (c == '(' || c == ')' || c == '%' || c == '#') ansi_esc = 5;
+            else if (c == 27) { /* stay */ }
+            else ansi_esc = 0;               /* single-char escape: ignore */
+            continue;
+        }
+        if (ansi_esc == 5) { ansi_esc = 0; continue; } /* charset Designator */
+
+        if (c == 27) { ansi_esc = 1; continue; }
+        if (c == '\n') { term_live_newline(); continue; }
+        if (c == 7) continue;                /* bell */
+        term_live_putc((char)c);
+    }
+}
+
+/* Run a child to completion while staying responsive: multiplex its output
+ * with GUI events and forward keystrokes to its stdin.  Returns 1 if the user
+ * closed the window (the caller should shut down). */
+static int run_child_interactive(os_window_t *win, int pid, int out_fd, int in_fd) {
+    char buf[256];
+    int out_eof = (out_fd < 0);
+    int alive = (pid > 0);
+
+    ansi_esc = 0;
+    ansi_par = 0;
+    ansi_seen = 0;
+    echo_len = 0;
+
+    for (;;) {
+        int dirty = 0;
+
+        if (!out_eof) {
+            os_pollfd_t pf;
+            pf.fd = out_fd;
+            pf.events = OS_POLLIN;
+            pf.revents = 0;
+            if (os_poll(&pf, 1, 5) > 0 && (pf.revents & (OS_POLLIN | OS_POLLHUP))) {
+                ssize_t n = os_read_fd(out_fd, buf, (int)sizeof(buf));
+                if (n > 0) {
+                    for (ssize_t i = 0; i < n; i++) {
+                        if (echo_is_reflection(buf[i])) continue;
+                        term_child_output(&buf[i], 1);
+                    }
+                    dirty = 1;
+                } else {
+                    out_eof = 1;
+                }
+            }
+        }
+
+        os_event_t ev;
+        while (os_poll_event(win, &ev)) {
+            dirty = 1;
+            if (ev.type == OS_EVENT_WIN_CLOSE) {
+                if (in_fd >= 0) os_close(in_fd);
+                return 1;
+            } else if (ev.type == OS_EVENT_WIN_MAXIMIZE) {
+                win->width = ev.x;
+                win->height = ev.y;
+                win->client_w = ev.x;
+                win->client_h = ev.y > 33 ? ev.y - 33 : 0;
+            } else if (ev.type == OS_EVENT_KEY_DOWN) {
+                char seq[8];
+                int sn = 0;
+                uint32_t k = ev.param;
+                if (k == 10 || k == 13) {
+                    seq[sn++] = '\n';
+                    /* The child cannot echo on a pipe, so show the newline. */
+                    term_live_newline();
+                    echo_remember('\n');
+                } else if (k == 8) {
+                    seq[sn++] = 127;
+                    if (live_len > 0) live_len--;
+                    live_buf[live_len] = '\0';
+                    term_live_flush();
+                } else if (k == 9) {
+                    seq[sn++] = '\t';
+                    term_live_putc('\t');
+                    echo_remember('\t');
+                } else if (k == OS_KEY_LEFT) {
+                    seq[0] = 27; seq[1] = '['; seq[2] = 'D'; sn = 3;
+                } else if (k == OS_KEY_RIGHT) {
+                    seq[0] = 27; seq[1] = '['; seq[2] = 'C'; sn = 3;
+                } else if (k == OS_KEY_UP) {
+                    seq[0] = 27; seq[1] = '['; seq[2] = 'A'; sn = 3;
+                } else if (k == OS_KEY_DOWN) {
+                    seq[0] = 27; seq[1] = '['; seq[2] = 'B'; sn = 3;
+                } else if (k >= 32 && k <= 126) {
+                    seq[sn++] = (char)k;
+                    term_live_putc((char)k);
+                    echo_remember((char)k);
+                }
+                if (sn > 0 && in_fd >= 0) {
+                    os_write_fd(in_fd, seq, sn);
+                }
+            }
+        }
+
+        /* Reap only once the output is drained, so the last lines are shown. */
+        if (alive) {
+            int st = 0;
+            if (os_waitpid(pid, &st, WNOHANG) == pid) {
+                alive = 0;
+            }
+        }
+
+        if (dirty) {
+            render_terminal(win);
+            os_update_window(win);
+        }
+
+        if (!alive && out_eof) break;
+        if (!dirty) os_sleep(5);
+    }
+    return 0;
+}
+
 /* Execute shell command */
-static void execute_command(const char *cmd) {
+static void execute_command(os_window_t *win, const char *cmd) {
     /* Skip leading whitespace */
     while (*cmd == ' ') cmd++;
     if (*cmd == '\0') return;
@@ -797,16 +1046,18 @@ static void execute_command(const char *cmd) {
         const char *exe_name = argv[0];
         char exec_path[128];
         int pfd[2] = { -1, -1 };
+        int infd[2] = { -1, -1 };
         int spawned = -1;
 
         if (!run_bg) {
             os_pipe(pfd);
+            os_pipe(infd);
         }
 
         if (exe_name[0] == '/') {
             os_strcpy(exec_path, exe_name);
             if (pfd[1] >= 0) {
-                spawned = os_spawn_stdio(exec_path, (const char *const*)argv, -1, pfd[1], pfd[1]);
+                spawned = os_spawn_stdio(exec_path, (const char *const*)argv, infd[0], pfd[1], pfd[1]);
             } else {
                 spawned = os_spawn_args(exec_path, (const char *const*)argv);
             }
@@ -816,7 +1067,7 @@ static void execute_command(const char *cmd) {
             os_strcpy(exec_path + os_strlen(exec_path), exe_name);
             os_strcpy(exec_path + os_strlen(exec_path), ".elf");
             if (pfd[1] >= 0) {
-                spawned = os_spawn_stdio(exec_path, (const char *const*)argv, -1, pfd[1], pfd[1]);
+                spawned = os_spawn_stdio(exec_path, (const char *const*)argv, infd[0], pfd[1], pfd[1]);
             } else {
                 spawned = os_spawn_args(exec_path, (const char *const*)argv);
             }
@@ -825,7 +1076,7 @@ static void execute_command(const char *cmd) {
                 os_strcpy(exec_path, "/");
                 os_strcpy(exec_path + os_strlen(exec_path), exe_name);
                 if (pfd[1] >= 0) {
-                    spawned = os_spawn_stdio(exec_path, (const char *const*)argv, -1, pfd[1], pfd[1]);
+                    spawned = os_spawn_stdio(exec_path, (const char *const*)argv, infd[0], pfd[1], pfd[1]);
                 } else {
                     spawned = os_spawn_args(exec_path, (const char *const*)argv);
                 }
@@ -835,7 +1086,7 @@ static void execute_command(const char *cmd) {
                 os_strcpy(exec_path, "/bin/");
                 os_strcpy(exec_path + os_strlen(exec_path), exe_name);
                 if (pfd[1] >= 0) {
-                    spawned = os_spawn_stdio(exec_path, (const char *const*)argv, -1, pfd[1], pfd[1]);
+                    spawned = os_spawn_stdio(exec_path, (const char *const*)argv, infd[0], pfd[1], pfd[1]);
                 } else {
                     spawned = os_spawn_args(exec_path, (const char *const*)argv);
                 }
@@ -845,7 +1096,7 @@ static void execute_command(const char *cmd) {
                 os_strcpy(exec_path, "/usr/bin/");
                 os_strcpy(exec_path + os_strlen(exec_path), exe_name);
                 if (pfd[1] >= 0) {
-                    spawned = os_spawn_stdio(exec_path, (const char *const*)argv, -1, pfd[1], pfd[1]);
+                    spawned = os_spawn_stdio(exec_path, (const char *const*)argv, infd[0], pfd[1], pfd[1]);
                 } else {
                     spawned = os_spawn_args(exec_path, (const char *const*)argv);
                 }
@@ -862,42 +1113,25 @@ static void execute_command(const char *cmd) {
             os_strcpy(ok_msg + os_strlen(ok_msg), exec_path);
             term_print_line(ok_msg, OS_COLOR_EMERALD_LT);
 
-            /* If foreground: read stdout/stderr from pipe and wait for child */
+            /* If foreground: multiplex stdout with keyboard input */
             if (!run_bg) {
-                if (pfd[1] >= 0) {
-                    os_close(pfd[1]);
+                if (pfd[1] >= 0) os_close(pfd[1]);
+                if (infd[0] >= 0) os_close(infd[0]);
+                live_len = 0;
+                live_buf[0] = '\0';
+                if (run_child_interactive(win, spawned, pfd[0], infd[1])) {
+                    term_quit_request = 1;
                 }
-                char pipe_buf[128];
-                char line_buf[128];
-                int lpos = 0;
-                ssize_t n;
-                while ((n = os_read_fd(pfd[0], pipe_buf, sizeof(pipe_buf))) > 0) {
-                    for (int i = 0; i < n; i++) {
-                        char c = pipe_buf[i];
-                        if (c == '\n') {
-                            line_buf[lpos] = 0;
-                            term_print_line(line_buf, OS_COLOR_SLATE_200);
-                            lpos = 0;
-                        } else if (c != '\r') {
-                            if (lpos < (int)sizeof(line_buf) - 1) {
-                                line_buf[lpos++] = c;
-                            }
-                        }
-                    }
-                }
-                if (lpos > 0) {
-                    line_buf[lpos] = 0;
-                    term_print_line(line_buf, OS_COLOR_SLATE_200);
-                }
-                if (pfd[0] >= 0) {
-                    os_close(pfd[0]);
-                }
+                if (pfd[0] >= 0) os_close(pfd[0]);
+                if (infd[1] >= 0) os_close(infd[1]);
                 int status = 0;
                 os_waitpid(spawned, &status, 0);
             }
         } else {
             if (pfd[0] >= 0) os_close(pfd[0]);
             if (pfd[1] >= 0) os_close(pfd[1]);
+            if (infd[0] >= 0) os_close(infd[0]);
+            if (infd[1] >= 0) os_close(infd[1]);
             char err[80];
             os_strcpy(err, "Command not found: '");
             os_strcpy(err + os_strlen(err), exe_name);
@@ -1355,8 +1589,12 @@ int main(int argc, char **argv) {
                     input_len = 0;
                     input_buf[0] = '\0';
 
-                    execute_command(cmd_copy);
+                    execute_command(&win, cmd_copy);
                     needs_redraw = 1;
+                    if (term_quit_request) {
+                        running = 0;
+                        break;
+                    }
                 } else if (key == 8) {
                     /* Backspace */
                     if (input_len > 0) {

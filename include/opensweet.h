@@ -71,6 +71,7 @@ typedef _Bool bool;
 #define SYS_SYMLINK        35
 #define SYS_NET_INFO       36
 #define SYS_GUI_TOGGLE_PIP 37
+#define SYS_POLL           38
 
 typedef struct {
     uint8_t  present;
@@ -448,6 +449,26 @@ static inline int64_t os_lseek(int fd, int64_t offset, int whence) {
 static inline int os_pipe(int pipefd[2]) {
     if (!pipefd) return -1;
     return (int)os_syscall1(SYS_PIPE, (int64_t)pipefd);
+}
+
+/* ---- poll ---- */
+#define OS_POLLIN   0x001
+#define OS_POLLOUT  0x004
+#define OS_POLLERR  0x008
+#define OS_POLLHUP  0x010
+#define OS_POLLNVAL 0x020
+
+typedef struct os_pollfd {
+    int   fd;
+    short events;
+    short revents;
+} os_pollfd_t;
+
+/* Wait until one of the descriptors is ready.  timeout_ms = -1 waits forever.
+ * Returns the number of ready descriptors, or 0 when the timeout expired. */
+static inline int os_poll(os_pollfd_t *fds, int nfds, int timeout_ms) {
+    if (!fds || nfds < 0) return -1;
+    return (int)os_syscall3(SYS_POLL, (int64_t)fds, nfds, timeout_ms);
 }
 
 static inline int os_dup2(int oldfd, int newfd) {

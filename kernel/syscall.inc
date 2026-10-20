@@ -37,6 +37,7 @@ SYS_RMDIR          = 34
 SYS_SYMLINK        = 35
 SYS_NET_INFO       = 36
 SYS_GUI_TOGGLE_PIP = 37
+SYS_POLL           = 38
 
 align 16
 sys_user_rsp       dq 0
@@ -154,8 +155,18 @@ syscall_entry:
     ; 3. Establish kernel image base in R15
     mov r15, 0xFFFF800000010000
 
-    ; 4. Re-enable interrupts for kernel syscall execution
-    sti
+    ; 4. Interrupts stay OFF for the duration of the syscall.
+    ;
+    ; The kernel keeps its filesystem and ATA state in a single set of globals
+    ; (ext4_nbuf/ext4_bbuf/ext4_inode/wbuf, the ATA command registers).  With
+    ; IF=1 a timer tick could preempt a syscall in the middle of an ext4
+    ; operation; the next task would then run its own ext4 operation, clobber
+    ; those globals and interleave ATA commands.  The visible symptom was an
+    ; intermittently truncated dpkg-deb extraction (stale directory bytes read
+    ; back as an inode_table block number, then "No valid PT_LOAD segments").
+    ; Blocking syscalls still schedule: task_sleep does an explicit `int 0x31`,
+    ; which runs regardless of IF, and the pipe paths re-enable interrupts
+    ; around their own sleeps.
 
     ; Check process ABI type (Native vs Linux)
 if defined CONFIG_LINUX_COMPAT
@@ -235,6 +246,8 @@ end if
     je .do_net_info
     cmp eax, SYS_GUI_TOGGLE_PIP
     je .do_gui_toggle_pip
+    cmp eax, SYS_POLL
+    je .do_poll
 
 if defined CONFIG_LINUX_COMPAT
     ; Fallback to Linux ABI for undeclared syscall numbers (marked distinctly
@@ -485,6 +498,11 @@ end if
 .pip_focus_sc:
     call wm_toggle_pip_focused
     xor eax, eax
+    jmp .syscall_ret
+
+.do_poll:
+    ; RDI = struct os_pollfd[], RSI = nfds, RDX = timeout ms (-1 = forever)
+    call vfs_poll
     jmp .syscall_ret
 
 .do_get_time:
