@@ -405,30 +405,50 @@ $x11FileDefs = @(
 )
 
 $x11Extracted = @()
+$x11Plan = @()
+$x11TotalBlocks = 0
 foreach ($xf in $x11FileDefs) {
     $p = Join-Path $x11Dir $xf.Name
     if (Test-Path $p) {
         $b = [IO.File]::ReadAllBytes($p)
         $blks = [int][Math]::Ceiling($b.Length / 1024.0)
-        ExtentLeaf ($itable + ($xf.Ino - 1) * 128) $curX11Block $blks $b.Length $xf.Mode
-        $x11Extracted += @{ Name = $xf.Name; Ino = $xf.Ino; StartBlock = $curX11Block; Blocks = $blks; Bytes = $b; IsSymlink = $false }
-        $curX11Block += $blks
+        $x11Plan += @{ Def = $xf; Bytes = $b; Blocks = $blks }
+        $x11TotalBlocks += $blks
     }
 }
-
-$lastAllocatedGrp0Block = $curX11Block
-
+# Group 1 metadata lives at blocks 8193..8204 (backup superblock, backup GDT,
+# block/inode bitmaps, inode table).  When the X11 libraries no longer fit
+# into group 0, start them after that metadata instead of writing file data
+# on top of it.
+if ($curX11Block + $x11TotalBlocks -gt 8192 -and $curX11Block -lt 8205) {
+    $curX11Block = 8205
+}
+foreach ($xp in $x11Plan) {
+    $xf = $xp.Def
+    $b = $xp.Bytes
+    $blks = $xp.Blocks
+    ExtentLeaf ($itable + ($xf.Ino - 1) * 128) $curX11Block $blks $b.Length $xf.Mode
+    $x11Extracted += @{ Name = $xf.Name; Ino = $xf.Ino; StartBlock = $curX11Block; Blocks = $blks; Bytes = $b; IsSymlink = $false }
+    $curX11Block += $blks
+}
 
 $wadPath = Join-Path $PSScriptRoot "user\doomgeneric\doom1.wad"
 $hasWad = $includeDoom -and (Test-Path $wadPath)
 $wadBlocks = 0
-$wadStartBlock = 8205
+# The WAD goes after every other file so it can never land on top of a
+# library that outgrew the old hard-coded start block.
+$wadStartBlock = $curX11Block
 if ($hasWad) {
     $wadBytes = [IO.File]::ReadAllBytes($wadPath)
     $wadBlocks = [int][Math]::Ceiling($wadBytes.Length / 1024.0)
     # inode 20 = doom1.wad -> blocks wadStartBlock..(wadStartBlock + wadBlocks - 1)
     ExtentLeaf ($itable + 19 * 128) $wadStartBlock $wadBlocks $wadBytes.Length 0x81A4
+    $curX11Block += $wadBlocks
 }
+if ($curX11Block -gt 16384) {
+    throw "make-ext4: file data overflows the 16MB image ($curX11Block blocks > 16384)"
+}
+$lastAllocatedGrp0Block = $curX11Block
 
 # ---- root dir data @ block 20 ----
 $d = 20 * $BS
@@ -699,20 +719,28 @@ $totalAllocatedBlocksGrp0 = if ($x11Extracted.Count -gt 0) { $lastAllocatedGrp0B
 # Root dir: block 20
 # User files: blocks 21 up to ($totalAllocatedBlocksGrp0 - 1)
 [Array]::Clear($img, 3 * $BS, $BS)
-$allocatedBlocksGrp0 = [System.Collections.Generic.HashSet[int]]::new()
-$allocatedBlocksGrp0.Add(1) | Out-Null
-$allocatedBlocksGrp0.Add(2) | Out-Null
-$allocatedBlocksGrp0.Add(3) | Out-Null
-$allocatedBlocksGrp0.Add(4) | Out-Null
-for ($b = 10; $b -le 17; $b++) { $allocatedBlocksGrp0.Add($b) | Out-Null }
-$allocatedBlocksGrp0.Add(20) | Out-Null
-for ($b = 21; $b -lt $totalAllocatedBlocksGrp0; $b++) { $allocatedBlocksGrp0.Add($b) | Out-Null }
+[Array]::Clear($img, 8195 * $BS, $BS)
+$allocatedBlocks = [System.Collections.Generic.HashSet[int]]::new()
+foreach ($b in 1, 2, 3, 4, 20) { $allocatedBlocks.Add($b) | Out-Null }
+for ($b = 10; $b -le 17; $b++) { $allocatedBlocks.Add($b) | Out-Null }
+for ($b = 21; $b -lt $totalAllocatedBlocksGrp0; $b++) { $allocatedBlocks.Add($b) | Out-Null }
+# Group 1 metadata: backup superblock, backup GDT, block bitmap, inode bitmap,
+# inode table.  Always marked used, never handed out to file data.
+for ($b = 8193; $b -le 8204; $b++) { $allocatedBlocks.Add($b) | Out-Null }
 
-foreach ($b in $allocatedBlocksGrp0) {
-    $relBlock = $b - 1
+# Each group bitmap only describes its own blocks: group 0 covers blocks
+# 1..8192 (bit i = block i+1), group 1 covers 8193..16383 (bit i = block i+8193).
+foreach ($b in $allocatedBlocks) {
+    if ($b -le 8192) {
+        $relBlock = $b - 1
+        $bitmap = 3
+    } else {
+        $relBlock = $b - 8193
+        $bitmap = 8195
+    }
     $byteIdx = $relBlock -shr 3
     $bitIdx  = $relBlock -band 7
-    $img[(3 * $BS) + $byteIdx] = $img[(3 * $BS) + $byteIdx] -bor (1 -shl $bitIdx)
+    $img[($bitmap * $BS) + $byteIdx] = $img[($bitmap * $BS) + $byteIdx] -bor (1 -shl $bitIdx)
 }
 
 # Inode bitmap at block 4:
@@ -742,27 +770,7 @@ for ($i = 8; $i -lt $BS; $i++) {
     $img[(4 * $BS) + $i] = 0xFF
 }
 
-# Group 1 block bitmap at block 8195:
-# In Group 1, blocks 8193..16383 correspond to relative bits 0..8190 (8191 blocks).
-# Metadata blocks of Group 1: 8193(SB), 8194(GDT), 8195(blk_bm), 8196(ino_bm), 8197..8204(itable, 8 blocks)
-# Total metadata = 12 blocks (relative blocks 0..11 in Group 1)
-# wad file: blocks wadStartBlock..(wadStartBlock + wadBlocks - 1)
-[Array]::Clear($img, 8195 * $BS, $BS)
-$allocatedBlocksGrp1Count = 12
-for ($b = 0; $b -lt 12; $b++) {
-    $byteIdx = $b -shr 3
-    $bitIdx  = $b -band 7
-    $img[(8195 * $BS) + $byteIdx] = $img[(8195 * $BS) + $byteIdx] -bor (1 -shl $bitIdx)
-}
-if ($hasWad) {
-    for ($b = 0; $b -lt $wadBlocks; $b++) {
-        $relBlock = ($wadStartBlock - 8193) + $b
-        $byteIdx = $relBlock -shr 3
-        $bitIdx  = $relBlock -band 7
-        $img[(8195 * $BS) + $byteIdx] = $img[(8195 * $BS) + $byteIdx] -bor (1 -shl $bitIdx)
-        $allocatedBlocksGrp1Count++
-    }
-}
+# Group 1 block bitmap (block 8195) is filled above together with group 0.
 # Bit 8191 in Group 1 is beyond the 16384 total blocks (since Group 1 has 8191 blocks: 8193..16383).
 # Set padding bit 8191 (bit 7 of byte 1023)
 $img[(8195 * $BS) + 1023] = $img[(8195 * $BS) + 1023] -bor 0x80
@@ -773,8 +781,8 @@ for ($i = 8; $i -lt $BS; $i++) {
     $img[(8196 * $BS) + $i] = 0xFF
 }
 
-$freeBlocksGrp0 = 8192 - $allocatedBlocksGrp0.Count
-$freeBlocksGrp1 = 8191 - $allocatedBlocksGrp1Count
+$freeBlocksGrp0 = 8192 - @($allocatedBlocks | Where-Object { $_ -le 8192 }).Count
+$freeBlocksGrp1 = 8191 - @($allocatedBlocks | Where-Object { $_ -gt 8192 }).Count
 $freeBlocksTotal = $freeBlocksGrp0 + $freeBlocksGrp1
 
 $freeInodesGrp0 = 64 - $usedInoCountGrp0
