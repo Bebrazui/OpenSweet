@@ -3996,10 +3996,16 @@ e4t_left    dd 0
 e4t_name    rb 256
 e4t_path    rb 256
 
+align 4
+cwd_state:
 ext4_cwd_inode dd 2
-ext4_lookup_depth dd 0
+; Per-process cwd state: the scheduler saves/restores this block into the
+; task's TCB on every switch, so one process's chdir() never leaks into
+; another.  Must stay contiguous and match TCB_CWD_STATE (72 bytes).
+proc_cwd_pid   dd -1                    ; -1 = the cwd is not in procfs
 ext4_cwd_path  db "/", 0
                rb 62
+ext4_lookup_depth dd 0
 
 ; ext4 file_type -> linux dirent64 d_type mapping:
 ; ext4: 0=unknown, 1=REG, 2=DIR, 3=CHR, 4=BLK, 5=FIFO, 6=SOCK, 7=LNK

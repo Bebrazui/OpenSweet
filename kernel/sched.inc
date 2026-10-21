@@ -70,7 +70,8 @@ TCB_SUID             = 0xAB0          ; uint32: saved set-UID (0 = root)
 TCB_SGID             = 0xAB4          ; uint32: saved set-GID (0 = root)
 TCB_UMASK            = 0xAB8          ; uint32: file creation mask (default 022 = 0x12)
 TCB_MMAP_NEXT        = 0xABC          ; uint32: per-process mmap bump pointer (0 = none yet)
-TCB_SIZE             = 2752           ; 0xAC0 (16-byte aligned)
+TCB_CWD_STATE        = 0xAC0          ; 72 bytes: per-process cwd (inode, proc pid, path)
+TCB_SIZE             = 0xB10          ; 2832 (16-byte aligned)
 
 TASK_STACK_SIZE = 8192                ; 8 KB stack per task
 
@@ -567,6 +568,7 @@ task_finalize_user:
     mov dword [rdi + TCB_SUID], 0
     mov dword [rdi + TCB_SGID], 0
     mov dword [rdi + TCB_UMASK], 0x12  ; 022 octal (default umask)
+    call task_cwd_store                 ; new child starts in the caller's cwd
     mov [rdi + TCB_USER_RSP], r11
     ; Per-process mmap zone bump pointer staged by the image loader.
     mov eax, dword [r15 + sys_spawn_mmap_next - kmain]
@@ -957,6 +959,8 @@ sched_tick:
     or rax, rdx
     mov [rsi + TCB_FS_BASE], rax
     fxsave [rsi + TCB_FXSAVE]
+    mov rdi, rsi
+    call task_cwd_store                 ; remember this process's cwd
 
     ; Pick next task in circular order
     mov edx, [r15 + sched_curr_task - kmain]
@@ -1012,12 +1016,50 @@ sched_tick:
 
     ; Restore incoming task's FPU/SSE context
     fxrstor [rdi + TCB_FXSAVE]
+    call task_cwd_load                  ; switch to the incoming process's cwd
 
     ; Load new RSP!
     mov rsp, [rdi + TCB_RSP]
 
 .sched_no_switch:
     jmp sched_restore
+
+; ==============================================================================
+; task_cwd_store / task_cwd_load: move the 72-byte per-process cwd block
+;   between the globals (the running process's view) and a task's TCB.
+;   Explicit loads/stores instead of rep movs: a user context interrupted
+;   with the direction flag set must not reverse the copy.
+;   RDI = TCB; every register is preserved.
+; ==============================================================================
+task_cwd_store:
+    push rax
+    push rsi
+    push rdi
+    lea rsi, [r15 + cwd_state - kmain]
+    add rdi, TCB_CWD_STATE
+    repeat 18
+        mov eax, [rsi + (% - 1) * 4]
+        mov [rdi + (% - 1) * 4], eax
+    end repeat
+    pop rdi
+    pop rsi
+    pop rax
+    ret
+
+task_cwd_load:
+    push rax
+    push rsi
+    push rdi
+    lea rsi, [rdi + TCB_CWD_STATE]
+    lea rdi, [r15 + cwd_state - kmain]
+    repeat 18
+        mov eax, [rsi + (% - 1) * 4]
+        mov [rdi + (% - 1) * 4], eax
+    end repeat
+    pop rdi
+    pop rsi
+    pop rax
+    ret
 
 ; ==============================================================================
 ; isr_yield: Software interrupt 0x31 handler (task_yield / task_sleep)
@@ -1052,6 +1094,8 @@ isr_yield:
     or rax, rdx
     mov [rsi + TCB_FS_BASE], rax
     fxsave [rsi + TCB_FXSAVE]
+    mov rdi, rsi
+    call task_cwd_store                 ; remember this process's cwd
 
     ; If current task was RUNNING, set to READY (if SLEEPING, leave as SLEEPING)
     cmp dword [rsi + TCB_STATE], TASK_RUNNING
@@ -1112,6 +1156,7 @@ isr_yield:
 
     ; Restore incoming task's FPU/SSE context
     fxrstor [rdi + TCB_FXSAVE]
+    call task_cwd_load                  ; switch to the incoming process's cwd
 
     ; Switch to next task's stack!
     mov rsp, [rdi + TCB_RSP]

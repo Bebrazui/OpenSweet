@@ -895,7 +895,6 @@ proc_dir_read:
 ; ------------------------------------------------------------------------------
 align 8
 proc_len  dd 0
-proc_cwd_pid dd -1                      ; -1 = the cwd is not in procfs
 proc_buf  rb PROC_BUF_SIZE
 
 ; path -> id (16 bytes per entry: name pointer, id; a null pointer ends it)

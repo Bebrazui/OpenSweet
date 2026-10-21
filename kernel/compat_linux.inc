@@ -3330,13 +3330,16 @@ KTERMIOS_SIZE = 36
     mov ecx, 512 / 8
     rep movsq
 
-    ; Inherit signal handlers and mask
+    ; Inherit signal handlers and mask (stop before the cwd block: it is
+    ; seeded from the live globals below, the TCB copy may be stale)
     lea rsi, [rbp + TCB_SIG_PENDING]
     lea rdi, [r13 + TCB_SIG_PENDING]
-    mov ecx, (TCB_SIZE - TCB_SIG_PENDING) / 8
+    mov ecx, (TCB_CWD_STATE - TCB_SIG_PENDING) / 8
     rep movsq
     mov dword [r13 + TCB_ALARM_MS], 0
     mov qword [r13 + TCB_FUTEX_ADDR], 0
+    mov rdi, r13
+    call task_cwd_store
 
     ; 3. TLS setup (CLONE_SETTLS = 0x00080000)
     ; In syscall frame: [rbx + 32] = flags, [rbx + 24] = tls (r8)
@@ -3597,9 +3600,11 @@ KTERMIOS_SIZE = 36
     rep movsq
     lea rsi, [rbp + TCB_SIG_PENDING]  ; pending/blocked/sender + action table
     lea rdi, [r13 + TCB_SIG_PENDING]  ; (fork inherits handlers, per POSIX)
-    mov ecx, (TCB_SIZE - TCB_SIG_PENDING) / 8
+    mov ecx, (TCB_CWD_STATE - TCB_SIG_PENDING) / 8
     rep movsq
     mov dword [r13 + TCB_ALARM_MS], 0 ; alarm(2) is NOT inherited (POSIX)
+    mov rdi, r13
+    call task_cwd_store               ; child inherits the caller's cwd
 
     ; 5. Child kernel stack + initial iretq frame (parent register snapshot)
     mov eax, r12d
