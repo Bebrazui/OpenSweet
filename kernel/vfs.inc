@@ -44,6 +44,7 @@ PIPE_STRUCT_SIZE = 16 + PIPE_BUF_SIZE
 align 16
 task_fd_tables rb (MAX_TASKS * MAX_FDS_PER_TASK * FD_ENTRY_SIZE)
 pipe_table     rb (MAX_PIPES * PIPE_STRUCT_SIZE)
+vfs_path_trusted dd 0               ; 1 = the next path came from the kernel
 
 ; ==============================================================================
 ; vfs_init_task_fds: Initialize standard streams 0, 1, 2 and clear the rest
@@ -181,10 +182,16 @@ vfs_open:
     mov r14d, edx                       ; mode
 
     ; Validate path pointer (256 bytes max)
+    cmp dword [r15 + vfs_path_trusted - kmain], 0
+    je .open_validate
+    mov dword [r15 + vfs_path_trusted - kmain], 0
+    jmp .open_validated
+.open_validate:
     mov rdi, r12
     mov rsi, 256
     call sys_validate_user_ptr
     jc .open_fail
+.open_validated:
 
     ; Find free FD in current task (3..15)
     mov eax, [r15 + sched_curr_task - kmain]
@@ -260,6 +267,10 @@ vfs_open:
     test eax, eax
     jz .not_dev
     js .is_proc_dir
+    cmp eax, PROC_PID_BASE
+    jb .is_proc_file                    ; the static /proc files
+    cmp eax, PROC_PID_STAT
+    jb .is_proc_pid_dir
 
 .is_proc_file:
     mov byte [r14 + 0], FD_TYPE_PROCFS
@@ -273,10 +284,16 @@ vfs_open:
     mov [r14 + 8], eax
     jmp .open_finish
 
+.is_proc_pid_dir:
+    sub eax, PROC_PID_BASE
+    mov word [r14 + 2], ax              ; the pid lives in the entry's inode slot
+    jmp .is_proc_dir_pid
+
 .is_proc_dir:
+    mov word [r14 + 2], 0               ; /proc itself
+.is_proc_dir_pid:
     mov byte [r14 + 0], FD_TYPE_PROCDIR
     mov byte [r14 + 1], r13b
-    mov word [r14 + 2], 0
     mov dword [r14 + 4], 0
     mov dword [r14 + 8], 0
     jmp .open_finish
@@ -457,10 +474,16 @@ vfs_stat_path:
     mov esi, 144
     call sys_validate_user_ptr
     jc .statp_efault
+    cmp dword [r15 + vfs_path_trusted - kmain], 0
+    je .statp_validate_path
+    mov dword [r15 + vfs_path_trusted - kmain], 0
+    jmp .statp_path_ok
+.statp_validate_path:
     mov rdi, r12
     mov esi, 64
     call sys_validate_user_ptr
     jc .statp_efault
+.statp_path_ok:
     mov rsi, r12
     call proc_find
     test eax, eax
@@ -543,7 +566,10 @@ vfs_stat_fd:
     movzx eax, word [rbx + 2]
     jmp .statf_proc_fill
 .statf_proc_dir:
-    xor eax, eax
+    movzx eax, word [rbx + 2]
+    test eax, eax
+    jz .statf_proc_fill
+    add eax, PROC_PID_BASE
 .statf_proc_fill:
     sub rsp, 144
     mov rdi, rsp

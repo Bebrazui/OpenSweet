@@ -1246,6 +1246,55 @@ sys_handler_chdir:
     mov byte [rdi], 0
 .cd_cp_done:
 
+    ; /proc and /proc/<pid> are virtual directories: keep the cwd in the
+    ; procfs variables instead of the ext4 inode.
+    lea rsi, [rsp]
+    call proc_find
+    cmp eax, -1
+    je .cd_proc_root
+    cmp eax, PROC_PID_BASE
+    jb .cd_ext4
+    cmp eax, PROC_PID_STAT
+    jae .cd_ext4
+
+    and eax, PROC_PID_MASK
+    mov [r15 + proc_cwd_pid - kmain], eax
+    mov r8d, eax
+    lea rdi, [r15 + ext4_cwd_path - kmain]
+    mov dword [rdi], 0x6F72702F         ; "/pro"
+    mov word [rdi + 4], 0x2F63          ; "c/"
+    add rdi, 6
+    lea rsi, [r15 + ext4_cwd_path - kmain + 56]
+    mov byte [rsi], 0
+    mov eax, r8d
+    mov ecx, 10
+.cd_itoa:
+    xor edx, edx
+    div ecx
+    add dl, '0'
+    dec rsi
+    mov [rsi], dl
+    test eax, eax
+    jnz .cd_itoa
+.cd_itoa_copy:
+    mov al, [rsi]
+    test al, al
+    jz .cd_itoa_done
+    stosb
+    inc rsi
+    jmp .cd_itoa_copy
+.cd_itoa_done:
+    mov byte [rdi], 0
+    jmp .cd_ok
+
+.cd_proc_root:
+    mov dword [r15 + proc_cwd_pid - kmain], 0
+    lea rdi, [r15 + ext4_cwd_path - kmain]
+    mov dword [rdi], 0x6F72702F         ; "/pro"
+    mov word [rdi + 4], 0x0063          ; "c"
+    jmp .cd_ok
+
+.cd_ext4:
     lea rsi, [rsp]
     pushfq
     cli
@@ -1256,7 +1305,9 @@ sys_handler_chdir:
     popfq
     test bl, bl
     jnz .cd_err
+    mov dword [r15 + proc_cwd_pid - kmain], -1
 
+.cd_ok:
     xor eax, eax                        ; success = 0
     add rsp, 64
     pop rdi

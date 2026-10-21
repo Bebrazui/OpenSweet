@@ -1272,6 +1272,103 @@ vfs_release_tgid_locks:
     pop rbx
     ret
 
+; ------------------------------------------------------------------------------
+; l_proc_relpath: RDI = path, RSI = 256-byte scratch.
+; While the cwd is a procfs directory, a relative path is resolved as
+; "/proc[/<pid>]/<path>".  RAX = the path to use (original, or the scratch).
+; ------------------------------------------------------------------------------
+l_proc_relpath:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    sub rsp, 16
+
+    mov rax, rdi
+    cmp byte [rdi], '/'
+    je .prp_out
+    mov r8d, [r15 + proc_cwd_pid - kmain]
+    cmp r8d, -1
+    je .prp_out
+
+    mov r11, rdi                        ; original path
+    mov rbx, rsi                        ; scratch base
+    lea r10, [rsi + 240]
+    mov rdi, rsi
+    lea rsi, [r15 + str_l_procroot - kmain]
+.prp_root:
+    lodsb
+    test al, al
+    jz .prp_pid
+    stosb
+    jmp .prp_root
+.prp_pid:
+    test r8d, r8d
+    jz .prp_slash
+    cmp rdi, r10
+    jae .prp_trunc
+    mov al, '/'
+    stosb
+    mov eax, r8d
+    lea r9, [rsp + 15]
+    mov byte [r9], 0
+    mov ecx, 10
+.prp_itoa:
+    xor edx, edx
+    div ecx
+    add dl, '0'
+    dec r9
+    mov [r9], dl
+    test eax, eax
+    jnz .prp_itoa
+.prp_digits:
+    mov al, [r9]
+    test al, al
+    jz .prp_slash
+    stosb
+    inc r9
+    jmp .prp_digits
+.prp_slash:
+    cmp rdi, r10
+    jae .prp_trunc
+    mov al, '/'
+    stosb
+    mov rsi, r11
+.prp_path:
+    lodsb
+    test al, al
+    jz .prp_end
+    cmp rdi, r10
+    jae .prp_trunc
+    stosb
+    jmp .prp_path
+.prp_end:
+    mov byte [rdi], 0
+    mov dword [r15 + vfs_path_trusted - kmain], 1
+    mov rax, rbx
+    jmp .prp_out
+.prp_trunc:
+    mov byte [rdi], 0
+    mov dword [r15 + vfs_path_trusted - kmain], 1
+    mov rax, rbx
+.prp_out:
+    add rsp, 16
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
 ; ==============================================================================
 ; linux_syscall_dispatch: Dispatch Linux x86_64 syscall
 ; In: RAX = syscall number
@@ -2616,23 +2713,27 @@ KTERMIOS_SIZE = 36
 
 .l_open:
     ; RDI = pathname, RSI = flags, RDX = mode
-    push rdi
+    push rbx
+    push r12
+    push r13
+    mov r12, rdi                        ; pathname
+    mov r13d, esi                       ; flags
+    mov ebx, edx                        ; mode
     push rsi
-    push rdx
     lea rsi, [r15 + str_l_open_dbg - kmain]
     call puts
-    pop rdx
-    pop rsi
-    pop rdi
-    push rdi
-    push rsi
-    push rdx
-    mov rsi, rdi
+    mov rsi, r12
     call puts
-    pop rdx
     pop rsi
-    pop rdi
+    sub rsp, 256
+    mov rdi, r12
+    lea rsi, [rsp]
+    call l_proc_relpath
+    mov rdi, rax
+    mov rsi, r13
+    mov rdx, rbx
     call vfs_open
+    add rsp, 256
     push rax
     lea rsi, [r15 + str_openat_res - kmain]
     call puts
@@ -2646,26 +2747,35 @@ KTERMIOS_SIZE = 36
     jne .l_open_ret
     mov rax, LINUX_ENOENT
 .l_open_ret:
+    pop r13
+    pop r12
+    pop rbx
     ret
 
 .l_openat:
     ; RDI = dirfd, RSI = pathname, RDX = flags, R10 = mode
-    push rsi
-    push rdx
-    push r10
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov r12, rsi                        ; pathname
+    mov r13d, edx                       ; flags
+    mov ebx, r10d                       ; mode
     push rsi
     lea rsi, [r15 + str_openat_log - kmain]
     call puts
-    pop rsi
+    mov rsi, r12
     call puts
-    pop r10
-    pop rdx
     pop rsi
-
-    mov rdi, rsi                     ; pathname
-    mov rsi, rdx                     ; flags
-    mov rdx, r10                     ; mode
+    sub rsp, 256
+    mov rdi, r12
+    lea rsi, [rsp]
+    call l_proc_relpath
+    mov rdi, rax
+    mov rsi, r13
+    mov rdx, rbx
     call vfs_open
+    add rsp, 256
     cmp rax, -1
     jne .l_openat_ret
     mov rax, LINUX_ENOENT
@@ -2679,6 +2789,10 @@ KTERMIOS_SIZE = 36
     mov al, 10
     call putc
     pop rax
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
     ret
 
 .l_close:
@@ -4481,17 +4595,27 @@ KTERMIOS_SIZE = 36
 ; .l_fstat (Linux #5): RDI = fd, RSI = statbuf
 ; ------------------------------------------------------------------------------
 .l_stat:
+    push r12
+    push r13
+    mov r12, rdi                        ; path
+    mov r13, rsi                        ; statbuf
+    sub rsp, 256
+    mov rsi, rsp
+    call l_proc_relpath
+    mov rdi, rax
+    mov rsi, r13
     call vfs_stat_path
+    add rsp, 256
+    pop r13
+    pop r12
     ret
 .l_lstat:
-    call vfs_stat_path
-    ret
+    jmp .l_stat
 .l_newfstatat:
     ; RDI = dirfd (ignored), RSI = pathname, RDX = statbuf, R10 = flags
     mov rdi, rsi                     ; pathname
     mov rsi, rdx                     ; statbuf
-    call vfs_stat_path
-    ret
+    jmp .l_stat
 .l_fstat:
     push rsi                            ; [rsp + 8] = statbuf
     push rdi                            ; [rsp + 0] = fd
@@ -4592,6 +4716,7 @@ KTERMIOS_SIZE = 36
     mov rdi, r13
     mov rsi, [rsp]
     mov edx, [rbx + 4]
+    movzx ecx, word [rbx + 2]           ; pid (0 = the /proc root)
     call proc_dir_read
     mov [rbx + 4], edx
     jmp .l_gd_done
@@ -6486,6 +6611,7 @@ str_l_sigkill db "[Linux ABI] Terminated by signal ", 0
 str_l_write_dbg db "[Linux ABI] write: fd=", 0
 str_l_write_dbg2 db " -> ", 0
 str_l_open_dbg db "[Linux ABI] open: ", 0
+str_l_procroot db "/proc", 0
 str_l_read_dbg db "[Linux ABI] read: fd=", 0
 str_l_mmap_dbg db "[Linux ABI] mmap: ", 0
 str_l_munmap_dbg db "[Linux ABI] munmap: ", 0
