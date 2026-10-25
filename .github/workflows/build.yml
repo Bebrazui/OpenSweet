@@ -49,12 +49,17 @@ jobs:
           # flat assembler prints its version banner and exits non-zero with no input file;
           # the banner is the assertion here.
 
-      - name: Assemble boot sector, stage 2 and kernel
+      - name: Assemble kernel, stage 2 and boot sector
         run: |
           mkdir -p build
-          "$FASM_BIN" arch/x86_64/boot/boot.asm       build/boot.bin
-          "$FASM_BIN" arch/x86_64/boot/stage2.asm     build/stage2.bin
+          # Same order as build.cmd: the kernel is assembled first because
+          # stage2 needs its exact sector count (-d KERNEL_SECTORS=<n>).
           "$FASM_BIN" arch/x86_64/kernel/kernel.asm   build/kernel.bin
+          ksize=$(stat -c%s build/kernel.bin)
+          ksec=$(( (ksize + 511) / 512 ))
+          echo "kernel.bin=$ksize bytes ($ksec sectors)"
+          "$FASM_BIN" -d KERNEL_SECTORS=$ksec arch/x86_64/boot/stage2.asm build/stage2.bin
+          "$FASM_BIN" arch/x86_64/boot/boot.asm       build/boot.bin
 
       - name: Verify artifacts
         run: |
@@ -64,7 +69,9 @@ jobs:
           echo "boot.bin=$boot  stage2.bin=$stage2  kernel.bin=$kernel"
           [ "$boot" -eq 512 ] || { echo "boot.bin must be exactly 512 bytes"; exit 1; }
           [ "$stage2" -gt 0 ] || { echo "stage2.bin is empty"; exit 1; }
+          [ "$stage2" -le 16384 ] || { echo "stage2.bin must fit the 16KB slot in os.img"; exit 1; }
           [ "$kernel" -gt 65536 ] || { echo "kernel.bin is suspiciously small"; exit 1; }
+          [ "$kernel" -le 585728 ] || { echo "kernel.bin exceeds the 585728-byte (0x8F000) load limit"; exit 1; }
 
       - uses: actions/upload-artifact@v4
         with:

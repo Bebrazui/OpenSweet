@@ -4,11 +4,12 @@
 KERNEL_LBA     = 33                  ; LBA0=MBR, LBA1..32=stage2(16KB)
 KERNEL_ADDR    = 0x10000
 ; Number of 512-byte sectors to load for the kernel.  build.cmd passes the
-; real value on the command line (-d KERNEL_SECTORS=<n>) so the kernel can
-; never be silently truncated; the default is only a fallback.
+; real value on the command line (-d KERNEL_SECTORS=<n>) so a bigger kernel
+; can never be silently truncated; there is deliberately no default.
 if ~ defined KERNEL_SECTORS
-    KERNEL_SECTORS = 920
+    display 'stage2: pass -d KERNEL_SECTORS=<sectors> (build.cmd computes it)', 13, 10
 end if
+assert defined KERNEL_SECTORS
 
 org 0x0600
 use16
