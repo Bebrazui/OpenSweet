@@ -437,14 +437,125 @@ $hasWad = $includeDoom -and (Test-Path $wadPath)
 $wadBlocks = 0
 # The WAD goes after every other file so it can never land on top of a
 # library that outgrew the old hard-coded start block.
-$wadStartBlock = $curX11Block
 if ($hasWad) {
     $wadBytes = [IO.File]::ReadAllBytes($wadPath)
     $wadBlocks = [int][Math]::Ceiling($wadBytes.Length / 1024.0)
-    # inode 20 = doom1.wad -> blocks wadStartBlock..(wadStartBlock + wadBlocks - 1)
+    # Group 1 metadata lives at blocks 8193..8204; never let file data land on it.
+    if ($curX11Block -lt 8205 -and ($curX11Block + $wadBlocks) -gt 8192) { $curX11Block = 8205 }
+    $wadStartBlock = $curX11Block
+    # inode 20 = doom1.wad -> blocks wadStartBlock..(wadStartBlock + $wadBlocks - 1)
     ExtentLeaf ($itable + 19 * 128) $wadStartBlock $wadBlocks $wadBytes.Length 0x81A4
     $curX11Block += $wadBlocks
 }
+
+# ---- real Debian binaries ----
+# /bin still holds the busybox hardlinks as a fallback, but every name listed
+# here is repointed at the genuine Debian program (extracted under build\deb_*)
+# so the system runs the same userland a normal Debian install does.
+$realBinSources = @(
+    @{ Name = 'ls';       Path = 'build\deb_coreutils\bin\ls' },
+    @{ Name = 'cat';      Path = 'build\deb_coreutils\bin\cat' },
+    @{ Name = 'cp';       Path = 'build\deb_coreutils\bin\cp' },
+    @{ Name = 'mv';       Path = 'build\deb_coreutils\bin\mv' },
+    @{ Name = 'rm';       Path = 'build\deb_coreutils\bin\rm' },
+    @{ Name = 'mkdir';    Path = 'build\deb_coreutils\bin\mkdir' },
+    @{ Name = 'rmdir';    Path = 'build\deb_coreutils\bin\rmdir' },
+    @{ Name = 'touch';    Path = 'build\deb_coreutils\bin\touch' },
+    @{ Name = 'chmod';    Path = 'build\deb_coreutils\bin\chmod' },
+    @{ Name = 'chown';    Path = 'build\deb_coreutils\bin\chown' },
+    @{ Name = 'ln';       Path = 'build\deb_coreutils\bin\ln' },
+    @{ Name = 'stat';     Path = 'build\deb_coreutils\bin\stat' },
+    @{ Name = 'date';     Path = 'build\deb_coreutils\bin\date' },
+    @{ Name = 'env';      Path = 'build\deb_coreutils\bin\env' },
+    @{ Name = 'head';     Path = 'build\deb_coreutils\bin\head' },
+    @{ Name = 'tail';     Path = 'build\deb_coreutils\bin\tail' },
+    @{ Name = 'wc';       Path = 'build\deb_coreutils\bin\wc' },
+    @{ Name = 'sort';     Path = 'build\deb_coreutils\bin\sort' },
+    @{ Name = 'uniq';     Path = 'build\deb_coreutils\bin\uniq' },
+    @{ Name = 'cut';      Path = 'build\deb_coreutils\bin\cut' },
+    @{ Name = 'tr';       Path = 'build\deb_coreutils\bin\tr' },
+    @{ Name = 'seq';      Path = 'build\deb_coreutils\bin\seq' },
+    @{ Name = 'df';       Path = 'build\deb_coreutils\bin\df' },
+    @{ Name = 'du';       Path = 'build\deb_coreutils\bin\du' },
+    @{ Name = 'sleep';    Path = 'build\deb_coreutils\bin\sleep' },
+    @{ Name = 'true';     Path = 'build\deb_coreutils\bin\true' },
+    @{ Name = 'false';    Path = 'build\deb_coreutils\bin\false' },
+    @{ Name = 'printf';   Path = 'build\deb_coreutils\bin\printf' },
+    @{ Name = 'basename'; Path = 'build\deb_coreutils\bin\basename' },
+    @{ Name = 'dirname';  Path = 'build\deb_coreutils\bin\dirname' },
+    @{ Name = 'pwd';      Path = 'build\deb_coreutils\bin\pwd' },
+    @{ Name = 'echo';     Path = 'build\deb_coreutils\bin\echo' },
+    @{ Name = 'whoami';   Path = 'build\deb_coreutils\bin\whoami' },
+    @{ Name = 'uname';    Path = 'build\deb_coreutils\bin\uname' },
+    @{ Name = 'id';       Path = 'build\deb_coreutils\bin\id' },
+    @{ Name = 'test';     Path = 'build\deb_coreutils\bin\test' },
+    @{ Name = 'expr';     Path = 'build\deb_coreutils\bin\expr' },
+    @{ Name = 'tee';      Path = 'build\deb_coreutils\bin\tee' },
+    @{ Name = 'sync';     Path = 'build\deb_coreutils\bin\sync' },
+    @{ Name = 'dd';       Path = 'build\deb_coreutils\bin\dd' },
+    @{ Name = 'od';       Path = 'build\deb_coreutils\bin\od' },
+    @{ Name = 'nohup';    Path = 'build\deb_coreutils\bin\nohup' },
+    @{ Name = 'timeout';  Path = 'build\deb_coreutils\bin\timeout' },
+    @{ Name = 'mktemp';   Path = 'build\deb_coreutils\bin\mktemp' },
+    @{ Name = 'realpath'; Path = 'build\deb_coreutils\bin\realpath' },
+    @{ Name = 'nproc';    Path = 'build\deb_coreutils\bin\nproc' },
+    @{ Name = 'tty';      Path = 'build\deb_coreutils\bin\tty' },
+    @{ Name = 'printenv'; Path = 'build\deb_coreutils\bin\printenv' },
+    @{ Name = 'groups';   Path = 'build\deb_coreutils\bin\groups' },
+    @{ Name = 'grep';     Path = 'build\deb_grep\bin\grep' },
+    @{ Name = 'sed';      Path = 'build\deb_sed\bin\sed' },
+    @{ Name = 'tar';      Path = 'build\deb_tar\bin\tar' }
+)
+# Group 0's inode table only has 64 entries; the new files use group 1's
+# inode table (blocks 8197..8204), i.e. inode numbers 65 and up.
+$itable1 = 8197 * $BS
+$nextRealIno = 65
+$realBins = @()
+foreach ($rb in $realBinSources) {
+    $p = Join-Path $PSScriptRoot $rb.Path
+    if (-not (Test-Path $p)) {
+        # Debian splits coreutils between /bin and /usr/bin.
+        $alt = Join-Path $PSScriptRoot ($rb.Path -replace '\\bin\\', '\usr\bin\')
+        if (Test-Path $alt) { $p = $alt }
+    }
+    if (Test-Path $p) {
+        if ($nextRealIno -ge 129) { throw "make-ext4: group 1 inode table is full" }
+        $b = [IO.File]::ReadAllBytes($p)
+        $blks = [int][Math]::Ceiling($b.Length / 1024.0)
+        if ($curX11Block -lt 8205 -and ($curX11Block + $blks) -gt 8192) { $curX11Block = 8205 }
+        ExtentLeaf ($itable1 + ($nextRealIno - 65) * 128) $curX11Block $blks $b.Length 0x81ED
+        $realBins += @{ Name = $rb.Name; Ino = $nextRealIno; StartBlock = $curX11Block; Blocks = $blks; Bytes = $b }
+        $nextRealIno++
+        $curX11Block += $blks
+    }
+}
+
+# Shared libraries the Debian programs above need (libselinux, libacl, ...).
+# They live at the image root, which the dynamic loader reaches through the
+# /lib -> . symlink, exactly like the libc.so.6 that bash already uses.
+$realLibSources = @(
+    @{ Name = 'libselinux.so.1';   Path = 'build\deb_libselinux1\lib\x86_64-linux-gnu\libselinux.so.1' },
+    @{ Name = 'libacl.so.1';       Path = 'build\deb_libacl1\usr\lib\x86_64-linux-gnu\libacl.so.1.1.2253' },
+    @{ Name = 'libattr.so.1';      Path = 'build\deb_libattr1\usr\lib\x86_64-linux-gnu\libattr.so.1.1.2448' },
+    @{ Name = 'libpcre.so.3';      Path = 'build\deb_libpcre3\lib\x86_64-linux-gnu\libpcre.so.3.13.3' },
+    @{ Name = 'libpcre2-8.so.0';   Path = 'build\deb_libpcre2\usr\lib\x86_64-linux-gnu\libpcre2-8.so.0.10.1' }
+)
+$realLibs = @()
+foreach ($rl in $realLibSources) {
+    $p = Join-Path $PSScriptRoot $rl.Path
+    if (Test-Path $p) {
+        if ($nextRealIno -ge 129) { throw "make-ext4: group 1 inode table is full" }
+        $b = [IO.File]::ReadAllBytes($p)
+        $blks = [int][Math]::Ceiling($b.Length / 1024.0)
+        if ($curX11Block -lt 8205 -and ($curX11Block + $blks) -gt 8192) { $curX11Block = 8205 }
+        ExtentLeaf ($itable1 + ($nextRealIno - 65) * 128) $curX11Block $blks $b.Length 0x81ED
+        $realLibs += @{ Name = $rl.Name; Ino = $nextRealIno; StartBlock = $curX11Block; Blocks = $blks; Bytes = $b }
+        $nextRealIno++
+        $curX11Block += $blks
+    }
+}
+$realFiles = @($realBins) + @($realLibs)
+
 if ($curX11Block -gt 16384) {
     throw "make-ext4: file data overflows the 16MB image ($curX11Block blocks > 16384)"
 }
@@ -549,6 +660,12 @@ foreach ($xe in $x11Extracted) {
     $curOff += $alignedSz
 }
 
+foreach ($rl in $realLibs) {
+    $alignedSz = [int][Math]::Ceiling((8 + $rl.Name.Length) / 4.0) * 4
+    DirEntry $curOff $rl.Ino $rl.Name 1 $alignedSz
+    $curOff += $alignedSz
+}
+
 if ($hasDebPkg) {
     $nlen = [Text.Encoding]::ASCII.GetBytes($debPkgName).Length
     $entrySz = 8 + $nlen
@@ -645,7 +762,11 @@ $applets = @(
     'gunzip','bzip2','xz','top','uptime','whoami','clear','pwd','dd','hexdump','od','strings',
     'diff','wget','nc','yes','nohup','watch','ar','tty','printenv','groups','who','stty','reset'
 )
-foreach ($a in $applets) { [void]$binEntries.Add(@{ Ino = 23; Name = $a; Type = 1 }) }
+foreach ($a in $applets) {
+    $ino = 23
+    foreach ($rb in $realBins) { if ($rb.Name -eq $a) { $ino = $rb.Ino; break } }
+    [void]$binEntries.Add(@{ Ino = $ino; Name = $a; Type = 1 })
+}
 
 $bOff = $binStartBlock * $BS
 [Array]::Clear($img, $bOff, $binBlocks * $BS)
@@ -702,6 +823,15 @@ foreach ($xe in $x11Extracted) {
     } else {
         echo "Added symlink $($xe.Name) -> libc.so.6 to disk image"
     }
+}
+
+foreach ($rb in $realBins) {
+    Put ($rb.StartBlock * $BS) $rb.Bytes
+    echo "Added Debian /bin/$($rb.Name) ($($rb.Bytes.Length) bytes, inode $($rb.Ino)) to disk image"
+}
+foreach ($rl in $realLibs) {
+    Put ($rl.StartBlock * $BS) $rl.Bytes
+    echo "Added Debian /lib/$($rl.Name) ($($rl.Bytes.Length) bytes, inode $($rl.Ino)) to disk image"
 }
 
 if ($hasWad) {
@@ -780,13 +910,20 @@ $img[(8195 * $BS) + 1023] = $img[(8195 * $BS) + 1023] -bor 0x80
 for ($i = 8; $i -lt $BS; $i++) {
     $img[(8196 * $BS) + $i] = 0xFF
 }
+# Real Debian binaries live in group 1 (inodes 65..128): mark them used.
+foreach ($rb in $realFiles) {
+    $bit = $rb.Ino - 65
+    $byteIdx = $bit -shr 3
+    $bitIdx = $bit -band 7
+    $img[(8196 * $BS) + $byteIdx] = $img[(8196 * $BS) + $byteIdx] -bor (1 -shl $bitIdx)
+}
 
 $freeBlocksGrp0 = 8192 - @($allocatedBlocks | Where-Object { $_ -le 8192 }).Count
 $freeBlocksGrp1 = 8191 - @($allocatedBlocks | Where-Object { $_ -gt 8192 }).Count
 $freeBlocksTotal = $freeBlocksGrp0 + $freeBlocksGrp1
 
 $freeInodesGrp0 = 64 - $usedInoCountGrp0
-$freeInodesGrp1 = 64
+$freeInodesGrp1 = 64 - $realFiles.Count
 $freeInodesTotal = $freeInodesGrp0 + $freeInodesGrp1
 
 PutU32 ($sb + 0x0C) $freeBlocksTotal        # s_free_blocks_count_lo

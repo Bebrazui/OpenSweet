@@ -560,6 +560,10 @@ vfs_stat_fd:
     je .statf_proc_dir
     cmp byte [rbx + 0], FD_TYPE_CONSOLE
     je .statf_char
+    cmp byte [rbx + 0], FD_TYPE_PIPE
+    je .statf_pipe
+    cmp byte [rbx + 0], FD_TYPE_DEV_NULL
+    je .statf_devnull
     jmp .statf_badfd
 
 .statf_proc:
@@ -594,6 +598,49 @@ vfs_stat_fd:
     mov qword [rsp + 24], 0x21B6        ; S_IFCHR | 0666
     mov qword [rsp + 40], 0x0500        ; st_rdev = makedev(5, 0) = /dev/tty
     mov qword [rsp + 56], 1024
+    mov rsi, rsp
+    mov rdi, r13
+    mov ecx, 144 / 8
+    rep movsq
+    add rsp, 144
+    xor eax, eax
+    jmp .statf_done
+
+; Pipes report S_IFIFO like Linux does; programs (cat, tee, ...) fstat their
+; standard output to size buffers and bail out with EBADF if this is missing.
+.statf_pipe:
+    sub rsp, 144
+    mov rdi, rsp
+    mov ecx, 18
+    xor eax, eax
+    rep stosq
+    mov qword [rsp + 0], 0x0501         ; st_dev
+    movzx eax, word [rbx + 2]           ; pipe id
+    add rax, 0x1000
+    mov [rsp + 8], rax                  ; st_ino
+    mov qword [rsp + 16], 1             ; st_nlink
+    mov qword [rsp + 24], 0x1180        ; S_IFIFO | 0600
+    mov qword [rsp + 56], 4096          ; st_blksize
+    mov rsi, rsp
+    mov rdi, r13
+    mov ecx, 144 / 8
+    rep movsq
+    add rsp, 144
+    xor eax, eax
+    jmp .statf_done
+
+.statf_devnull:
+    sub rsp, 144
+    mov rdi, rsp
+    mov ecx, 18
+    xor eax, eax
+    rep stosq
+    mov qword [rsp + 0], 0x0501
+    mov qword [rsp + 8], 2
+    mov qword [rsp + 16], 1
+    mov qword [rsp + 24], 0x21B6        ; S_IFCHR | 0666
+    mov qword [rsp + 40], 0x0103        ; st_rdev = makedev(1, 3) = /dev/null
+    mov qword [rsp + 56], 4096
     mov rsi, rsp
     mov rdi, r13
     mov ecx, 144 / 8
