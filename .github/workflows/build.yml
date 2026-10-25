@@ -22,13 +22,26 @@ jobs:
 
       - name: Install flat assembler 1.73.35 (Linux build)
         run: |
-          curl -fsSL -o fasm.tgz https://flatassembler.net/fasm-1.73.35.tgz
-          tar xzf fasm.tgz
-          # The tarball layout has changed between releases; locate the binary instead of guessing.
-          FASM_BIN=$(find . -maxdepth 3 -type f -name fasm | head -n1)
-          if [ -z "$FASM_BIN" ]; then echo "fasm binary not found in the tarball"; exit 1; fi
+          # fasm's Linux build is a 32-bit ELF; make sure the runner has the
+          # i386 loader before anything tries to execute it.
+          sudo apt-get update -qq
+          sudo apt-get install -y libc6-i386
+          # flatassembler.net has extended outages; Debian ships the identical
+          # 1.73.35 build behind a reliable CDN. Try the pool first and fall
+          # back to the original tarball when the site is reachable again.
+          if curl -fsSL --connect-timeout 15 --retry 2 -o fasm.deb https://deb.debian.org/debian/pool/main/f/fasm/fasm_1.73.35-2_amd64.deb; then
+            dpkg-deb -x fasm.deb fasm-root
+            FASM_BIN=$(find "$PWD/fasm-root" -type f -name fasm | head -n1)
+          else
+            curl -fsSL --connect-timeout 15 --retry 2 -o fasm.tgz https://flatassembler.net/fasm-1.73.35.tgz
+            tar xzf fasm.tgz
+            # The tarball layout has changed between releases; locate the binary instead of guessing.
+            FASM_BIN=$(find . -maxdepth 3 -type f -name fasm | head -n1)
+            FASM_BIN="$PWD/${FASM_BIN#./}"
+          fi
+          if [ -z "$FASM_BIN" ]; then echo "fasm binary not found"; exit 1; fi
           chmod +x "$FASM_BIN"
-          echo "FASM_BIN=$(pwd)/$FASM_BIN" >> "$GITHUB_ENV"
+          echo "FASM_BIN=$FASM_BIN" >> "$GITHUB_ENV"
 
       - name: Check the assembler runs
         run: |
