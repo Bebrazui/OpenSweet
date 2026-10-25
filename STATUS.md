@@ -3,7 +3,7 @@
 Plain-language state of the project: what is verified, what is in flight, what is
 known to be missing. Keep it short and honest — update it before it drifts.
 
-Last updated: 2026-10-19 (kernel `448 096` bytes, 65+ commits on `main`).
+Last updated: 2026-10-25 (kernel `482 560` bytes, 105 commits on `main`, CI green).
 
 ---
 
@@ -50,9 +50,18 @@ These are confirmed by the serial log of a real headless boot (`scripts/smoke.ps
     `1 234 376` bytes, the loader reports `loaded segments: 4`, and
     `bash --version` prints the real GNU banner (5.1.4) and exits 0.
   - *Still open:* an interactive `bash` session (prompt / readline), pipelines,
-    job control, and the `fstat`-on-`/dev/tty` path that currently returns
-    `EBADF`. Reproduce with `scripts/test_bash.ps1` (use `-RebuildDisk` for a
-    clean tree; a failed extraction leaves partial state behind).
+    and job control — a real `/dev/ptmx` + `/dev/pts/N` is the next step.
+    `fstat` now answers for pipes (`S_IFIFO`) and `/dev/null` (`S_IFCHR`);
+    only the `/dev/tty` path still returns `EBADF`. Reproduce with
+    `scripts/test_bash.ps1` (use `-RebuildDisk` for a clean tree; a failed
+    extraction leaves partial state behind).
+- **Real Debian programs in `/bin`.** The busybox applet names stay as a
+  fallback, but ~50 of them (`ls`, `cat`, `grep`, `sed`, `tar`, ...) are
+  repointed at genuine Debian binaries (group-1 inodes 65..121) with
+  libselinux/libacl/libattr/libpcre packed next to libc.so.6. The image
+  builds and boots clean; the programs have not been exercised one by one
+  yet. The 16 MB image is nearly full (~820 KB free of 16 MB) — grow it
+  before packaging anything more.
 - **Interactive children in the native terminal.** A foreground child now gets
   a stdin pipe as fd 0, and the terminal multiplexes the child's output with
   GUI events, so a Linux program can be typed at and it keeps repainting.
@@ -111,8 +120,8 @@ Ordered roughly by how much they block other work.
    `docs/linux-syscalls.md`.
    The per-task fd table was also raised from 16 to 64 entries.
 5. **`make-ext4.ps1` is a single point of failure.** ~30 KB of hand-rolled ext4
-   construction with hard-coded inode numbers (32, 36–46). A silent accounting error
-   produces a corrupt image with no diagnostic.
+   construction with hard-coded inode numbers (32, 36–46, 65–121). A silent
+   accounting error produces a corrupt image with no diagnostic.
 6. **Documentation drift.** `README.md` still calls ext4 "read-only" (it writes) and
    omits the network stack, X11 and userland from the tree; `docs/ROADMAP.md` lists
    networking as not started. `gemini.md`, `docs/linux-syscalls.md` and
@@ -152,7 +161,9 @@ step.
 
 ## CI
 
-`.github/workflows/build.yml` assembles `boot.asm`, `stage2.asm` and `kernel.asm`
-with the Linux build of flat assembler 1.73.35 and checks the artifact sizes. This
-gives a regression gate for the kernel itself. The job has **not yet been executed
-on a Linux runner** — treat the first green run as the proof.
+`.github/workflows/build.yml` assembles the kernel first, then `stage2.asm` with
+`-d KERNEL_SECTORS=<n>` computed from the real `kernel.bin` (same order as
+`build.cmd`; `stage2.asm` refuses to assemble without the define), then
+`boot.asm`, and checks artifact sizes including the 16 KB stage2 slot and the
+585728-byte kernel load limit. fasm 1.73.35 is fetched from the Debian pool
+while flatassembler.net has extended outages. **First green run: 2026-10-25.**
